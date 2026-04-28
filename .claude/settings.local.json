@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install *)",
+      "Bash(npx prisma *)",
+      "Bash(timeout 8 npm run dev)",
+      "Bash(node --import tsx/esm src/app.js)",
+      "Bash(kill %1)"
+    ]
+  }
+}

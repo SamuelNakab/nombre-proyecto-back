@@ -1,0 +1,351 @@
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────
+
+enum Rol {
+  CLIENTE
+  CONDUCTOR
+  GERENTE
+  ADMIN
+}
+
+enum EstadoViaje {
+  BUSCANDO_CONDUCTOR
+  CONDUCTOR_ASIGNADO
+  EN_CAMINO_A_ORIGEN
+  CARGANDO
+  EN_RUTA
+  DESCARGANDO
+  FINALIZADO
+  CANCELADO
+}
+
+enum TipoZona {
+  CABA
+  PROVINCIA
+  MIXTO
+}
+
+enum TipoTransaccion {
+  COBRO_INICIAL
+  AJUSTE
+  PENALIDAD
+  REEMBOLSO
+}
+
+enum EstadoTransaccion {
+  PENDIENTE
+  PROCESADO
+  FALLIDO
+  REEMBOLSADO
+}
+
+enum EstadoParada {
+  PENDIENTE
+  ENTREGADO
+}
+
+enum TipoCondicion {
+  FRAGIL
+  REFRIGERADO
+  CARGA_PESADA
+  PELIGROSO
+  VOLUMINOSO
+}
+
+// ─────────────────────────────────────────────
+// USUARIO BASE
+// ─────────────────────────────────────────────
+
+model Usuario {
+  id_usuario     Int      @id @default(autoincrement())
+  firebase_uid   String   @unique
+  // firebase_uid es el identificador que devuelve Firebase al registrar un usuario.
+  // NO hay campo contrasena — Firebase es dueño de las credenciales.
+  nombre         String
+  apellido       String
+  dni            String   @unique
+  email          String   @unique
+  telefono       String?
+  rol            Rol
+  fecha_registro DateTime @default(now())
+
+  cliente          Cliente?
+  conductor        Conductor?
+  empresas_gerente Empresa[]
+  metodos_pago     MetodoPago[]
+
+  @@map("usuarios")
+}
+
+// ─────────────────────────────────────────────
+// CLIENTE
+// ─────────────────────────────────────────────
+
+model Cliente {
+  id_cliente          Int     @id @default(autoincrement())
+  id_usuario          Int     @unique
+  cuit                String?
+  nombre_empresa      String?
+  direccion_principal String?
+
+  usuario        Usuario        @relation(fields: [id_usuario], references: [id_usuario])
+  viajes         Viaje[]
+  calificaciones Calificacion[]
+
+  @@map("clientes")
+}
+
+// ─────────────────────────────────────────────
+// CONDUCTOR
+// ─────────────────────────────────────────────
+
+model Conductor {
+  id_conductor         Int      @id @default(autoincrement())
+  id_usuario           Int      @unique
+  nro_licencia         String
+  licencia_vencimiento DateTime
+  calificacion_promedio Float   @default(0)
+
+  usuario             Usuario             @relation(fields: [id_usuario], references: [id_usuario])
+  conductor_empresas  ConductorEmpresa[]
+  conductor_vehiculos ConductorVehiculo[]
+  viajes              Viaje[]
+  calificaciones      Calificacion[]
+
+  @@map("conductores")
+}
+
+// ─────────────────────────────────────────────
+// EMPRESA FLETORA
+// ─────────────────────────────────────────────
+
+model Empresa {
+  id_empresa     Int      @id @default(autoincrement())
+  id_gerente     Int
+  cuit           String   @unique
+  nombre         String
+  fecha_registro DateTime @default(now())
+
+  gerente            Usuario            @relation(fields: [id_gerente], references: [id_usuario])
+  conductor_empresas ConductorEmpresa[]
+  vehiculos          Vehiculo[]
+  viajes             Viaje[]
+
+  @@map("empresas")
+}
+
+// ─────────────────────────────────────────────
+// CONDUCTOR <-> EMPRESA  (N:N)
+// ─────────────────────────────────────────────
+
+model ConductorEmpresa {
+  id_conductor_empresa Int      @id @default(autoincrement())
+  id_conductor         Int
+  id_empresa           Int
+  fecha_ingreso        DateTime @default(now())
+  activo               Boolean  @default(true)
+
+  conductor Conductor @relation(fields: [id_conductor], references: [id_conductor])
+  empresa   Empresa   @relation(fields: [id_empresa], references: [id_empresa])
+
+  @@unique([id_conductor, id_empresa])
+  @@map("conductor_empresa")
+}
+
+// ─────────────────────────────────────────────
+// METODO DE PAGO
+// Un usuario puede tener N tarjetas registradas.
+// NUNCA se guardan datos reales de tarjeta — solo el token de MercadoPago.
+// ─────────────────────────────────────────────
+
+model MetodoPago {
+  id_metodo       Int     @id @default(autoincrement())
+  id_usuario      Int
+  mp_token        String
+  ultimos_digitos String
+  marca           String?
+  activo          Boolean @default(true)
+
+  usuario Usuario @relation(fields: [id_usuario], references: [id_usuario])
+
+  @@map("metodos_pago")
+}
+
+// ─────────────────────────────────────────────
+// VEHICULO
+// Por ahora solo empresas tienen vehiculos.
+// Fleteros individuales se agregan despues con FK nullable a Conductor.
+// ─────────────────────────────────────────────
+
+model Vehiculo {
+  id_vehiculo   Int    @id @default(autoincrement())
+  id_empresa    Int
+  patente       String @unique
+  marca         String
+  modelo        String
+  anio          Int
+  color         String
+  tipo_vehiculo String
+
+  empresa             Empresa             @relation(fields: [id_empresa], references: [id_empresa])
+  conductor_vehiculos ConductorVehiculo[]
+  condiciones         CondicionVehiculo[]
+  viajes              Viaje[]
+
+  @@map("vehiculos")
+}
+
+// ─────────────────────────────────────────────
+// CONDUCTOR <-> VEHICULO  (N:N)
+// ─────────────────────────────────────────────
+
+model ConductorVehiculo {
+  id_conductor_vehiculo Int @id @default(autoincrement())
+  id_vehiculo           Int
+  id_conductor          Int
+
+  vehiculo  Vehiculo  @relation(fields: [id_vehiculo], references: [id_vehiculo])
+  conductor Conductor @relation(fields: [id_conductor], references: [id_conductor])
+
+  @@unique([id_vehiculo, id_conductor])
+  @@map("conductor_vehiculo")
+}
+
+// ─────────────────────────────────────────────
+// CONDICION DEL VEHICULO
+// Qué capacidades tiene el vehículo.
+// ─────────────────────────────────────────────
+
+model CondicionVehiculo {
+  id_condicion Int           @id @default(autoincrement())
+  id_vehiculo  Int
+  condicion    TipoCondicion
+
+  vehiculo Vehiculo @relation(fields: [id_vehiculo], references: [id_vehiculo])
+
+  @@unique([id_vehiculo, condicion])
+  @@map("condicion_vehiculo")
+}
+
+// ─────────────────────────────────────────────
+// CONDICION REQUERIDA POR EL VIAJE
+// Qué capacidades necesita el viaje.
+// El sistema cruza esta tabla con CondicionVehiculo para filtrar conductores elegibles.
+// ─────────────────────────────────────────────
+
+model CondicionRequerida {
+  id_condicion_req Int           @id @default(autoincrement())
+  id_viaje         Int
+  condicion        TipoCondicion
+
+  viaje Viaje @relation(fields: [id_viaje], references: [id_viaje])
+
+  @@unique([id_viaje, condicion])
+  @@map("condicion_requerida")
+}
+
+// ─────────────────────────────────────────────
+// VIAJE
+// ─────────────────────────────────────────────
+
+model Viaje {
+  id_viaje            Int         @id @default(autoincrement())
+  id_cliente          Int
+  id_conductor        Int?
+  id_vehiculo         Int?
+  id_empresa          Int?
+  zona                TipoZona
+  tarifa_hora         Float?
+  tarifa_km           Float?
+  distancia_provincia Float?
+  tiempo_capital      Float?
+  fecha_programada    DateTime
+  estado              EstadoViaje @default(BUSCANDO_CONDUCTOR)
+  precio_estimado     Float?
+  precio_real         Float?
+  creado_en           DateTime    @default(now())
+
+  cliente          Cliente              @relation(fields: [id_cliente], references: [id_cliente])
+  conductor        Conductor?           @relation(fields: [id_conductor], references: [id_conductor])
+  vehiculo         Vehiculo?            @relation(fields: [id_vehiculo], references: [id_vehiculo])
+  empresa          Empresa?             @relation(fields: [id_empresa], references: [id_empresa])
+  paradas          Parada[]
+  transacciones    Transaccion[]
+  condiciones_req  CondicionRequerida[]
+  calificacion     Calificacion?
+
+  @@map("viajes")
+}
+
+// ─────────────────────────────────────────────
+// PARADA
+// ─────────────────────────────────────────────
+
+model Parada {
+  id_parada     Int          @id @default(autoincrement())
+  id_viaje      Int
+  orden         Int
+  direccion     String
+  latitud       Float
+  longitud      Float
+  qr_token      String       @unique @default(cuid())
+  estado        EstadoParada @default(PENDIENTE)
+  fecha_entrega DateTime?
+
+  viaje Viaje @relation(fields: [id_viaje], references: [id_viaje])
+
+  @@map("paradas")
+}
+
+// ─────────────────────────────────────────────
+// TRANSACCION
+// ─────────────────────────────────────────────
+
+model Transaccion {
+  id_transaccion     Int               @id @default(autoincrement())
+  id_viaje           Int
+  tipo               TipoTransaccion
+  monto              Float
+  monto_fee          Float
+  monto_neto         Float
+  estado             EstadoTransaccion @default(PENDIENTE)
+  mp_payment_id      String?
+  mp_idempotency_key String?           @unique
+  creado_en          DateTime          @default(now())
+
+  viaje Viaje @relation(fields: [id_viaje], references: [id_viaje])
+
+  @@map("transacciones")
+}
+
+// ─────────────────────────────────────────────
+// CALIFICACION
+// ─────────────────────────────────────────────
+
+model Calificacion {
+  id_calificacion Int      @id @default(autoincrement())
+  id_viaje        Int      @unique
+  id_cliente      Int
+  id_conductor    Int
+  puntaje         Int
+  comentario      String?
+  fecha_hora      DateTime @default(now())
+
+  viaje     Viaje     @relation(fields: [id_viaje], references: [id_viaje])
+  cliente   Cliente   @relation(fields: [id_cliente], references: [id_cliente])
+  conductor Conductor @relation(fields: [id_conductor], references: [id_conductor])
+
+  @@map("calificaciones")
+}

@@ -62,6 +62,7 @@ async function rollbackFirebase(uid) {
 
 export async function registrarCliente(req, res) {
   const parsed = schemaCliente.safeParse(req.body);
+  
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0].message });
   }
@@ -69,6 +70,7 @@ export async function registrarCliente(req, res) {
   const { nombre, apellido, dni, email, contrasena, telefono, cuit, nombre_empresa, direccion_principal } = parsed.data;
 
   const firebaseUser = await crearEnFirebase(email, contrasena);
+  console.log('Firebase user creation result:', firebaseUser);
   if (firebaseUser.conflicto === 'email') {
     return res.status(409).json({ error: 'El email ya esta registrado' });
   }

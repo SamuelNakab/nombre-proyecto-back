@@ -279,3 +279,27 @@ Emitido por el servidor cuando un conductor acepta un viaje.
 - Fechas en formato ISO 8601 UTC
 - El campo `contrasena` nunca se almacena en la DB — solo va a Firebase
 - Los campos `firebase_uid` se incluyen en `GET /me` pero el cliente no debe usarlos directamente
+
+## Autenticacion
+
+Los endpoints protegidos requieren un header:
+  Authorization: Bearer <token>
+
+El token se obtiene de Firebase en el cliente, NO de esta API.
+
+En React Native:
+  import auth from '@react-native-firebase/auth';
+  const token = await auth().currentUser.getIdToken();
+
+En Next.js:
+  import { getAuth } from 'firebase/auth';
+  const token = await getAuth().currentUser.getIdToken();
+
+El token dura 1 hora. Firebase lo renueva automaticamente.
+Pasarlo en cada request a endpoints que digan "requiere token".
+
+Firebase config (misma para mobile y web):
+  apiKey: "..."
+  authDomain: "..."
+  projectId: "..."
+  (Samuel les pasa estos valores por privado — no van en el repo)

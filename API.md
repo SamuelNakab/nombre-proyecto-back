@@ -302,4 +302,3 @@ Firebase config (misma para mobile y web):
   apiKey: "..."
   authDomain: "..."
   projectId: "..."
-  (Samuel les pasa estos valores por privado — no van en el repo)

@@ -1,5 +1,6 @@
 import 'dotenv/config';
-import { PrismaClient } from '../../generated/prisma/client.ts';
+import { PrismaClient } from '@prisma/client';
+
 import { PrismaPg } from '@prisma/adapter-pg';
 
 const logLevels =

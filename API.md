@@ -1,7 +1,7 @@
 # Fleter — Contrato de API
 
 Documento de referencia para el equipo mobile y web.
-Base URL: `https://<dominio>/api`
+Base URL: `https://nombre-proyecto-back-production.up.railway.app/`
 
 ---
 

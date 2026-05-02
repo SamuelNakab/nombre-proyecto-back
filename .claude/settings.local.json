@@ -15,7 +15,10 @@
       "Bash(taskkill /PID 18716 /F)",
       "Bash(netstat -ano)",
       "Bash(echo \"Port 3000 free: $\\(netstat -ano)",
-      "Bash(node -e ' *)"
+      "Bash(node -e ' *)",
+      "Bash(npm run *)",
+      "Bash(npm uninstall *)",
+      "Bash(Remove-Item \"c:\\\\Users\\\\Usuario\\\\Documents\\\\GitHub\\\\nombre-proyecto-back\\\\prisma.config.ts\" -Force)"
     ]
   }
 }

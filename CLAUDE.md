@@ -7,110 +7,84 @@ el sistema lo publica a conductores elegibles via WebSocket,
 el primero en aceptar queda asignado.
 
 ## Estado actual del proyecto
-- Base de datos: schema.prisma completo, migración inicial aplicada en Neon
+- Base de datos: schema.prisma completo, migracion inicial aplicada en Neon
 - Scaffold: estructura de carpetas creada
 - Config: prisma.js, firebase.js, redis.js, storage.js creados
 - Middleware: auth.middleware.js creado (verificarToken, requireRol)
-- app.js: servidor base con health check funcionando
-- Pendiente: endpoints de Fase 1 (registro, login) y documentación de la API
+- Endpoints Fase 1: registro y login implementados y funcionando en local
+- Deploy: Railway — fallando por imports de Prisma incompatibles con Node 22 ESM estricto
 
 ## Stack
-- Node.js con ES Modules (import/export — NUNCA require)
+- Node.js 22 con ES Modules (import/export — NUNCA require)
 - Express
 - PostgreSQL en Neon (serverless)
 - Prisma v5 como ORM
 - Firebase Admin SDK para autenticacion
-- Socket.io para WebSockets (GPS, matching, alertas)
-- Redis para coordenadas GPS activas y rooms de viajes
-- Zod para validacion de inputs en endpoints
-- BullMQ para colas de notificaciones push
-- MercadoPago Marketplace para pagos
+- Socket.io para WebSockets
+- Redis
+- Zod para validacion
+- BullMQ para colas
+
+## PROBLEMA ACTIVO A RESOLVER
+Railway (Node 22.22.2, ESM estricto) no puede importar PrismaClient como named export.
+El error es: "Named export 'PrismaClient' not found. The requested module
+'@prisma/client' is a CommonJS module"
+
+La solucion correcta para CUALQUIER import de @prisma/client en ESM estricto es:
+  import pkg from '@prisma/client';
+  const { PrismaClient } = pkg;
+
+Ademas Railway no ejecuta prisma generate automaticamente.
+El script start en package.json debe ser:
+  "start": "prisma generate && node src/app.js"
 
 ## Reglas de codigo
-- ES Modules siempre. Si escribis require() es un error.
-- Async/await siempre. Nada de .then() encadenados.
-- Validar todos los inputs con Zod en los endpoints.
-- Respuestas de error siempre con formato: { error: "mensaje" }
+- ES Modules siempre. NUNCA require().
+- Para modulos CommonJS (como @prisma/client) usar el patron:
+    import pkg from 'nombre-modulo';
+    const { NamedExport } = pkg;
+- Async/await siempre.
+- Validar todos los inputs con Zod.
+- Respuestas de error: { error: "mensaje" }
 - Variables de entorno: todas en .env, nunca hardcodeadas.
-- Nombres de archivos: kebab-case
-- Named exports en controllers y services, no default exports.
-- Nunca modificar la DB directamente. Todo via schema.prisma + migrate.
+- Nombres de archivos: kebab-case.
+- Named exports en controllers y services.
 
 ## Estructura de carpetas
 src/
 ├── config/
-│   ├── firebase.js       # firebase-admin inicializado
-│   ├── prisma.js         # instancia unica de PrismaClient
-│   ├── redis.js          # cliente de Redis
-│   └── storage.js        # cliente de Cloudflare R2
+│   ├── firebase.js
+│   ├── prisma.js        ← TIENE EL BUG DE IMPORT
+│   ├── redis.js
+│   └── storage.js
 ├── routes/
-│   └── auth.routes.js    # pendiente
+│   └── auth.routes.js
 ├── controllers/
-│   └── auth.controller.js  # pendiente
+│   └── auth.controller.js
 ├── services/
-│   ├── costo.service.js
-│   ├── desvio.service.js
-│   ├── eta.service.js
-│   ├── parada.service.js
-│   └── notifications.service.js
 ├── middlewares/
-│   └── auth.middleware.js  # verificarToken + requireRol — listo
+│   └── auth.middleware.js
 ├── sockets/
-│   ├── index.js
-│   ├── gps.socket.js
-│   └── matching.socket.js
 ├── jobs/
-│   └── notificaciones.job.js
-└── app.js                  # servidor base listo, health check en GET /health
-
+└── app.js
 prisma/
-├── schema.prisma           # completo y migrado
-└── migrations/             # migracion init aplicada
-
-## Modelos de la base de datos (resumen)
-Usuario        → firebase_uid UNIQUE, email, dni, rol (CLIENTE|CONDUCTOR|GERENTE|ADMIN)
-Cliente        → extiende Usuario 1:1, tiene viajes y calificaciones
-Conductor      → extiende Usuario 1:1, tiene licencia y calificacion_promedio
-Empresa        → tiene un gerente (Usuario), conductores y vehiculos
-ConductorEmpresa → tabla N:N entre Conductor y Empresa
-MetodoPago     → mp_token de MercadoPago, NUNCA datos reales de tarjeta
-Vehiculo       → pertenece a Empresa, tiene condiciones
-ConductorVehiculo → tabla N:N entre Conductor y Vehiculo
-CondicionVehiculo → capacidades del vehiculo (FRAGIL, REFRIGERADO, etc.)
-CondicionRequerida → lo que necesita un viaje (se cruza con CondicionVehiculo)
-Viaje          → id_conductor/id_vehiculo/id_empresa son nullable al crear
-Parada         → qr_token UNIQUE GLOBAL con @default(cuid())
-Transaccion    → mp_idempotency_key UNIQUE para evitar cobros duplicados
-Calificacion   → UNIQUE por viaje
-
-## Autenticacion
-- Firebase Auth maneja todas las credenciales
-- NO hay contrasena en la DB — firebase_uid es el puente
-- Flujo registro: crear en Firebase → obtener uid → crear en DB con ese uid
-- Flujo login: Firebase autentica → JWT → backend verifica con verifyIdToken
-- Si Firebase tiene exito pero la DB falla: hacer rollback borrando el usuario de Firebase
-- verificarToken: verifica JWT, busca usuario por firebase_uid, adjunta req.usuario
-- requireRol('CLIENTE', 'ADMIN'): verifica que req.usuario.rol este en la lista
+├── schema.prisma
+└── migrations/
 
 ## Variables de entorno
-Todas las variables están en .env (no se pushea a Git).
-El template con los nombres está en .env.example.
-Para desarrollo: copiar .env.example a .env y completar los valores.
-Ver .env.example para la lista completa de variables requeridas.
+Todas en .env (no se pushea). Ver .env.example para la lista completa.
 
-## Endpoints existentes
-GET /health → { status: 'ok', timestamp: Date }
-
-## Endpoints pendientes — Fase 1
+## Endpoints existentes (Fase 1)
 POST /api/auth/registro-cliente
 POST /api/auth/registro-conductor
 POST /api/auth/registro-gerente
-POST /api/auth/login
-GET  /api/auth/me
-PUT  /api/auth/perfil
+POST /api/auth/login         (requiere Bearer token de Firebase)
+GET  /api/auth/me            (requiere Bearer token de Firebase)
+PUT  /api/auth/perfil        (requiere Bearer token de Firebase)
+GET  /health
 
 ## Comandos importantes
-npm run dev                                    → iniciar servidor con hot reload
-npx prisma migrate dev --name descripcion      → nueva migracion
-npx prisma studio                              → UI para ver la DB en localhost:5555
-npx prisma generate                            → regenerar cliente de Prisma
+npm run dev                                → desarrollo local con hot reload
+npm run start                              → produccion (debe incluir prisma generate)
+npx prisma migrate dev --name descripcion  → nueva migracion
+npx prisma studio                          → UI para ver la DB

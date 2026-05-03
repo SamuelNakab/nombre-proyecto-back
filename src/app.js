@@ -3,6 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import authRoutes from './routes/auth.routes.js';
+import viajesRoutes from './routes/viajes.routes.js';
 
 const app = express();
 
@@ -15,6 +16,7 @@ app.get('/health', (_req, res) => {
 });
 
 app.use('/api/auth', authRoutes);
+app.use('/api/viajes', viajesRoutes);
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {

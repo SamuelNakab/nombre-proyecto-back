@@ -18,7 +18,8 @@
       "Bash(node -e ' *)",
       "Bash(npm run *)",
       "Bash(npm uninstall *)",
-      "Bash(Remove-Item \"c:\\\\Users\\\\Usuario\\\\Documents\\\\GitHub\\\\nombre-proyecto-back\\\\prisma.config.ts\" -Force)"
+      "Bash(Remove-Item \"c:\\\\Users\\\\Usuario\\\\Documents\\\\GitHub\\\\nombre-proyecto-back\\\\prisma.config.ts\" -Force)",
+      "Bash(echo \"EXIT:$?\")"
     ]
   }
 }

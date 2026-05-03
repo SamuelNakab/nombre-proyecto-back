@@ -242,6 +242,259 @@ Endpoint de verificación de estado del servidor. No requiere autenticación.
 
 ---
 
+---
+
+## /viajes — Gestión de viajes (Fase 2)
+
+### POST /api/viajes/estimar-costo
+
+Calcula el costo estimado de un viaje sin crearlo. Si `GOOGLE_MAPS_API_KEY` no está configurada, usa distancia mock (10 km, 0.5 h).
+
+**Rol requerido:** `CLIENTE`
+
+**Headers:**
+```
+Authorization: Bearer <firebase-id-token>
+```
+
+**Body:**
+```json
+{
+  "zona": "CABA",
+  "paradas": [
+    { "lat": -34.603722, "lng": -58.381592, "direccion": "Av. de Mayo 1370, CABA" },
+    { "lat": -34.615, "lng": -58.370, "direccion": "San Telmo, CABA" }
+  ],
+  "tarifa_hora": 5000
+}
+```
+- `zona`: `"CABA"` | `"PROVINCIA"` | `"MIXTO"`
+- `paradas`: mínimo 2 elementos
+- `tarifa_hora`: requerido si zona es `CABA` o `MIXTO`
+- `tarifa_km`: requerido si zona es `PROVINCIA` o `MIXTO`
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "precio_estimado": 2500,
+  "distancia_total_km": 2.3,
+  "tiempo_total_horas": 0.5
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "mensaje de validación" }` | Campo faltante o inválido |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CLIENTE |
+| 503 | `{ "error": "No se pudo calcular la distancia" }` | Error en Google Maps API |
+
+---
+
+### POST /api/viajes
+
+Crea un viaje nuevo. El viaje queda en estado `BUSCANDO_CONDUCTOR`.
+
+**Rol requerido:** `CLIENTE`
+
+**Headers:**
+```
+Authorization: Bearer <firebase-id-token>
+```
+
+**Body:**
+```json
+{
+  "zona": "MIXTO",
+  "paradas": [
+    { "lat": -34.603722, "lng": -58.381592, "direccion": "Av. de Mayo 1370, CABA" },
+    { "lat": -34.92, "lng": -57.95, "direccion": "La Plata, Buenos Aires" }
+  ],
+  "tarifa_hora": 5000,
+  "tarifa_km": 800,
+  "fecha_programada": "2026-05-10T10:00:00.000Z",
+  "condiciones_requeridas": ["FRAGIL", "REFRIGERADO"]
+}
+```
+- `fecha_programada`: fecha ISO futura, mínimo 1 hora desde el momento del request
+- `condiciones_requeridas`: opcional, valores posibles: `FRAGIL`, `REFRIGERADO`, `CARGA_PESADA`, `PELIGROSO`, `VOLUMINOSO`
+
+**Respuesta exitosa — 201:**
+```json
+{
+  "id_viaje": 42,
+  "id_cliente": 3,
+  "id_conductor": null,
+  "id_vehiculo": null,
+  "id_empresa": null,
+  "zona": "MIXTO",
+  "tarifa_hora": 5000,
+  "tarifa_km": 800,
+  "fecha_programada": "2026-05-10T10:00:00.000Z",
+  "estado": "BUSCANDO_CONDUCTOR",
+  "precio_estimado": 10800,
+  "precio_real": null,
+  "creado_en": "2026-05-03T12:00:00.000Z",
+  "paradas": [
+    {
+      "id_parada": 1,
+      "id_viaje": 42,
+      "orden": 1,
+      "direccion": "Av. de Mayo 1370, CABA",
+      "lat": -34.603722,
+      "lng": -58.381592,
+      "qr_token": "cuid_generado",
+      "estado": "PENDIENTE",
+      "fecha_entrega": null
+    }
+  ],
+  "condiciones_req": [
+    { "id_condicion_req": 1, "id_viaje": 42, "condicion": "FRAGIL" },
+    { "id_condicion_req": 2, "id_viaje": 42, "condicion": "REFRIGERADO" }
+  ]
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "mensaje de validación" }` | Campo faltante o inválido |
+| 400 | `{ "error": "El usuario no tiene perfil de cliente" }` | El usuario autenticado no tiene registro de cliente |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CLIENTE |
+| 503 | `{ "error": "No se pudo calcular la distancia" }` | Error en Google Maps API |
+
+---
+
+### GET /api/viajes/disponibles
+
+Devuelve los viajes en estado `BUSCANDO_CONDUCTOR` con fecha futura para los que el conductor es elegible (tiene al menos un vehículo que cumple todas las condiciones requeridas).
+
+**Rol requerido:** `CONDUCTOR`
+
+**Headers:**
+```
+Authorization: Bearer <firebase-id-token>
+```
+
+**Respuesta exitosa — 200:**
+```json
+[
+  {
+    "id_viaje": 42,
+    "zona": "CABA",
+    "precio_estimado": 2500,
+    "fecha_programada": "2026-05-10T10:00:00.000Z",
+    "estado": "BUSCANDO_CONDUCTOR",
+    "paradas": [
+      { "orden": 1, "direccion": "Av. de Mayo 1370, CABA", "lat": -34.603722, "lng": -58.381592 }
+    ],
+    "condiciones_req": [],
+    "cliente": {
+      "usuario": {
+        "nombre": "Juan",
+        "apellido": "Pérez",
+        "telefono": "+5491112345678"
+      }
+    }
+  }
+]
+```
+Ordenados por `fecha_programada` ascendente.
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "El usuario no tiene perfil de conductor" }` | El usuario autenticado no tiene registro de conductor |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
+
+---
+
+### GET /api/viajes/mis-viajes
+
+Devuelve todos los viajes creados por el cliente autenticado, ordenados del más reciente al más antiguo.
+
+**Rol requerido:** `CLIENTE`
+
+**Headers:**
+```
+Authorization: Bearer <firebase-id-token>
+```
+
+**Respuesta exitosa — 200:**
+```json
+[
+  {
+    "id_viaje": 42,
+    "zona": "CABA",
+    "precio_estimado": 2500,
+    "precio_real": null,
+    "estado": "BUSCANDO_CONDUCTOR",
+    "fecha_programada": "2026-05-10T10:00:00.000Z",
+    "creado_en": "2026-05-03T12:00:00.000Z",
+    "paradas": [
+      { "orden": 1, "direccion": "Av. de Mayo 1370, CABA" }
+    ],
+    "conductor": null
+  }
+]
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "El usuario no tiene perfil de cliente" }` | El usuario autenticado no tiene registro de cliente |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CLIENTE |
+
+---
+
+### GET /api/viajes/:id
+
+Devuelve el detalle de un viaje. Solo puede acceder el cliente que lo creó o el conductor asignado.
+
+**Rol requerido:** Autenticado (CLIENTE o CONDUCTOR)
+
+**Headers:**
+```
+Authorization: Bearer <firebase-id-token>
+```
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "id_viaje": 42,
+  "zona": "CABA",
+  "precio_estimado": 2500,
+  "precio_real": null,
+  "estado": "BUSCANDO_CONDUCTOR",
+  "fecha_programada": "2026-05-10T10:00:00.000Z",
+  "creado_en": "2026-05-03T12:00:00.000Z",
+  "paradas": [
+    { "orden": 1, "direccion": "Av. de Mayo 1370, CABA", "lat": -34.603722, "lng": -58.381592, "estado": "PENDIENTE" }
+  ],
+  "condiciones_req": [
+    { "condicion": "FRAGIL" }
+  ],
+  "cliente": {
+    "id_cliente": 3,
+    "usuario": { "nombre": "Juan", "apellido": "Pérez", "email": "juan@example.com" }
+  },
+  "conductor": null
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Sin acceso a este viaje" }` | El usuario no es el cliente ni el conductor del viaje |
+| 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
+
+---
+
 ## Eventos de Socket.io
 
 ### ⚠️ PENDIENTE — conductor:aceptado

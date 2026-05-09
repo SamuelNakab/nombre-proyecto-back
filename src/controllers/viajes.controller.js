@@ -15,7 +15,7 @@ const camposBase = {
       z.object({
         lat: z.number(),
         lng: z.number(),
-        direccion: z.string().min(1),
+        direccion: z.string().min(1).optional(),
       })
     )
     .min(2),
@@ -121,9 +121,9 @@ export async function crearViaje(req, res) {
       paradas: {
         create: paradas.map((p, i) => ({
           orden: i + 1,
-          lat: p.lat,
-          lng: p.lng,
-          direccion: p.direccion,
+          latitud: p.lat,
+          longitud: p.lng,
+          direccion: p.direccion ?? `${p.lat},${p.lng}`,
         })),
       },
       condiciones_req: {

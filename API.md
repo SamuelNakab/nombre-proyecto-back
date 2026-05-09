@@ -342,8 +342,8 @@ Authorization: Bearer <firebase-id-token>
       "id_viaje": 42,
       "orden": 1,
       "direccion": "Av. de Mayo 1370, CABA",
-      "lat": -34.603722,
-      "lng": -58.381592,
+      "latitud": -34.603722,
+      "longitud": -58.381592,
       "qr_token": "cuid_generado",
       "estado": "PENDIENTE",
       "fecha_entrega": null
@@ -388,7 +388,7 @@ Authorization: Bearer <firebase-id-token>
     "fecha_programada": "2026-05-10T10:00:00.000Z",
     "estado": "BUSCANDO_CONDUCTOR",
     "paradas": [
-      { "orden": 1, "direccion": "Av. de Mayo 1370, CABA", "lat": -34.603722, "lng": -58.381592 }
+      { "orden": 1, "direccion": "Av. de Mayo 1370, CABA", "latitud": -34.603722, "longitud": -58.381592 }
     ],
     "condiciones_req": [],
     "cliente": {
@@ -473,7 +473,7 @@ Authorization: Bearer <firebase-id-token>
   "fecha_programada": "2026-05-10T10:00:00.000Z",
   "creado_en": "2026-05-03T12:00:00.000Z",
   "paradas": [
-    { "orden": 1, "direccion": "Av. de Mayo 1370, CABA", "lat": -34.603722, "lng": -58.381592, "estado": "PENDIENTE" }
+    { "orden": 1, "direccion": "Av. de Mayo 1370, CABA", "latitud": -34.603722, "longitud": -58.381592, "estado": "PENDIENTE" }
   ],
   "condiciones_req": [
     { "condicion": "FRAGIL" }

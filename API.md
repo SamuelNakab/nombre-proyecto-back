@@ -555,3 +555,20 @@ Firebase config (misma para mobile y web):
   apiKey: "..."
   authDomain: "..."
   projectId: "..."
+
+{
+    "email": "mail@domain.com",
+    "password": "password",
+    "returnSecureToken": true
+}
+
+{
+  "kind": "identitytoolkit#VerifyPasswordResponse",
+  "localId": "EJGLVSmawodt4lmKpRRREYxgzVo2",
+  "email": "mail@domain.com",
+  "displayName": "",
+  "idToken": "eyJhbGciOiJSUzI1NiIsImtpZCI6Ijg2OGU0YWNlMGI2NTE2ZDM2YjlmNTZkZThjZTQ5Nzg4ZmNjZGFjNDMiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL3NlY3VyZXRva2VuLmdvb2dsZS5jb20vZmxldGVzLThmYWJhIiwiYXVkIjoiZmxldGVzLThmYWJhIiwiYXV0aF90aW1lIjoxNzc4Mjk3OTM0LCJ1c2VyX2lkIjoiRUpHTFZTbWF3b2R0NGxtS3BSUlJFWXhnelZvMiIsInN1YiI6IkVKR0xWU21hd29kdDRsbUtwUlJSRVl4Z3pWbzIiLCJpYXQiOjE3NzgyOTc5MzQsImV4cCI6MTc3ODMwMTUzNCwiZW1haWwiOiJtYWlsQGRvbWFpbi5jb20iLCJlbWFpbF92ZXJpZmllZCI6ZmFsc2UsImZpcmViYXNlIjp7ImlkZW50aXRpZXMiOnsiZW1haWwiOlsibWFpbEBkb21haW4uY29tIl19LCJzaWduX2luX3Byb3ZpZGVyIjoicGFzc3dvcmQifX0.L0AvQYE7S7YzFr9Ih96m2w2FKRK20VVSISQ3vic6FqHL00H7Q6EXxRN924VgGjcyZvscZIoODthjtpjyIGKq2Ur0VPxjV0kr8JYd-pxxvUHpWox-MEGrPSFKUfvyTcq2FEYF_MuJl81w7n3QREmCqXmmXw0tQHg5oAmLpM6WT_cbw1o2-5BARZvmtWGl2DrNMqpVfCOGmApbz45iQaVfhuJqPuJp-YLL_Ogs3I3pisAy7LLAowp_Uto-fvOB3TIWOUsYcPPYhGU3Jg0LzzI78XReICYQnx77VXIfvWnpEUyciNRilVgv_NM-ak2PTufXMVL_DYQd3ewda4CJOx4tpw",
+  "registered": true,
+  "refreshToken": "AMf-vBwLZMK7VVyk2rM4Tm2-1nM-FVIDKvtLLsv2zPDdos1i0As7lkK2SYDEKNf7zxqP6kAepOiHbY6Mljr36wGPe1-cDBO4NlaWwFYwfg2M2gphgJI8ZDh0bcdW-qAgV9AxYEgoYlaJiOAxSZ2xWaQmq9wDXRmAiIxzO18BtmGz4xnTrgkJugmiZXXo7e20xkWKUzMUX-LG",
+  "expiresIn": "3600"
+}

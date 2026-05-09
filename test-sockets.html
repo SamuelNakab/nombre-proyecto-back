@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Fleter — Test Sockets</title>
+  <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #0f172a; color: #e2e8f0; }
+    input { background: #1e293b; color: white; border: 1px solid #334155; 
+            padding: 8px; width: 500px; margin: 4px 0; }
+    button { background: #2563eb; color: white; border: none; 
+             padding: 8px 16px; cursor: pointer; margin: 4px; }
+    button:hover { background: #1d4ed8; }
+    #log { background: #1e293b; padding: 16px; margin-top: 16px; 
+           height: 400px; overflow-y: auto; border: 1px solid #334155; }
+    .event { color: #86efac; }
+    .error { color: #fca5a5; }
+    .info  { color: #93c5fd; }
+    .sent  { color: #fde68a; }
+  </style>
+</head>
+<body>
+  <h2>Fleter — Test WebSockets</h2>
+
+  <div>
+    <input id="token" placeholder="Pegá tu token de Firebase acá (sin Bearer)" />
+    <br>
+    <input id="viajeId" placeholder="ID del viaje (para aceptar)" />
+    <br>
+    <button onclick="conectar()">Conectar</button>
+    <button onclick="aceptarViaje()">Aceptar viaje</button>
+    <button onclick="desconectar()">Desconectar</button>
+  </div>
+
+  <div id="log"></div>
+
+  <script>
+    let socket = null;
+
+    function log(msg, tipo = 'info') {
+      const div = document.getElementById('log');
+      const time = new Date().toLocaleTimeString();
+      div.innerHTML += `<div class="${tipo}">[${time}] ${msg}</div>`;
+      div.scrollTop = div.scrollHeight;
+    }
+
+    function conectar() {
+      const token = document.getElementById('token').value.trim();
+      if (!token) { log('Pegá el token primero', 'error'); return; }
+
+      if (socket) socket.disconnect();
+
+      log('Conectando...', 'info');
+
+      socket = io('http://localhost:3000', {
+        auth: { token: 'Bearer ' + token }
+      });
+
+      socket.on('connect', () => {
+        log(`Conectado. Socket ID: ${socket.id}`, 'info');
+      });
+
+      socket.on('connect_error', (err) => {
+        log(`Error de conexion: ${err.message}`, 'error');
+      });
+
+      socket.on('disconnect', (reason) => {
+        log(`Desconectado: ${reason}`, 'error');
+      });
+
+      // Eventos de matching
+      socket.on('viaje:disponible', (data) => {
+        log(`VIAJE DISPONIBLE: ${JSON.stringify(data, null, 2)}`, 'event');
+      });
+
+      socket.on('viaje:conductor_asignado', (data) => {
+        log(`CONDUCTOR ASIGNADO: ${JSON.stringify(data, null, 2)}`, 'event');
+      });
+
+      socket.on('viaje:ya_asignado', (data) => {
+        log(`YA ASIGNADO (llegaste tarde): ${JSON.stringify(data)}`, 'error');
+      });
+
+      socket.on('viaje:cancelado_sin_conductor', (data) => {
+        log(`CANCELADO SIN CONDUCTOR: ${JSON.stringify(data)}`, 'error');
+      });
+
+      socket.on('error', (data) => {
+        log(`ERROR del servidor: ${JSON.stringify(data)}`, 'error');
+      });
+    }
+
+    function aceptarViaje() {
+      if (!socket?.connected) { log('No estás conectado', 'error'); return; }
+      const id_viaje = parseInt(document.getElementById('viajeId').value);
+      if (!id_viaje) { log('Ingresá el ID del viaje', 'error'); return; }
+      socket.emit('viaje:aceptar', { id_viaje });
+      log(`Emitido viaje:aceptar para viaje ${id_viaje}`, 'sent');
+    }
+
+    function desconectar() {
+      if (socket) { socket.disconnect(); socket = null; }
+    }
+  </script>
+</body>
+</html>

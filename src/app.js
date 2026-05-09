@@ -1,9 +1,11 @@
 import 'dotenv/config';
+import { createServer } from 'http';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import authRoutes from './routes/auth.routes.js';
 import viajesRoutes from './routes/viajes.routes.js';
+import { inicializarSockets } from './sockets/index.js';
 
 const app = express();
 
@@ -18,7 +20,11 @@ app.get('/health', (_req, res) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/viajes', viajesRoutes);
 
+const httpServer = createServer(app);
+inicializarSockets(httpServer);
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
+httpServer.listen(PORT, () => {
   console.log(`Servidor corriendo en el puerto ${PORT}`);
+  console.log(`Socket.io escuchando en el puerto ${PORT}`);
 });

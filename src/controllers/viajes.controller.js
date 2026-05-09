@@ -1,8 +1,9 @@
 import { z } from 'zod';
 import prisma from '../config/prisma.js';
-import {
-  estimarCosto as estimarCostoService,
-} from '../services/costo.service.js';
+import { estimarCosto as estimarCostoService } from '../services/costo.service.js';
+import { obtenerConductoresElegibles } from '../services/elegibilidad.service.js';
+import { publicarViaje } from '../services/matching.service.js';
+import { io } from '../sockets/index.js';
 
 // ─── Schemas de validacion ───────────────────────────────────────────────────
 
@@ -135,6 +136,12 @@ export async function crearViaje(req, res) {
       condiciones_req: true,
     },
   });
+
+  if (io) {
+    const condicionesRequeridas = condiciones_requeridas;
+    const conductoresElegibles = await obtenerConductoresElegibles(condicionesRequeridas);
+    await publicarViaje(io, viaje, conductoresElegibles, req.usuario.id_usuario);
+  }
 
   return res.status(201).json(viaje);
 }

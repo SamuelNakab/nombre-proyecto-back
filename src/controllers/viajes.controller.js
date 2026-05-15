@@ -3,6 +3,7 @@ import prisma from '../config/prisma.js';
 import { estimarCosto as estimarCostoService } from '../services/costo.service.js';
 import { obtenerConductoresElegibles } from '../services/elegibilidad.service.js';
 import { publicarViaje } from '../services/matching.service.js';
+import { obtenerAcumulado } from '../services/gps.service.js';
 import { io } from '../sockets/index.js';
 
 // ─── Schemas de validacion ───────────────────────────────────────────────────
@@ -197,6 +198,98 @@ export async function obtenerViaje(req, res) {
   }
 
   return res.status(200).json(viaje);
+}
+
+export async function cambiarEstado(req, res) {
+  const schema = z.object({ estado: z.enum(['CARGANDO', 'DESCARGANDO']) });
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: parsed.error.issues[0].message });
+  }
+
+  const id_viaje = Number(req.params.id);
+  const { estado } = parsed.data;
+
+  const viaje = await prisma.viaje.findUnique({
+    where: { id_viaje },
+    include: { conductor: true },
+  });
+  if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
+  if (!viaje.conductor || viaje.conductor.id_usuario !== req.usuario.id_usuario) {
+    return res.status(403).json({ error: 'No sos el conductor de este viaje' });
+  }
+  if (viaje.estado === 'FINALIZADO' || viaje.estado === 'CANCELADO') {
+    return res.status(400).json({ error: 'El viaje ya esta finalizado o cancelado' });
+  }
+
+  const estado_anterior = viaje.estado;
+  await prisma.viaje.update({ where: { id_viaje }, data: { estado } });
+
+  if (io) {
+    io.to(`viaje:${id_viaje}`).emit('viaje:estado_cambiado', {
+      id_viaje,
+      estado_anterior,
+      estado_nuevo: estado,
+    });
+  }
+
+  return res.status(200).json({ id_viaje, estado_anterior, estado_nuevo: estado });
+}
+
+export async function obtenerCostoAcumulado(req, res) {
+  const id_viaje = Number(req.params.id);
+
+  const viaje = await prisma.viaje.findUnique({
+    where: { id_viaje },
+    include: {
+      cliente: true,
+      conductor: true,
+    },
+  });
+  if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
+
+  const esCliente = viaje.cliente.id_usuario === req.usuario.id_usuario;
+  const esConductor = viaje.conductor !== null && viaje.conductor.id_usuario === req.usuario.id_usuario;
+  if (!esCliente && !esConductor) {
+    return res.status(403).json({ error: 'Sin acceso a este viaje' });
+  }
+
+  const acumulado = await obtenerAcumulado(id_viaje);
+  if (!acumulado) {
+    return res.status(200).json({ precio_acumulado: 0, desglose: null });
+  }
+
+  let precio_acumulado = 0;
+  let precio_por_tiempo = null;
+  let precio_por_distancia = null;
+
+  if (viaje.zona === 'CABA') {
+    precio_por_tiempo = acumulado.tiempo_horas * (viaje.tarifa_hora || 0);
+    precio_acumulado = precio_por_tiempo;
+  } else if (viaje.zona === 'PROVINCIA') {
+    precio_por_distancia = acumulado.distancia_km * (viaje.tarifa_km || 0);
+    precio_acumulado = precio_por_distancia;
+  } else {
+    precio_por_tiempo = acumulado.tiempo_horas * (viaje.tarifa_hora || 0);
+    precio_por_distancia = acumulado.distancia_km * (viaje.tarifa_km || 0);
+    precio_acumulado = precio_por_tiempo + precio_por_distancia;
+  }
+
+  const hora = new Date().getHours();
+  const es_hora_pico = (hora >= 7 && hora <= 10) || (hora >= 17 && hora <= 20);
+
+  return res.status(200).json({
+    precio_acumulado,
+    desglose: {
+      precio_por_tiempo,
+      precio_por_distancia,
+      tiempo_horas: acumulado.tiempo_horas,
+      distancia_km: acumulado.distancia_km,
+      tarifa_hora: viaje.tarifa_hora,
+      tarifa_km: viaje.tarifa_km,
+      es_hora_pico,
+    },
+  });
 }
 
 export async function listarMisViajes(req, res) {

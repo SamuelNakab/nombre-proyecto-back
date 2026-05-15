@@ -2,6 +2,7 @@ import { Server } from 'socket.io';
 import prisma from '../config/prisma.js';
 import { autenticarSocket } from './auth.socket.js';
 import { manejarAceptarViaje } from './matching.socket.js';
+import { registrarHandlersGPS } from './gps.socket.js';
 
 export let io = null;
 
@@ -21,6 +22,7 @@ export function inicializarSockets(httpServer) {
     }
 
     manejarAceptarViaje(socket, io);
+    registrarHandlersGPS(socket, io);
 
     socket.on('disconnect', () => {
       console.log(`[Socket] desconectado: ${rol} uid:${id_usuario} id:${socket.id}`);

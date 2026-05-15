@@ -287,21 +287,27 @@ Si `GOOGLE_MAPS_API_KEY` no está configurada usa valores mock (10 km, 0.5 h).
     { "lat": -34.6037, "lng": -58.3816, "direccion": "Plaza de Mayo, CABA" },
     { "lat": -34.5895, "lng": -58.3974, "direccion": "Recoleta, CABA" }
   ],
-  "tarifa_hora": 5000
+  "fecha_programada": "2026-07-01T08:00:00.000Z"
 }
 ```
 
 - `zona`: `"CABA"` | `"PROVINCIA"` | `"MIXTO"`
 - `paradas`: mínimo 2 elementos
-- `tarifa_hora`: requerido si zona es `CABA` o `MIXTO`
-- `tarifa_km`: requerido si zona es `PROVINCIA` o `MIXTO`
+- `fecha_programada`: opcional. Si se omite se usa la fecha/hora actual para determinar si es hora pico.
 
 **Respuesta exitosa — 200:**
 ```json
 {
   "precio_estimado": 2500,
-  "distancia_total_km": 2.3,
-  "tiempo_total_horas": 0.5
+  "desglose": {
+    "precio_por_tiempo": 2500,
+    "precio_por_distancia": null,
+    "tiempo_horas": 0.5,
+    "distancia_km": 2.3,
+    "tarifa_hora": 5000,
+    "tarifa_km": null,
+    "es_hora_pico": true
+  }
 }
 ```
 
@@ -330,8 +336,6 @@ instantáneamente a los conductores elegibles conectados via WebSocket.
     { "lat": -34.6037, "lng": -58.3816, "direccion": "Plaza de Mayo, CABA" },
     { "lat": -34.92, "lng": -57.95, "direccion": "La Plata, Buenos Aires" }
   ],
-  "tarifa_hora": 5000,
-  "tarifa_km": 800,
   "fecha_programada": "2026-07-01T10:00:00.000Z",
   "condiciones_requeridas": ["FRAGIL", "REFRIGERADO"]
 }
@@ -340,6 +344,9 @@ instantáneamente a los conductores elegibles conectados via WebSocket.
 - `fecha_programada`: fecha ISO futura, mínimo 1 hora desde el momento del request
 - `condiciones_requeridas`: opcional. Valores posibles: `FRAGIL`, `REFRIGERADO`,
   `CARGA_PESADA`, `PELIGROSO`, `VOLUMINOSO`
+
+Las tarifas se calculan automáticamente según la zona y si la `fecha_programada` cae en hora pico
+(7–10 h o 17–20 h). Se usan las variables de entorno `TARIFA_*` o los valores por defecto.
 
 **Respuesta exitosa — 201:**
 ```json
@@ -351,10 +358,10 @@ instantáneamente a los conductores elegibles conectados via WebSocket.
   "id_empresa": null,
   "zona": "MIXTO",
   "tarifa_hora": 5000,
-  "tarifa_km": 800,
+  "tarifa_km": 200,
   "fecha_programada": "2026-07-01T10:00:00.000Z",
   "estado": "BUSCANDO_CONDUCTOR",
-  "precio_estimado": 10800,
+  "precio_estimado": 4500,
   "precio_real": null,
   "creado_en": "2026-05-09T12:00:00.000Z",
   "paradas": [
@@ -372,7 +379,16 @@ instantáneamente a los conductores elegibles conectados via WebSocket.
   "condiciones_req": [
     { "id_condicion_req": 1, "condicion": "FRAGIL" },
     { "id_condicion_req": 2, "condicion": "REFRIGERADO" }
-  ]
+  ],
+  "desglose_estimado": {
+    "precio_por_tiempo": 2500,
+    "precio_por_distancia": 2000,
+    "tiempo_horas": 0.5,
+    "distancia_km": 10,
+    "tarifa_hora": 5000,
+    "tarifa_km": 200,
+    "es_hora_pico": true
+  }
 }
 ```
 

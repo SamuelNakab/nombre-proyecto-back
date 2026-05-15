@@ -7,43 +7,70 @@ el sistema lo publica a conductores elegibles via WebSocket,
 el primero en aceptar queda asignado.
 
 ## Estado actual del proyecto
-Fase 1 COMPLETA y desplegada en Railway.
-Fase 2 EN DESARROLLO en branch develop.
-
-## RESTRICCION ACTIVA DE DESARROLLO
-GOOGLE_MAPS_API_KEY no esta disponible todavia.
-Todo el codigo que use Google Maps debe funcionar de la siguiente manera:
-- Si GOOGLE_MAPS_API_KEY existe en el .env: usar la API real de Google
-- Si GOOGLE_MAPS_API_KEY no existe o esta vacia: usar valores mock hardcodeados
-  y loggear un warning en consola: "GOOGLE_MAPS_API_KEY no configurada, usando valores mock"
-- Los valores mock son: distancia_km = 10, tiempo_horas = 0.5
-- Esta logica va SOLO en costo.service.js — el resto del codigo no sabe si es mock o real
-- Cuando se agregue la key al .env, todo funciona automaticamente sin cambiar codigo
+- Fase 1 COMPLETA: autenticacion, registro, login, perfiles
+- Fase 2 COMPLETA: creacion de viajes, matching, listado para conductores
+- Fase 3 COMPLETA: matching en tiempo real con Socket.io
+- MODIFICACION EN CURSO: eliminar tarifas del body del usuario,
+  el backend las calcula con tarifa.service.js
 
 ## Stack
 - Node.js 22 con ES Modules (import/export — NUNCA require)
 - Express
-- PostgreSQL en Neon (serverless)
-- Prisma 6 como ORM (version fija sin caret)
+- PostgreSQL en Neon — Prisma 6 (version fija sin caret)
 - Firebase Admin SDK para autenticacion
-- Socket.io para WebSockets (proxima fase)
-- Redis (proximas fases)
+- Socket.io v4
+- Redis con ioredis
 - Zod para validacion
-- BullMQ para colas (proximas fases)
-- Google Maps API Distance Matrix (requiere GOOGLE_MAPS_API_KEY en .env)
+- BullMQ (proximas fases)
+- Google Maps API (mock activo — GOOGLE_MAPS_API_KEY vacia)
 
 ## Reglas de codigo
 - ES Modules siempre. NUNCA require().
-- Para modulos CommonJS usar:
-    import pkg from 'nombre-modulo';
-    const { NamedExport } = pkg;
+- Modulos CommonJS: import pkg from 'modulo'; const { X } = pkg;
 - Async/await siempre.
 - Validar todos los inputs con Zod.
 - Respuestas de error: { error: "mensaje" }
 - Variables de entorno: todas en .env, nunca hardcodeadas.
 - Nombres de archivos: kebab-case.
 - Named exports en controllers y services.
-- Nunca modificar la DB directamente. Todo via schema.prisma + migrate.
+
+## MODELO DE TARIFAS — CAMBIO IMPORTANTE
+El usuario YA NO manda tarifa_hora ni tarifa_km en el body.
+El backend calcula las tarifas con tarifa.service.js.
+
+El algoritmo simple (placeholder hasta tener uno real):
+- Hora pico (7-10hs y 17-20hs): usar TARIFA_PICO_HORA_CABA o TARIFA_PICO_KM_PROVINCIA
+- Resto del dia: usar TARIFA_BASE_HORA_CABA o TARIFA_BASE_KM_PROVINCIA
+- Las variables de entorno definen las tarifas base
+
+Variables de entorno de tarifas:
+  TARIFA_BASE_HORA_CABA=3500       (ARS por hora, horario normal)
+  TARIFA_PICO_HORA_CABA=5000       (ARS por hora, hora pico)
+  TARIFA_BASE_KM_PROVINCIA=150     (ARS por km, horario normal)
+  TARIFA_PICO_KM_PROVINCIA=200     (ARS por km, hora pico)
+
+## DESGLOSE DE PRECIO — OBLIGATORIO
+Toda respuesta que incluya un precio DEBE incluir el desglose.
+El desglose explica como se llego al precio total.
+
+Estructura del desglose:
+{
+  "precio_total": 3250,
+  "desglose": {
+    "precio_por_tiempo": 2100,     (null si zona es PROVINCIA)
+    "precio_por_distancia": 1150,  (null si zona es CABA)
+    "tiempo_horas": 0.6,
+    "distancia_km": 10.5,
+    "tarifa_hora": 3500,           (null si zona es PROVINCIA)
+    "tarifa_km": null,             (null si zona es CABA)
+    "es_hora_pico": false
+  }
+}
+
+Esto aplica a:
+- POST /api/viajes/estimar-costo
+- POST /api/viajes (campo desglose_estimado)
+- Al finalizar el viaje (campo desglose_real)
 
 ## Estructura de carpetas
 src/
@@ -59,60 +86,45 @@ src/
 │   ├── auth.controller.js
 │   └── viajes.controller.js
 ├── services/
-│   ├── costo.service.js
-│   └── elegibilidad.service.js
+│   ├── tarifa.service.js      ← NUEVO: calcula tarifas segun zona y hora
+│   ├── costo.service.js       ← MODIFICAR: ya no recibe tarifas del usuario
+│   ├── elegibilidad.service.js
+│   └── matching.service.js
 ├── middlewares/
-│   ├── auth.middleware.js
-│   └── validate.middleware.js
+│   └── auth.middleware.js
 ├── sockets/
-├── jobs/
+│   ├── index.js
+│   ├── matching.socket.js
+│   └── auth.socket.js
 └── app.js
 prisma/
 ├── schema.prisma
 └── migrations/
 
-## Modelos relevantes para Fase 2
-Viaje              → id_conductor/id_vehiculo/id_empresa son nullable al crear
-Parada             → qr_token UNIQUE GLOBAL (cuid generado por Prisma)
-CondicionRequerida → lo que necesita el viaje
-CondicionVehiculo  → capacidades del vehiculo
-Cliente            → quien crea el viaje
-Conductor          → quien ve los viajes disponibles
-
-## Logica del calculo de costo
-- Zona CABA: costo = tiempo_horas_total * tarifa_hora
-- Zona PROVINCIA: costo = distancia_km_total * tarifa_km
-- Zona MIXTO: costo = (tiempo * tarifa_hora) + (distancia * tarifa_km)
-- precio_estimado se calcula al crear el viaje
-- precio_real se calcula al finalizar con datos GPS reales (Fase 4)
-
-## Filtro de conductores elegibles
-Un conductor es elegible si al menos uno de sus vehiculos cumple
-TODAS las condiciones requeridas por el viaje.
-
 ## Variables de entorno
-Todas en .env (no se pushea). Ver .env.example.
-GOOGLE_MAPS_API_KEY → requerida para calculos reales, opcional para desarrollo
-                      (el sistema usa mock si no esta presente)
+Todas en .env. Ver .env.example.
+Nuevas variables de tarifas:
+  TARIFA_BASE_HORA_CABA=3500
+  TARIFA_PICO_HORA_CABA=5000
+  TARIFA_BASE_KM_PROVINCIA=150
+  TARIFA_PICO_KM_PROVINCIA=200
 
-## Endpoints existentes (Fase 1)
+## Endpoints existentes
 POST /api/auth/registro-cliente
 POST /api/auth/registro-conductor
 POST /api/auth/registro-gerente
 POST /api/auth/login
 GET  /api/auth/me
 PUT  /api/auth/perfil
+POST /api/viajes/estimar-costo   ← MODIFICAR: quitar tarifas del body
+POST /api/viajes                 ← MODIFICAR: quitar tarifas del body
+GET  /api/viajes/disponibles
+GET  /api/viajes/mis-viajes
+GET  /api/viajes/:id
 GET  /health
 
-## Endpoints a implementar en Fase 2
-POST /api/viajes/estimar-costo    (CLIENTE)
-POST /api/viajes                  (CLIENTE)
-GET  /api/viajes/disponibles      (CONDUCTOR)
-GET  /api/viajes/mis-viajes       (CLIENTE)
-GET  /api/viajes/:id              (autenticado)
-
 ## Comandos importantes
-npm run dev                                → desarrollo local
-npm run start                              → produccion
-npx prisma migrate dev --name descripcion  → nueva migracion
-npx prisma studio                          → UI para ver la DB
+npm run dev
+npm run start
+npx prisma migrate dev --name descripcion
+npx prisma studio

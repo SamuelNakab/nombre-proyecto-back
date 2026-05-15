@@ -1,3 +1,5 @@
+import { obtenerTarifas } from './tarifa.service.js';
+
 async function getDistanciaYTiempo(origenLat, origenLng, destinoLat, destinoLng) {
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
 
@@ -36,7 +38,9 @@ export async function calcularDistanciaYTiempo(origen, destino) {
   return getDistanciaYTiempo(origen.lat, origen.lng, destino.lat, destino.lng);
 }
 
-export async function estimarCosto({ zona, paradas, tarifa_hora, tarifa_km }) {
+export async function estimarCosto({ zona, paradas, fecha_programada }) {
+  const { tarifa_hora, tarifa_km, es_hora_pico } = obtenerTarifas(zona, new Date(fecha_programada));
+
   let distancia_total_km = 0;
   let tiempo_total_horas = 0;
 
@@ -47,13 +51,31 @@ export async function estimarCosto({ zona, paradas, tarifa_hora, tarifa_km }) {
   }
 
   let precio_estimado;
+  let precio_por_tiempo = null;
+  let precio_por_distancia = null;
+
   if (zona === 'CABA') {
-    precio_estimado = tiempo_total_horas * tarifa_hora;
+    precio_por_tiempo = tiempo_total_horas * tarifa_hora;
+    precio_estimado = precio_por_tiempo;
   } else if (zona === 'PROVINCIA') {
-    precio_estimado = distancia_total_km * tarifa_km;
+    precio_por_distancia = distancia_total_km * tarifa_km;
+    precio_estimado = precio_por_distancia;
   } else {
-    precio_estimado = tiempo_total_horas * tarifa_hora + distancia_total_km * tarifa_km;
+    precio_por_tiempo = tiempo_total_horas * tarifa_hora;
+    precio_por_distancia = distancia_total_km * tarifa_km;
+    precio_estimado = precio_por_tiempo + precio_por_distancia;
   }
 
-  return { precio_estimado, distancia_total_km, tiempo_total_horas };
+  return {
+    precio_estimado,
+    desglose: {
+      precio_por_tiempo,
+      precio_por_distancia,
+      tiempo_horas: tiempo_total_horas,
+      distancia_km: distancia_total_km,
+      tarifa_hora,
+      tarifa_km,
+      es_hora_pico,
+    },
+  };
 }

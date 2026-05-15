@@ -20,45 +20,27 @@ const camposBase = {
       })
     )
     .min(2),
-  tarifa_hora: z.number().positive().optional(),
-  tarifa_km: z.number().positive().optional(),
 };
 
-function refineTarifas(data, ctx) {
-  if (['CABA', 'MIXTO'].includes(data.zona) && data.tarifa_hora == null) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: 'tarifa_hora es requerida para zona CABA o MIXTO',
-      path: ['tarifa_hora'],
-    });
-  }
-  if (['PROVINCIA', 'MIXTO'].includes(data.zona) && data.tarifa_km == null) {
-    ctx.addIssue({
-      code: z.ZodIssueCode.custom,
-      message: 'tarifa_km es requerida para zona PROVINCIA o MIXTO',
-      path: ['tarifa_km'],
-    });
-  }
-}
+const schemaEstimar = z.object({
+  ...camposBase,
+  fecha_programada: z.string().optional(),
+});
 
-const schemaEstimar = z.object(camposBase).superRefine(refineTarifas);
-
-const schemaCrear = z
-  .object({
-    ...camposBase,
-    fecha_programada: z.string().refine(
-      (val) => {
-        const date = new Date(val);
-        return !isNaN(date.getTime()) && date > new Date(Date.now() + 60 * 60 * 1000);
-      },
-      { message: 'fecha_programada debe ser una fecha ISO futura (al menos 1 hora desde ahora)' }
-    ),
-    condiciones_requeridas: z
-      .array(z.enum(CONDICIONES))
-      .optional()
-      .default([]),
-  })
-  .superRefine(refineTarifas);
+const schemaCrear = z.object({
+  ...camposBase,
+  fecha_programada: z.string().refine(
+    (val) => {
+      const date = new Date(val);
+      return !isNaN(date.getTime()) && date > new Date(Date.now() + 60 * 60 * 1000);
+    },
+    { message: 'fecha_programada debe ser una fecha ISO futura (al menos 1 hora desde ahora)' }
+  ),
+  condiciones_requeridas: z
+    .array(z.enum(CONDICIONES))
+    .optional()
+    .default([]),
+});
 
 // ─── Helper de elegibilidad en memoria ──────────────────────────────────────
 
@@ -78,10 +60,11 @@ export async function estimarCosto(req, res) {
     return res.status(400).json({ error: parsed.error.issues[0].message });
   }
 
-  const { zona, paradas, tarifa_hora, tarifa_km } = parsed.data;
+  const { zona, paradas, fecha_programada } = parsed.data;
+  const fechaEfectiva = fecha_programada ?? new Date().toISOString();
 
   try {
-    const resultado = await estimarCostoService({ zona, paradas, tarifa_hora, tarifa_km });
+    const resultado = await estimarCostoService({ zona, paradas, fecha_programada: fechaEfectiva });
     return res.status(200).json(resultado);
   } catch {
     return res.status(503).json({ error: 'No se pudo calcular la distancia' });
@@ -94,8 +77,7 @@ export async function crearViaje(req, res) {
     return res.status(400).json({ error: parsed.error.issues[0].message });
   }
 
-  const { zona, paradas, tarifa_hora, tarifa_km, fecha_programada, condiciones_requeridas } =
-    parsed.data;
+  const { zona, paradas, fecha_programada, condiciones_requeridas } = parsed.data;
 
   const cliente = await prisma.cliente.findUnique({
     where: { id_usuario: req.usuario.id_usuario },
@@ -106,10 +88,12 @@ export async function crearViaje(req, res) {
 
   let resultado;
   try {
-    resultado = await estimarCostoService({ zona, paradas, tarifa_hora, tarifa_km });
+    resultado = await estimarCostoService({ zona, paradas, fecha_programada });
   } catch {
     return res.status(503).json({ error: 'No se pudo calcular la distancia' });
   }
+
+  const { tarifa_hora, tarifa_km } = resultado.desglose;
 
   const viaje = await prisma.viaje.create({
     data: {
@@ -138,12 +122,11 @@ export async function crearViaje(req, res) {
   });
 
   if (io) {
-    const condicionesRequeridas = condiciones_requeridas;
-    const conductoresElegibles = await obtenerConductoresElegibles(condicionesRequeridas);
+    const conductoresElegibles = await obtenerConductoresElegibles(condiciones_requeridas);
     await publicarViaje(io, viaje, conductoresElegibles, req.usuario.id_usuario);
   }
 
-  return res.status(201).json(viaje);
+  return res.status(201).json({ ...viaje, desglose_estimado: resultado.desglose });
 }
 
 export async function listarViajesDisponibles(req, res) {

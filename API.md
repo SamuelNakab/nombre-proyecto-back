@@ -587,9 +587,15 @@ socket.on('connect_error', (err) => {
     { "orden": 1, "direccion": "Plaza de Mayo, CABA" },
     { "orden": 2, "direccion": "Recoleta, CABA" }
   ],
-  "condiciones_req": []
+  "condiciones_req": [
+    { "condicion": "FRAGIL" },
+    { "condicion": "REFRIGERADO" }
+  ]
 }
 ```
+
+**Nota:** `condiciones_req` puede ser un array vacío si el viaje
+no requiere condiciones especiales de vehículo.
 
 **Cómo escucharlo:**
 ```js
@@ -634,6 +640,7 @@ si ganó la carrera o `viaje:ya_asignado` si otro conductor fue más rápido.
 ```json
 {
   "id_viaje": 42,
+  "id_usuario_conductor": 7,
   "conductor": {
     "nombre": "Carlos",
     "apellido": "López",
@@ -656,6 +663,13 @@ socket.on('viaje:conductor_asignado', (data) => {
   console.log('Conductor asignado:', data.conductor.nombre);
 });
 ```
+
+**Importante para mobile y web:** usá `id_usuario_conductor` para distinguir
+si el evento es para vos o para otro conductor del room:
+- Si `data.id_usuario_conductor === tuUsuario.id_usuario` → fuiste asignado,
+  navegar a la pantalla del viaje activo
+- Si no coincide → otro conductor fue asignado, sacar el viaje de tu lista
+  de disponibles
 
 ---
 

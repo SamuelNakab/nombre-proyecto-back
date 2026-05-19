@@ -64,6 +64,7 @@ export function manejarAceptarViaje(socket, io) {
     const room = `viaje:${id_viaje}`;
     io.to(room).emit('viaje:conductor_asignado', {
       id_viaje,
+      id_usuario_conductor: conductor.id_usuario,
       conductor: {
         nombre: conductor.usuario.nombre,
         apellido: conductor.usuario.apellido,

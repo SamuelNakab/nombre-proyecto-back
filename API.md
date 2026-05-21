@@ -1,5 +1,4 @@
-El API.md que tenés mezcló contenido del CLAUDE.md adentro. Acá está el API.md correcto y completo hasta Fase 3. Reemplazás todo el contenido del archivo con esto:
-markdown# Fleter — Contrato de API
+# Fleter — Contrato de API
 
 Documento de referencia para el equipo mobile y web.
 Base URL desarrollo: `http://localhost:3000`
@@ -10,7 +9,9 @@ Base URL producción: `https://nombre-proyecto-back-production.up.railway.app`
 ## Autenticación
 
 La mayoría de endpoints requieren un JWT de Firebase en el header:
+```
 Authorization: Bearer <firebase-id-token>
+```
 
 El token se obtiene del cliente Firebase después de que el usuario inicia sesión.
 Este backend **nunca autentica contraseñas directamente** — solo verifica el token.
@@ -30,13 +31,16 @@ const token = await getAuth().currentUser.getIdToken();
 El token dura 1 hora. Firebase lo renueva automáticamente.
 
 **Para testing (Thunder Client / Postman):**
+```
 POST https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=TU_FIREBASE_WEB_API_KEY
+
 Body:
 {
-"email": "usuario@test.com",
-"password": "password",
-"returnSecureToken": true
+  "email": "usuario@test.com",
+  "password": "password",
+  "returnSecureToken": true
 }
+```
 El campo `idToken` de la respuesta es el Bearer token.
 
 ---
@@ -431,7 +435,10 @@ condiciones requeridas del viaje).
         "longitud": -58.3816
       }
     ],
-    "condiciones_req": [],
+    "condiciones_req": [
+      { "condicion": "FRAGIL" },
+      { "condicion": "REFRIGERADO" }
+    ],
     "cliente": {
       "usuario": {
         "nombre": "Juan",
@@ -442,6 +449,9 @@ condiciones requeridas del viaje).
   }
 ]
 ```
+
+**Nota:** `condiciones_req` puede ser un array vacío si el viaje no requiere
+condiciones especiales de vehículo.
 
 Ordenados por `fecha_programada` ascendente.
 
@@ -546,6 +556,87 @@ Detalle de un viaje. Solo puede acceder el cliente que lo creó o el conductor a
 
 ---
 
+### PATCH /api/viajes/:id/estado
+
+Cambia el estado del viaje manualmente. Solo puede ejecutarlo el conductor asignado al viaje.
+
+**Rol requerido:** `CONDUCTOR`
+
+**Body:**
+```json
+{
+  "estado": "CARGANDO"
+}
+```
+
+- `estado`: `"CARGANDO"` | `"DESCARGANDO"`
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "id_viaje": 42,
+  "estado_anterior": "EN_RUTA",
+  "estado_nuevo": "CARGANDO"
+}
+```
+
+**Comportamiento adicional:** emite el evento `viaje:estado_cambiado` al room del viaje via WebSocket.
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "mensaje de validación" }` | Estado no válido |
+| 400 | `{ "error": "El viaje ya esta finalizado o cancelado" }` | Viaje en estado terminal |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
+| 403 | `{ "error": "No sos el conductor de este viaje" }` | El conductor no está asignado a este viaje |
+| 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
+
+---
+
+### GET /api/viajes/:id/costo-acumulado
+
+Devuelve el costo acumulado del viaje en curso calculado a partir de los datos GPS en Redis.
+Solo puede acceder el cliente que creó el viaje o el conductor asignado.
+
+**Rol requerido:** Autenticado (`CLIENTE` o `CONDUCTOR`)
+
+**Respuesta exitosa — 200 (con GPS activo):**
+```json
+{
+  "precio_acumulado": 1837.5,
+  "desglose": {
+    "precio_por_tiempo": 1750,
+    "precio_por_distancia": 87.5,
+    "tiempo_horas": 0.5,
+    "distancia_km": 8.75,
+    "tarifa_hora": 3500,
+    "tarifa_km": 10,
+    "es_hora_pico": false
+  }
+}
+```
+
+**Respuesta exitosa — 200 (sin GPS todavía):**
+```json
+{
+  "precio_acumulado": 0,
+  "desglose": null
+}
+```
+
+- `precio_por_tiempo`: `null` si la zona es `PROVINCIA`
+- `precio_por_distancia`: `null` si la zona es `CABA`
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Sin acceso a este viaje" }` | El usuario no es el cliente ni el conductor del viaje |
+| 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
+
+---
+
 ## WebSockets — Matching en tiempo real
 
 La conexión WebSocket se establece con autenticación JWT igual que los endpoints REST.
@@ -572,8 +663,8 @@ socket.on('connect_error', (err) => {
 
 ### Evento: viaje:disponible
 
-**Dirección:** servidor → conductor  
-**Quién lo recibe:** conductores elegibles conectados cuando se crea un viaje nuevo  
+**Dirección:** servidor → conductor
+**Quién lo recibe:** conductores elegibles conectados cuando se crea un viaje nuevo
 **Cuándo:** inmediatamente después de que un cliente hace `POST /api/viajes`
 
 **Payload:**
@@ -594,8 +685,7 @@ socket.on('connect_error', (err) => {
 }
 ```
 
-**Nota:** `condiciones_req` puede ser un array vacío si el viaje
-no requiere condiciones especiales de vehículo.
+**Nota:** `condiciones_req` puede ser un array vacío si el viaje no requiere condiciones especiales de vehículo.
 
 **Cómo escucharlo:**
 ```js
@@ -609,8 +699,8 @@ socket.on('viaje:disponible', (data) => {
 
 ### Evento: viaje:aceptar
 
-**Dirección:** conductor → servidor  
-**Quién lo emite:** el conductor que quiere tomar el viaje  
+**Dirección:** conductor → servidor
+**Quién lo emite:** el conductor que quiere tomar el viaje
 **Cuándo:** cuando el conductor toca "Aceptar" en la pantalla del viaje disponible
 
 **Payload a emitir:**
@@ -632,8 +722,8 @@ si ganó la carrera o `viaje:ya_asignado` si otro conductor fue más rápido.
 
 ### Evento: viaje:conductor_asignado
 
-**Dirección:** servidor → room del viaje  
-**Quién lo recibe:** el cliente que creó el viaje y el conductor que aceptó  
+**Dirección:** servidor → room del viaje
+**Quién lo recibe:** el cliente que creó el viaje y todos los conductores en el room
 **Cuándo:** cuando un conductor acepta exitosamente el viaje
 
 **Payload:**
@@ -675,8 +765,8 @@ si el evento es para vos o para otro conductor del room:
 
 ### Evento: viaje:ya_asignado
 
-**Dirección:** servidor → conductor  
-**Quién lo recibe:** el conductor que intentó aceptar pero llegó tarde  
+**Dirección:** servidor → conductor
+**Quién lo recibe:** el conductor que intentó aceptar pero llegó tarde
 **Cuándo:** cuando dos conductores aceptan al mismo tiempo y el otro ganó
 
 **Payload:**
@@ -699,8 +789,8 @@ socket.on('viaje:ya_asignado', (data) => {
 
 ### Evento: viaje:cancelado_sin_conductor
 
-**Dirección:** servidor → cliente  
-**Quién lo recibe:** el cliente que creó el viaje  
+**Dirección:** servidor → cliente
+**Quién lo recibe:** el cliente que creó el viaje
 **Cuándo:** cuando nadie acepta el viaje dentro del tiempo límite (10 minutos por defecto)
 
 **Payload:**
@@ -721,6 +811,193 @@ socket.on('viaje:cancelado_sin_conductor', (data) => {
 
 ---
 
+## WebSockets — GPS en tiempo real (Fase 4)
+
+### Evento: conductor:ubicacion
+
+**Dirección:** conductor → servidor
+**Quién lo emite:** el conductor durante el viaje activo
+**Cuándo:** cada ~15 segundos mientras el conductor está en movimiento
+
+**Payload a emitir:**
+```json
+{
+  "id_viaje": 42,
+  "lat": -34.6037,
+  "lng": -58.3816,
+  "timestamp": 1746700000000
+}
+```
+
+- `timestamp`: milisegundos desde epoch (`Date.now()`)
+
+**Cómo emitirlo:**
+```js
+socket.emit('conductor:ubicacion', {
+  id_viaje: 42,
+  lat: -34.6037,
+  lng: -58.3816,
+  timestamp: Date.now()
+});
+```
+
+**Efectos secundarios en el servidor:**
+- Guarda coordenada en Redis (historial de últimas 20)
+- Acumula distancia y tiempo
+- Si el viaje estaba en `CONDUCTOR_ASIGNADO` y es el primer ping: cambia automáticamente a `EN_CAMINO_A_ORIGEN`
+- Emite `mapa:actualizar`, y cada ~60 s emite `costo:actualizar`
+- Si el viaje está en `EN_RUTA`: verifica desvíos y paradas sospechosas
+
+---
+
+### Evento: mapa:actualizar
+
+**Dirección:** servidor → room del viaje
+**Quién lo recibe:** cliente y conductor conectados al room `viaje:{id_viaje}`
+**Cuándo:** cada vez que el conductor emite `conductor:ubicacion`
+
+**Payload:**
+```json
+{
+  "lat": -34.6037,
+  "lng": -58.3816,
+  "timestamp": 1746700000000,
+  "velocidad_kmh": 47
+}
+```
+
+**Cómo escucharlo:**
+```js
+socket.on('mapa:actualizar', (data) => {
+  // actualizar marcador del conductor en el mapa
+  console.log(`Conductor en ${data.lat}, ${data.lng} — ${data.velocidad_kmh} km/h`);
+});
+```
+
+---
+
+### Evento: costo:actualizar
+
+**Dirección:** servidor → room del viaje
+**Quién lo recibe:** cliente y conductor conectados al room
+**Cuándo:** aproximadamente una vez por minuto (cuando `timestamp % 60000 < 16000`)
+
+**Payload:**
+```json
+{
+  "precio_acumulado": 1750,
+  "desglose": {
+    "precio_por_tiempo": 1750,
+    "precio_por_distancia": null,
+    "tiempo_horas": 0.5,
+    "distancia_km": 8.2,
+    "tarifa_hora": 3500,
+    "tarifa_km": null,
+    "es_hora_pico": false
+  }
+}
+```
+
+**Cómo escucharlo:**
+```js
+socket.on('costo:actualizar', (data) => {
+  // actualizar el medidor de costo en la pantalla del cliente
+  console.log('Costo acumulado:', data.precio_acumulado);
+});
+```
+
+---
+
+### Evento: alerta:desvio
+
+**Dirección:** servidor → room del viaje
+**Quién lo recibe:** cliente y conductor
+**Cuándo:** cuando el conductor se aleja más de `DESVIO_UMBRAL_METROS` (default 300 m) de la ruta trazada
+**Solo aplica:** viajes en estado `EN_RUTA`
+
+**Payload:**
+```json
+{
+  "id_viaje": 42,
+  "distancia_metros": 450,
+  "mensaje": "El conductor se desvio 450m de la ruta"
+}
+```
+
+**Cómo escucharlo:**
+```js
+socket.on('alerta:desvio', (data) => {
+  // mostrar alerta al cliente
+  console.log(data.mensaje);
+});
+```
+
+---
+
+### Evento: alerta:parada
+
+**Dirección:** servidor → room del viaje
+**Quién lo recibe:** cliente y conductor
+**Cuándo:** cuando el conductor lleva más de `PARADA_SOSPECHOSA_MINUTOS` (default 5 min) detenido
+fuera de las paradas del viaje
+**Solo aplica:** viajes en estado `EN_RUTA`, zonas `CABA` y `MIXTO`
+
+**Payload:**
+```json
+{
+  "id_viaje": 42,
+  "minutos_detenido": 7,
+  "mensaje": "El conductor lleva 7 minutos detenido"
+}
+```
+
+**Cómo escucharlo:**
+```js
+socket.on('alerta:parada', (data) => {
+  // mostrar alerta al cliente
+  console.log(data.mensaje);
+});
+```
+
+---
+
+### Evento: viaje:estado_cambiado
+
+**Dirección:** servidor → room del viaje
+**Quién lo recibe:** cliente y conductor
+**Cuándo:** cambio automático de estado por GPS (primer ping) o cambio manual via `PATCH /:id/estado`
+
+**Payload:**
+```json
+{
+  "id_viaje": 42,
+  "estado_anterior": "CONDUCTOR_ASIGNADO",
+  "estado_nuevo": "EN_CAMINO_A_ORIGEN"
+}
+```
+
+Estados posibles del viaje (flujo completo):
+
+| Estado | Descripción |
+|--------|-------------|
+| `BUSCANDO_CONDUCTOR` | Viaje creado, esperando que un conductor acepte |
+| `CONDUCTOR_ASIGNADO` | Conductor aceptó, aún no se movió |
+| `EN_CAMINO_A_ORIGEN` | Primer ping GPS recibido (automático) |
+| `EN_RUTA` | En curso — activar algoritmos de desvío y parada |
+| `CARGANDO` | Detenido cargando mercadería (manual via endpoint) |
+| `DESCARGANDO` | Detenido descargando mercadería (manual via endpoint) |
+| `FINALIZADO` | Viaje completado |
+| `CANCELADO` | Viaje cancelado |
+
+**Cómo escucharlo:**
+```js
+socket.on('viaje:estado_cambiado', (data) => {
+  console.log(`Viaje ${data.id_viaje}: ${data.estado_anterior} → ${data.estado_nuevo}`);
+});
+```
+
+---
+
 ## Convenciones generales
 
 - Todos los errores devuelven `{ "error": "mensaje legible" }`
@@ -728,4 +1005,4 @@ socket.on('viaje:cancelado_sin_conductor', (data) => {
 - El campo `contrasena` nunca se almacena en la DB — solo va a Firebase
 - `id_conductor`, `id_vehiculo` e `id_empresa` en el viaje son `null` hasta que se asigne un conductor
 - El campo `vehiculo` en `viaje:conductor_asignado` puede ser `null` si el conductor
-  no tiene vehículo registrado en la DB (se resuelve en Fase 4)
+  no tiene vehículo registrado en la DB

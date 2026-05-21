@@ -201,7 +201,7 @@ export async function obtenerViaje(req, res) {
 }
 
 export async function cambiarEstado(req, res) {
-  const schema = z.object({ estado: z.enum(['CARGANDO', 'DESCARGANDO']) });
+  const schema = z.object({ estado: z.enum(['CARGANDO', 'DESCARGANDO', 'EN_RUTA']) });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0].message });

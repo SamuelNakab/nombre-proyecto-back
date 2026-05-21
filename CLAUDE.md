@@ -17,6 +17,7 @@ elegibles via WebSocket, el primero en aceptar queda asignado.
 - Node.js 22 con ES Modules (import/export — NUNCA require)
 - Express
 - PostgreSQL en Neon — Prisma 6 (version fija sin caret)
+- Firebase Admin SDK para autenticacion
 - Socket.io v4
 - Redis con ioredis — EN USO en Fase 4 para GPS
 - Turf.js — para algoritmos geograficos en Fase 4

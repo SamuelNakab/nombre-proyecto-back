@@ -1,5 +1,4 @@
 import prisma from '../config/prisma.js';
-import redis from '../config/redis.js';
 import {
   guardarCoordenada,
   obtenerUltimaCoordenada,
@@ -114,7 +113,7 @@ export function registrarHandlersGPS(socket, io) {
         }
 
         const parada_result = await verificarParadaSospechosa(
-          id_viaje, viaje.zona, velocidad_kmh, lat, lng, viaje.paradas, redis
+          id_viaje, viaje.zona, velocidad_kmh, lat, lng, viaje.paradas
         );
         if (parada_result.sospechosa) {
           io.to(`viaje:${id_viaje}`).emit('alerta:parada', {

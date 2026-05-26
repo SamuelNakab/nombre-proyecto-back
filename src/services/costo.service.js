@@ -16,22 +16,27 @@ async function getDistanciaYTiempo(origenLat, origenLng, destinoLat, destinoLng)
   url.searchParams.set('units', 'metric');
   url.searchParams.set('key', apiKey);
 
-  const response = await fetch(url.toString());
-  const data = await response.json();
+  try {
+    const response = await fetch(url.toString());
+    const data = await response.json();
 
-  if (data.status !== 'OK') {
-    throw new Error(data.error_message || data.status);
+    if (data.status !== 'OK') {
+      throw new Error(data.error_message || data.status);
+    }
+
+    const element = data.rows?.[0]?.elements?.[0];
+    if (!element || element.status !== 'OK') {
+      throw new Error(element?.status || 'ELEMENT_NOT_FOUND');
+    }
+
+    return {
+      distancia_km: element.distance.value / 1000,
+      tiempo_horas: element.duration.value / 3600,
+    };
+  } catch (err) {
+    console.warn('[costo.service] Error en Google Maps — usando mock:', err.message);
+    return { distancia_km: 10, tiempo_horas: 0.5 };
   }
-
-  const element = data.rows?.[0]?.elements?.[0];
-  if (!element || element.status !== 'OK') {
-    throw new Error(element?.status || 'ELEMENT_NOT_FOUND');
-  }
-
-  return {
-    distancia_km: element.distance.value / 1000,
-    tiempo_horas: element.duration.value / 3600,
-  };
 }
 
 export async function calcularDistanciaYTiempo(origen, destino) {

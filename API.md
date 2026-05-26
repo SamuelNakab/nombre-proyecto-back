@@ -634,6 +634,7 @@ si ganó la carrera o `viaje:ya_asignado` si otro conductor fue más rápido.
 ```json
 {
   "id_viaje": 42,
+  "id_usuario_conductor": "firebase_uid_del_conductor",
   "conductor": {
     "nombre": "Carlos",
     "apellido": "López",

@@ -1,6 +1,7 @@
 import * as turf from '@turf/turf';
+import redis from '../config/redis.js';
 
-export async function verificarParadaSospechosa(id_viaje, zona, velocidad_kmh, lat, lng, paradas, redis) {
+export async function verificarParadaSospechosa(id_viaje, zona, velocidad_kmh, lat, lng, paradas) {
   if (zona === 'PROVINCIA') return { sospechosa: false };
 
   const umbral_vel = parseFloat(process.env.PARADA_SOSPECHOSA_VELOCIDAD_KMH || '3');

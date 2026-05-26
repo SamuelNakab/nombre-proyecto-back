@@ -9,9 +9,8 @@ elegibles via WebSocket, el primero en aceptar queda asignado.
 - Fase 1 COMPLETA: autenticacion, registro, login, perfiles
 - Fase 2 COMPLETA: creacion de viajes, estimacion de costo con desglose
 - Fase 3 COMPLETA: matching en tiempo real con Socket.io
-- Bugs corregidos: condiciones_req en eventos, id_usuario_conductor
-  en matching, conductores que conectan tarde reciben viajes disponibles
-- Fase 4 EN DESARROLLO en branch develop
+- MODIFICACION EN CURSO: eliminar tarifas del body del usuario,
+  el backend las calcula con tarifa.service.js
 
 ## Stack
 - Node.js 22 con ES Modules (import/export — NUNCA require)
@@ -19,11 +18,10 @@ elegibles via WebSocket, el primero en aceptar queda asignado.
 - PostgreSQL en Neon — Prisma 6 (version fija sin caret)
 - Firebase Admin SDK para autenticacion
 - Socket.io v4
-- Redis con ioredis — EN USO en Fase 4 para GPS
-- Turf.js — para algoritmos geograficos en Fase 4
+- Redis con ioredis
 - Zod para validacion
 - BullMQ (proximas fases)
-- Google Maps API — SIN KEY todavia, usar mocks
+- Google Maps API (mock activo — GOOGLE_MAPS_API_KEY vacia)
 
 ## Reglas de codigo
 - ES Modules siempre. NUNCA require().
@@ -35,62 +33,43 @@ elegibles via WebSocket, el primero en aceptar queda asignado.
 - Nombres de archivos: kebab-case.
 - Named exports en controllers y services.
 
-## ESTRATEGIA MOCK — Google Maps no disponible
-Cuando GOOGLE_MAPS_API_KEY esta vacia o no existe:
-- Ruta optima: linea recta entre la primera y ultima parada
-  console.warn('[desvio.service] Sin API key — usando ruta recta mock')
-- ETA: retornar 15 minutos fijo
-  console.warn('[eta.service] Sin API key — usando ETA mock')
-- Distancia/tiempo: ya implementado (10km / 0.5h)
-Cuando se agregue la key al .env todo funciona con datos reales sin
-cambiar codigo.
+## MODELO DE TARIFAS — CAMBIO IMPORTANTE
+El usuario YA NO manda tarifa_hora ni tarifa_km en el body.
+El backend calcula las tarifas con tarifa.service.js.
 
-## MODELO DE TARIFAS (implementado)
-El usuario NO manda tarifa_hora ni tarifa_km.
-tarifa.service.js las calcula segun zona y hora del dia.
-Las tarifas se guardan en el Viaje en DB para calcular el costo real.
+El algoritmo simple (placeholder hasta tener uno real):
+- Hora pico (7-10hs y 17-20hs): usar TARIFA_PICO_HORA_CABA o TARIFA_PICO_KM_PROVINCIA
+- Resto del dia: usar TARIFA_BASE_HORA_CABA o TARIFA_BASE_KM_PROVINCIA
+- Las variables de entorno definen las tarifas base
 
-## DESGLOSE DE PRECIO (implementado)
-Toda respuesta con precio incluye campo desglose con:
-precio_por_tiempo, precio_por_distancia, tiempo_horas, distancia_km,
-tarifa_hora, tarifa_km, es_hora_pico.
+Variables de entorno de tarifas:
+  TARIFA_BASE_HORA_CABA=3500       (ARS por hora, horario normal)
+  TARIFA_PICO_HORA_CABA=5000       (ARS por hora, hora pico)
+  TARIFA_BASE_KM_PROVINCIA=150     (ARS por km, horario normal)
+  TARIFA_PICO_KM_PROVINCIA=200     (ARS por km, hora pico)
 
-## REDIS — estrategia de keys para GPS
-Las coordenadas GPS NO van a PostgreSQL. Van a Redis:
-  "gps:{id_viaje}:ultima"       → { lat, lng, timestamp } — expire 2h
-  "gps:{id_viaje}:historial"    → lista de ultimas 20 coords — LPUSH+LTRIM
-  "gps:{id_viaje}:ruta"         → array [[lng,lat],...] — expire 24h
-  "gps:{id_viaje}:acumulado"    → { tiempo_horas, distancia_km,
-                                     ultima_lat, ultima_lng,
-                                     ultima_actualizacion } — expire 24h
-  "gps:{id_viaje}:pings_detenido" → contador pings lentos — INCR
+## DESGLOSE DE PRECIO — OBLIGATORIO
+Toda respuesta que incluya un precio DEBE incluir el desglose.
+El desglose explica como se llego al precio total.
 
-Al finalizar el viaje:
-  - Persistir acumulado en Viaje.tiempo_capital y Viaje.distancia_provincia
-  - DEL todas las keys del viaje
+Estructura del desglose:
+{
+  "precio_total": 3250,
+  "desglose": {
+    "precio_por_tiempo": 2100,     (null si zona es PROVINCIA)
+    "precio_por_distancia": 1150,  (null si zona es CABA)
+    "tiempo_horas": 0.6,
+    "distancia_km": 10.5,
+    "tarifa_hora": 3500,           (null si zona es PROVINCIA)
+    "tarifa_km": null,             (null si zona es CABA)
+    "es_hora_pico": false
+  }
+}
 
-## ALGORITMOS (version simplificada para desarrollo)
-Desvios:
-  Ruta mock = linea recta entre primera y ultima parada del viaje
-  Con cada ping: Turf nearestPointOnLine calcula distancia a esa linea
-  Si > DESVIO_UMBRAL_METROS: emitir alerta:desvio
-
-Paradas sospechosas (solo CABA y MIXTO):
-  Calcular velocidad entre ping anterior y actual
-  Si velocidad < PARADA_SOSPECHOSA_VELOCIDAD_KMH: INCR contador Redis
-  Si contador * 15seg >= PARADA_SOSPECHOSA_MINUTOS * 60:
-    Verificar que no esta dentro de 150m de alguna parada del viaje
-    Si no: emitir alerta:parada
-  Si velocidad >= umbral: DEL contador (resetear)
-
-Acumulador de costo:
-  Con cada ping: sumar delta de distancia y tiempo al acumulado en Redis
-  Cada ~60 segundos: emitir costo:actualizar al room
-
-## CAMBIO AUTOMATICO DE ESTADO
-Primer ping GPS en viaje CONDUCTOR_ASIGNADO
-  → actualizar a EN_CAMINO_A_ORIGEN
-  → emitir viaje:estado_cambiado al room
+Esto aplica a:
+- POST /api/viajes/estimar-costo
+- POST /api/viajes (campo desglose_estimado)
+- Al finalizar el viaje (campo desglose_real)
 
 ## Estructura de carpetas
 src/
@@ -109,61 +88,43 @@ src/
 │   ├── tarifa.service.js
 │   ├── costo.service.js
 │   ├── elegibilidad.service.js
-│   ├── matching.service.js
-│   ├── gps.service.js          ← NUEVO Fase 4
-│   ├── desvio.service.js       ← NUEVO Fase 4
-│   ├── parada.service.js       ← NUEVO Fase 4
-│   └── eta.service.js          ← NUEVO Fase 4
+│   └── matching.service.js
 ├── middlewares/
 │   └── auth.middleware.js
 ├── sockets/
 │   ├── index.js
 │   ├── auth.socket.js
 │   ├── matching.socket.js
-│   └── gps.socket.js           ← NUEVO Fase 4
+│   └── auth.socket.js
 └── app.js
-scripts/
-├── seed-test.js                ← ya existe
-├── simular-gps.js              ← NUEVO Fase 4
-└── test-fase4.js               ← NUEVO Fase 4
 prisma/
 ├── schema.prisma
 └── migrations/
 
-## Endpoints existentes (no modificar)
-GET  /health
-POST /api/auth/* (todos)
-POST /api/viajes/estimar-costo
-POST /api/viajes
+## Variables de entorno
+Todas en .env. Ver .env.example.
+Nuevas variables de tarifas:
+  TARIFA_BASE_HORA_CABA=3500
+  TARIFA_PICO_HORA_CABA=5000
+  TARIFA_BASE_KM_PROVINCIA=150
+  TARIFA_PICO_KM_PROVINCIA=200
+
+## Endpoints existentes
+POST /api/auth/registro-cliente
+POST /api/auth/registro-conductor
+POST /api/auth/registro-gerente
+POST /api/auth/login
+GET  /api/auth/me
+PUT  /api/auth/perfil
+POST /api/viajes/estimar-costo   ← MODIFICAR: quitar tarifas del body
+POST /api/viajes                 ← MODIFICAR: quitar tarifas del body
 GET  /api/viajes/disponibles
 GET  /api/viajes/mis-viajes
 GET  /api/viajes/:id
+GET  /health
 
-## Nuevos endpoints Fase 4
-PATCH /api/viajes/:id/estado          → conductor cambia estado manual
-GET   /api/viajes/:id/costo-acumulado → cliente consulta costo hasta ahora
-
-## Eventos Socket.io existentes (no tocar)
-viaje:disponible, viaje:aceptar, viaje:conductor_asignado,
-viaje:ya_asignado, viaje:cancelado_sin_conductor
-
-## Eventos Socket.io nuevos Fase 4
-conductor:ubicacion   conductor→servidor  { id_viaje, lat, lng, timestamp }
-mapa:actualizar       servidor→room       { lat, lng, timestamp, velocidad_kmh }
-costo:actualizar      servidor→room       { precio_acumulado, desglose }
-alerta:desvio         servidor→room       { id_viaje, distancia_metros, mensaje }
-alerta:parada         servidor→room       { id_viaje, minutos_detenido, mensaje }
-viaje:estado_cambiado servidor→room       { id_viaje, estado_anterior, estado_nuevo }
-
-## Variables de entorno Fase 4 (nuevas)
-DESVIO_UMBRAL_METROS=300
-PARADA_SOSPECHOSA_MINUTOS=5
-PARADA_SOSPECHOSA_VELOCIDAD_KMH=3
-
-## Comandos
+## Comandos importantes
 npm run dev
 npm run start
 npx prisma migrate dev --name descripcion
 npx prisma studio
-node scripts/test-fase4.js    ← test completo de Fase 4
-node scripts/simular-gps.js <id_viaje>  ← simular GPS manual

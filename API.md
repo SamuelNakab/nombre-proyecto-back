@@ -527,6 +527,15 @@ condiciones requeridas del viaje).
 Ordenados por `fecha_programada` ascendente.
 
 
+**Ejemplo de llamada (React Native / fetch):**
+```js
+const res = await fetch('http://localhost:3000/api/viajes/disponibles', {
+  headers: { Authorization: 'Bearer ' + conductorToken }
+});
+const viajes = await res.json(); // array
+```
+
+
 **Errores posibles:**
 | Status | Body | Causa |
 |--------|------|-------|
@@ -747,8 +756,8 @@ si ganó la carrera o `viaje:ya_asignado` si otro conductor fue más rápido.
 ### Evento: viaje:conductor_asignado
 
 
-**Dirección:** servidor → room del viaje  
-**Quién lo recibe:** el cliente que creó el viaje y el conductor que aceptó  
+**Dirección:** servidor → conductor ganador (socket directo) y cliente (socket directo)  
+**Quién lo recibe:** exclusivamente el conductor que ganó la asignación y el cliente dueño del viaje  
 **Cuándo:** cuando un conductor acepta exitosamente el viaje
 
 
@@ -756,7 +765,7 @@ si ganó la carrera o `viaje:ya_asignado` si otro conductor fue más rápido.
 ```json
 {
   "id_viaje": 42,
-  "id_usuario_conductor": "firebase_uid_del_conductor",
+  "id_usuario_conductor": 5,
   "conductor": {
     "nombre": "Carlos",
     "apellido": "López",
@@ -782,12 +791,10 @@ socket.on('viaje:conductor_asignado', (data) => {
 ```
 
 
-**Importante para mobile y web:** usá `id_usuario_conductor` para distinguir
-si el evento es para vos o para otro conductor del room:
-- Si `data.id_usuario_conductor === tuUsuario.id_usuario` → fuiste asignado,
-  navegar a la pantalla del viaje activo
-- Si no coincide → otro conductor fue asignado, sacar el viaje de tu lista
-  de disponibles
+**Nota:** este evento se emite directamente al socket del conductor ganador y al socket
+del cliente — no se broadcast al room. Los conductores que intentaron y perdieron reciben
+`viaje:ya_asignado` (si emitieron `viaje:aceptar`) o `viaje:no_disponible` (si aún
+estaban esperando en el room).
 
 
 ---
@@ -817,6 +824,39 @@ socket.on('viaje:ya_asignado', (data) => {
   console.log(data.mensaje);
 });
 ```
+
+
+---
+
+
+### Evento: viaje:no_disponible
+
+
+**Dirección:** servidor → conductores del room (broadcast, excluye al ganador)  
+**Quién lo recibe:** todos los conductores conectados al room `viaje:{id_viaje}` que no ganaron la asignación  
+**Cuándo:** inmediatamente después de que otro conductor acepta exitosamente el viaje
+
+
+**Payload:**
+```json
+{
+  "id_viaje": 42
+}
+```
+
+
+**Cómo escucharlo:**
+```js
+socket.on('viaje:no_disponible', (data) => {
+  // remover el viaje de la lista de disponibles
+  console.log('Viaje ya no disponible:', data.id_viaje);
+});
+```
+
+
+**Diferencia con `viaje:ya_asignado`:** este evento llega a conductores que estaban
+en el room pero **no llegaron a emitir `viaje:aceptar`**. Quien emitió `viaje:aceptar`
+y llegó tarde recibe `viaje:ya_asignado`, no este evento.
 
 
 ---

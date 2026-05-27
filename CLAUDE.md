@@ -6,11 +6,8 @@ El cliente solicita un viaje, el sistema lo publica a conductores
 elegibles via WebSocket, el primero en aceptar queda asignado.
 
 ## Estado actual del proyecto
-- Fase 1 COMPLETA: autenticacion, registro, login, perfiles
-- Fase 2 COMPLETA: creacion de viajes, estimacion de costo con desglose
-- Fase 3 COMPLETA: matching en tiempo real con Socket.io
-- MODIFICACION EN CURSO: eliminar tarifas del body del usuario,
-  el backend las calcula con tarifa.service.js
+- Fases 1-4 COMPLETAS
+- BUGS A CORREGIR EN ESTA SESION (ver seccion BUGS MAS ABAJO)
 
 ## Stack
 - Node.js 22 con ES Modules (import/export — NUNCA require)
@@ -19,9 +16,8 @@ elegibles via WebSocket, el primero en aceptar queda asignado.
 - Firebase Admin SDK para autenticacion
 - Socket.io v4
 - Redis con ioredis
+- Turf.js
 - Zod para validacion
-- BullMQ (proximas fases)
-- Google Maps API (mock activo — GOOGLE_MAPS_API_KEY vacia)
 
 ## Reglas de codigo
 - ES Modules siempre. NUNCA require().
@@ -33,98 +29,79 @@ elegibles via WebSocket, el primero en aceptar queda asignado.
 - Nombres de archivos: kebab-case.
 - Named exports en controllers y services.
 
-## MODELO DE TARIFAS — CAMBIO IMPORTANTE
-El usuario YA NO manda tarifa_hora ni tarifa_km en el body.
-El backend calcula las tarifas con tarifa.service.js.
+## BUGS A CORREGIR
 
-El algoritmo simple (placeholder hasta tener uno real):
-- Hora pico (7-10hs y 17-20hs): usar TARIFA_PICO_HORA_CABA o TARIFA_PICO_KM_PROVINCIA
-- Resto del dia: usar TARIFA_BASE_HORA_CABA o TARIFA_BASE_KM_PROVINCIA
-- Las variables de entorno definen las tarifas base
+### BUG 1 — Endpoint de viajes disponibles para conductores
+El equipo frontend reporta que no existe un endpoint para que el conductor
+consulte los viajes que puede aceptar.
 
-Variables de entorno de tarifas:
-  TARIFA_BASE_HORA_CABA=3500       (ARS por hora, horario normal)
-  TARIFA_PICO_HORA_CABA=5000       (ARS por hora, hora pico)
-  TARIFA_BASE_KM_PROVINCIA=150     (ARS por km, horario normal)
-  TARIFA_PICO_KM_PROVINCIA=200     (ARS por km, hora pico)
+IMPORTANTE: El endpoint GET /api/viajes/disponibles YA EXISTE desde Fase 2.
+Antes de crear nada, verificar que:
+  1. El endpoint existe en viajes.routes.js
+  2. Requiere rol CONDUCTOR
+  3. Devuelve viajes en estado BUSCANDO_CONDUCTOR con fecha futura
+  4. Filtra por condiciones del vehiculo del conductor
+  5. Incluye paradas y condiciones_req en la respuesta
 
-## DESGLOSE DE PRECIO — OBLIGATORIO
-Toda respuesta que incluya un precio DEBE incluir el desglose.
-El desglose explica como se llego al precio total.
+Si todo esto esta correcto: el bug es del frontend, no del backend.
+Reportarlo claramente sin modificar nada del endpoint.
+Si algo falta o esta mal: corregirlo.
 
-Estructura del desglose:
-{
-  "precio_total": 3250,
-  "desglose": {
-    "precio_por_tiempo": 2100,     (null si zona es PROVINCIA)
-    "precio_por_distancia": 1150,  (null si zona es CABA)
-    "tiempo_horas": 0.6,
-    "distancia_km": 10.5,
-    "tarifa_hora": 3500,           (null si zona es PROVINCIA)
-    "tarifa_km": null,             (null si zona es CABA)
-    "es_hora_pico": false
-  }
-}
+### BUG 2 — Race condition en WebSocket de matching
+PROBLEMA: cuando dos conductores aceptan el mismo viaje al mismo tiempo,
+ambos reciben viaje:conductor_asignado aunque solo uno gano la race.
 
-Esto aplica a:
-- POST /api/viajes/estimar-costo
-- POST /api/viajes (campo desglose_estimado)
-- Al finalizar el viaje (campo desglose_real)
+CAUSA: viaje:conductor_asignado se emite al room completo en lugar de
+solo al socket del conductor ganador.
 
-## Estructura de carpetas
+FLUJO CORRECTO que debe implementar el backend:
+
+  Evento                  | Destinatario
+  ------------------------|------------------------------------------
+  viaje:conductor_asignado| Solo el socket del conductor que GANO
+  viaje:ya_asignado       | Cada socket que intento aceptar y perdio
+  viaje:no_disponible     | Broadcast a todos los demas del room
+
+Payload de viaje:no_disponible (NUEVO):
+  { id_viaje: number }
+
+El archivo a modificar es src/sockets/matching.socket.js.
+
+La logica actual probablemente hace:
+  io.to('viaje:' + id_viaje).emit('viaje:conductor_asignado', payload)
+  (esto emite a TODOS en el room)
+
+Debe cambiarse a:
+  socket.emit('viaje:conductor_asignado', payload)
+  (esto emite SOLO al socket del conductor ganador)
+  
+  Y agregar:
+  socket.to('viaje:' + id_viaje).emit('viaje:no_disponible', { id_viaje })
+  (esto emite a TODOS en el room EXCEPTO al ganador)
+
+VERIFICACION PREVIA: antes de modificar, leer el archivo actual y confirmar
+si el bug existe realmente. Si ya emite solo al socket ganador, el bug es
+del frontend y no hay que cambiar nada.
+
+## Estructura de carpetas relevante
 src/
-├── config/
-│   ├── firebase.js
-│   ├── prisma.js
-│   ├── redis.js
-│   └── storage.js
-├── routes/
-│   ├── auth.routes.js
-│   └── viajes.routes.js
-├── controllers/
-│   ├── auth.controller.js
-│   └── viajes.controller.js
-├── services/
-│   ├── tarifa.service.js
-│   ├── costo.service.js
-│   ├── elegibilidad.service.js
-│   └── matching.service.js
-├── middlewares/
-│   └── auth.middleware.js
-├── sockets/
-│   ├── index.js
-│   ├── auth.socket.js
-│   ├── matching.socket.js
-│   └── auth.socket.js
-└── app.js
-prisma/
-├── schema.prisma
-└── migrations/
+├── routes/viajes.routes.js
+├── controllers/viajes.controller.js
+└── sockets/matching.socket.js
 
-## Variables de entorno
-Todas en .env. Ver .env.example.
-Nuevas variables de tarifas:
-  TARIFA_BASE_HORA_CABA=3500
-  TARIFA_PICO_HORA_CABA=5000
-  TARIFA_BASE_KM_PROVINCIA=150
-  TARIFA_PICO_KM_PROVINCIA=200
+## Endpoints de viajes
+GET  /api/viajes/disponibles  → CONDUCTOR, lista viajes disponibles
+POST /api/viajes              → CLIENTE, crea viaje
+GET  /api/viajes/:id          → autenticado, detalle
 
-## Endpoints existentes
-POST /api/auth/registro-cliente
-POST /api/auth/registro-conductor
-POST /api/auth/registro-gerente
-POST /api/auth/login
-GET  /api/auth/me
-PUT  /api/auth/perfil
-POST /api/viajes/estimar-costo   ← MODIFICAR: quitar tarifas del body
-POST /api/viajes                 ← MODIFICAR: quitar tarifas del body
-GET  /api/viajes/disponibles
-GET  /api/viajes/mis-viajes
-GET  /api/viajes/:id
-GET  /health
+## Eventos WebSocket de matching
+viaje:disponible         → conductores elegibles (al crear viaje)
+viaje:aceptar            → conductor → servidor
+viaje:conductor_asignado → SOLO al conductor ganador
+viaje:ya_asignado        → conductores que intentaron y perdieron
+viaje:no_disponible      → resto de conductores del room (NUEVO)
+viaje:cancelado_sin_conductor → cliente
 
-## Comandos importantes
+## Comandos
 npm run dev
-npm run start
-npx prisma migrate dev --name descripcion
-npx prisma studio
+node scripts/test-bugs2.js

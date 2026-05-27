@@ -2,8 +2,8 @@ import prisma from '../config/prisma.js';
 import { cancelarTimer } from '../services/matching.service.js';
 
 export function manejarAceptarViaje(socket, io) {
-  socket.on('viaje:aceptar', async (payload) => {
-    if (!payload?.id_viaje) {
+  socket.on('viaje:aceptar', async (data) => {
+    if (!data?.id_viaje) {
       socket.emit('error', { error: 'id_viaje requerido' });
       return;
     }
@@ -27,31 +27,27 @@ export function manejarAceptarViaje(socket, io) {
     }
 
     const primerVehiculo = conductor.conductor_vehiculos[0]?.vehiculo ?? null;
-    const id_viaje = Number(payload.id_viaje);
+    const id_viaje = Number(data.id_viaje);
 
-    let yaAsignado = false;
+    // Atomic update: solo actualiza si el viaje aun esta BUSCANDO_CONDUCTOR.
+    // updateMany con condicion en WHERE es atomico en PostgreSQL: el segundo
+    // conductor en llegar ve count=0 porque el primero ya cambio el estado.
+    let updated;
     try {
-      await prisma.$transaction(async (tx) => {
-        const viaje = await tx.viaje.findUnique({ where: { id_viaje } });
-        if (!viaje || viaje.estado !== 'BUSCANDO_CONDUCTOR') {
-          yaAsignado = true;
-          return;
-        }
-        await tx.viaje.update({
-          where: { id_viaje },
-          data: {
-            estado: 'CONDUCTOR_ASIGNADO',
-            id_conductor: conductor.id_conductor,
-            id_vehiculo: primerVehiculo?.id_vehiculo ?? null,
-          },
-        });
+      updated = await prisma.viaje.updateMany({
+        where: { id_viaje, estado: 'BUSCANDO_CONDUCTOR' },
+        data: {
+          estado: 'CONDUCTOR_ASIGNADO',
+          id_conductor: conductor.id_conductor,
+          id_vehiculo: primerVehiculo?.id_vehiculo ?? null,
+        },
       });
     } catch {
       socket.emit('error', { error: 'Error al procesar la asignacion' });
       return;
     }
 
-    if (yaAsignado) {
+    if (updated.count === 0) {
       socket.emit('viaje:ya_asignado', {
         id_viaje,
         mensaje: 'Otro conductor fue mas rapido',
@@ -61,8 +57,12 @@ export function manejarAceptarViaje(socket, io) {
 
     cancelarTimer(id_viaje);
 
-    const room = `viaje:${id_viaje}`;
-    io.to(room).emit('viaje:conductor_asignado', {
+    const viaje = await prisma.viaje.findUnique({
+      where: { id_viaje },
+      select: { cliente: { select: { id_usuario: true } } },
+    });
+
+    const eventoPayload = {
       id_viaje,
       id_usuario_conductor: conductor.id_usuario,
       conductor: {
@@ -78,7 +78,24 @@ export function manejarAceptarViaje(socket, io) {
             tipo_vehiculo: primerVehiculo.tipo_vehiculo,
           }
         : null,
-    });
+    };
+
+    // Solo al socket del conductor ganador
+    socket.emit('viaje:conductor_asignado', eventoPayload);
+
+    // Al socket del cliente del viaje (busqueda directa por id_usuario)
+    const idClienteUsuario = viaje?.cliente?.id_usuario;
+    if (idClienteUsuario) {
+      for (const [, s] of io.sockets.sockets) {
+        if (s.data.usuario?.id_usuario === idClienteUsuario) {
+          s.emit('viaje:conductor_asignado', eventoPayload);
+          break;
+        }
+      }
+    }
+
+    // Broadcast a todos los demas del room (conductores que perdieron la race)
+    socket.to(`viaje:${id_viaje}`).emit('viaje:no_disponible', { id_viaje });
 
     console.log(`[Matching] viaje ${id_viaje} asignado al conductor ${conductor.id_conductor}`);
   });

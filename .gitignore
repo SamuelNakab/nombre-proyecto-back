@@ -1,4 +1,4 @@
-
+del dev_output.log
 node_modules/
 .env
 .env.*

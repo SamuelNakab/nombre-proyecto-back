@@ -45,10 +45,17 @@ const schemaCrear = z.object({
 
 // ─── Helper de elegibilidad en memoria ──────────────────────────────────────
 
-function conductorEsElegible(vehiculosConductor, condicionesViaje) {
+function conductorEsElegible(vehiculosConductor, vehiculosPropios, condicionesViaje) {
   if (condicionesViaje.length === 0) return true;
-  return vehiculosConductor.some((cv) => {
+
+  const tieneViaEmpresa = vehiculosConductor.some((cv) => {
     const tiene = cv.vehiculo.condiciones.map((c) => c.condicion);
+    return condicionesViaje.every((req) => tiene.includes(req));
+  });
+  if (tieneViaEmpresa) return true;
+
+  return vehiculosPropios.some((v) => {
+    const tiene = v.condiciones.map((c) => c.condicion);
     return condicionesViaje.every((req) => tiene.includes(req));
   });
 }
@@ -141,6 +148,9 @@ export async function listarViajesDisponibles(req, res) {
           },
         },
       },
+      vehiculos_propios: {
+        include: { condiciones: true },
+      },
     },
   });
   if (!conductor) {
@@ -168,7 +178,11 @@ export async function listarViajesDisponibles(req, res) {
 
   const viajesElegibles = viajes.filter((viaje) => {
     const condicionesViaje = viaje.condiciones_req.map((c) => c.condicion);
-    return conductorEsElegible(conductor.conductor_vehiculos, condicionesViaje);
+    return conductorEsElegible(
+      conductor.conductor_vehiculos,
+      conductor.vehiculos_propios,
+      condicionesViaje
+    );
   });
 
   return res.status(200).json(viajesElegibles);

@@ -13,11 +13,15 @@ export function manejarAceptarViaje(socket, io) {
       return;
     }
 
+    if (!payload.id_vehiculo) {
+      socket.emit('error', { error: 'Debes seleccionar un vehiculo' });
+      return;
+    }
+
     const conductor = await prisma.conductor.findUnique({
       where: { id_usuario: socket.data.usuario.id_usuario },
       include: {
         usuario: { select: { nombre: true, apellido: true } },
-        conductor_vehiculos: { include: { vehiculo: true }, take: 1 },
       },
     });
 
@@ -26,8 +30,35 @@ export function manejarAceptarViaje(socket, io) {
       return;
     }
 
-    const primerVehiculo = conductor.conductor_vehiculos[0]?.vehiculo ?? null;
+    const vehiculo = await prisma.vehiculo.findUnique({
+      where: { id_vehiculo: parseInt(payload.id_vehiculo) },
+      include: { condiciones: true },
+    });
+
+    if (!vehiculo) {
+      socket.emit('error', { error: 'Vehiculo no encontrado' });
+      return;
+    }
+
+    if (vehiculo.id_conductor !== conductor.id_conductor) {
+      socket.emit('error', { error: 'Este vehiculo no te pertenece' });
+      return;
+    }
+
     const id_viaje = Number(payload.id_viaje);
+
+    const condicionesRequeridas = await prisma.condicionRequerida.findMany({
+      where: { id_viaje },
+    });
+
+    const condicionesVehiculo = vehiculo.condiciones.map((c) => c.condicion);
+    const faltaAlguna = condicionesRequeridas.some(
+      (cr) => !condicionesVehiculo.includes(cr.condicion)
+    );
+    if (faltaAlguna) {
+      socket.emit('error', { error: 'Tu vehiculo no cumple las condiciones del viaje' });
+      return;
+    }
 
     let yaAsignado = false;
     try {
@@ -42,7 +73,7 @@ export function manejarAceptarViaje(socket, io) {
           data: {
             estado: 'CONDUCTOR_ASIGNADO',
             id_conductor: conductor.id_conductor,
-            id_vehiculo: primerVehiculo?.id_vehiculo ?? null,
+            id_vehiculo: vehiculo.id_vehiculo,
           },
         });
       });
@@ -62,22 +93,22 @@ export function manejarAceptarViaje(socket, io) {
     cancelarTimer(id_viaje);
 
     const room = `viaje:${id_viaje}`;
-    io.to(room).emit('viaje:conductor_asignado', {
+    socket.emit('viaje:conductor_asignado', {
       id_viaje,
       conductor: {
         nombre: conductor.usuario.nombre,
         apellido: conductor.usuario.apellido,
         calificacion_promedio: conductor.calificacion_promedio,
       },
-      vehiculo: primerVehiculo
-        ? {
-            patente: primerVehiculo.patente,
-            marca: primerVehiculo.marca,
-            modelo: primerVehiculo.modelo,
-            tipo_vehiculo: primerVehiculo.tipo_vehiculo,
-          }
-        : null,
+      vehiculo: {
+        patente: vehiculo.patente,
+        marca: vehiculo.marca,
+        modelo: vehiculo.modelo,
+        tipo_vehiculo: vehiculo.tipo_vehiculo,
+      },
     });
+
+    socket.to(room).emit('viaje:no_disponible', { id_viaje });
 
     console.log(`[Matching] viaje ${id_viaje} asignado al conductor ${conductor.id_conductor}`);
   });

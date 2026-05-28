@@ -39,6 +39,7 @@ async function unirseARoomsDisponibles(socket) {
       conductor_vehiculos: {
         include: { vehiculo: { include: { condiciones: true } } },
       },
+      vehiculos_propios: { include: { condiciones: true } },
     },
   });
   if (!conductor) return;
@@ -51,7 +52,7 @@ async function unirseARoomsDisponibles(socket) {
   let joined = 0;
   for (const viaje of viajes) {
     const condiciones = viaje.condiciones_req.map((c) => c.condicion);
-    if (conductorEsElegible(conductor.conductor_vehiculos, condiciones)) {
+    if (conductorEsElegible(conductor.conductor_vehiculos, conductor.vehiculos_propios, condiciones)) {
       socket.join(`viaje:${viaje.id_viaje}`);
       joined++;
     }
@@ -60,10 +61,17 @@ async function unirseARoomsDisponibles(socket) {
   console.log(`[Socket] conductor ${conductor.id_conductor} unido a ${joined} rooms`);
 }
 
-function conductorEsElegible(vehiculosConductor, condicionesViaje) {
+function conductorEsElegible(vehiculosConductor, vehiculosPropios, condicionesViaje) {
   if (condicionesViaje.length === 0) return true;
-  return vehiculosConductor.some((cv) => {
+
+  const tieneViaEmpresa = vehiculosConductor.some((cv) => {
     const tiene = cv.vehiculo.condiciones.map((c) => c.condicion);
+    return condicionesViaje.every((req) => tiene.includes(req));
+  });
+  if (tieneViaEmpresa) return true;
+
+  return vehiculosPropios.some((v) => {
+    const tiene = v.condiciones.map((c) => c.condicion);
     return condicionesViaje.every((req) => tiene.includes(req));
   });
 }

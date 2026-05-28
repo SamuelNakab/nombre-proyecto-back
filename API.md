@@ -610,14 +610,23 @@ socket.on('viaje:disponible', (data) => {
 **Payload a emitir:**
 ```json
 {
-  "id_viaje": 42
+  "id_viaje": 42,
+  "id_vehiculo": 7
 }
 ```
 
+- `id_vehiculo`: **requerido**. ID del vehículo propio del conductor con el que acepta el viaje.
+
 **Cómo emitirlo:**
 ```js
-socket.emit('viaje:aceptar', { id_viaje: 42 });
+socket.emit('viaje:aceptar', { id_viaje: 42, id_vehiculo: 7 });
 ```
+
+**Validaciones del servidor:**
+1. `id_vehiculo` debe estar presente; si falta: `error` con `"Debes seleccionar un vehiculo"`
+2. El vehículo debe existir; si no: `error` con `"Vehiculo no encontrado"`
+3. El vehículo debe pertenecer al conductor; si no: `error` con `"Este vehiculo no te pertenece"`
+4. El vehículo debe cumplir todas las condiciones requeridas del viaje; si falta alguna: `error` con `"Tu vehiculo no cumple las condiciones del viaje"`
 
 **Nota:** después de emitir este evento el conductor recibirá `viaje:conductor_asignado`
 si ganó la carrera o `viaje:ya_asignado` si otro conductor fue más rápido.
@@ -975,6 +984,271 @@ socket.on('viaje:estado_cambiado', (data) => {
   console.log(`Viaje ${data.id_viaje}: ${data.estado_anterior} → ${data.estado_nuevo}`);
 });
 ```
+
+---
+
+---
+
+## /conductores — Vehículos de conductores independientes
+
+### POST /api/conductores/mis-vehiculos
+
+Registra un vehículo propio del conductor autenticado.
+
+**Rol requerido:** `CONDUCTOR`
+
+**Headers requeridos:**
+```
+Authorization: Bearer <firebase-id-token>
+```
+
+**Body:**
+```json
+{
+  "patente": "string 6-8 caracteres (requerido)",
+  "marca": "string (requerido)",
+  "modelo": "string (requerido)",
+  "anio": "number entero entre 1990 y año actual (requerido)",
+  "color": "string (requerido)",
+  "tipo_vehiculo": "string (requerido)",
+  "condiciones": ["FRAGIL", "REFRIGERADO"]
+}
+```
+
+- `condiciones`: opcional, default `[]`. Valores válidos: `FRAGIL`, `REFRIGERADO`, `CARGA_PESADA`, `PELIGROSO`, `VOLUMINOSO`
+
+**Respuesta exitosa — 201:**
+```json
+{
+  "id_vehiculo": 10,
+  "id_empresa": null,
+  "id_conductor": 3,
+  "patente": "ABC123",
+  "marca": "Ford",
+  "modelo": "Transit",
+  "anio": 2022,
+  "color": "Blanco",
+  "tipo_vehiculo": "furgon",
+  "condiciones": [
+    { "id_condicion": 5, "id_vehiculo": 10, "condicion": "FRAGIL" },
+    { "id_condicion": 6, "id_vehiculo": 10, "condicion": "REFRIGERADO" }
+  ]
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "mensaje de validación" }` | Campo faltante o inválido |
+| 400 | `{ "error": "El usuario no tiene perfil de conductor" }` | Sin registro de conductor |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
+| 409 | `{ "error": "La patente ya esta registrada" }` | Patente duplicada |
+
+---
+
+### GET /api/conductores/mis-vehiculos
+
+Devuelve todos los vehículos propios del conductor autenticado.
+
+**Rol requerido:** `CONDUCTOR`
+
+**Headers requeridos:**
+```
+Authorization: Bearer <firebase-id-token>
+```
+
+**Respuesta exitosa — 200:**
+```json
+[
+  {
+    "id_vehiculo": 10,
+    "id_empresa": null,
+    "id_conductor": 3,
+    "patente": "ABC123",
+    "marca": "Ford",
+    "modelo": "Transit",
+    "anio": 2022,
+    "color": "Blanco",
+    "tipo_vehiculo": "furgon",
+    "condiciones": [
+      { "id_condicion": 5, "id_vehiculo": 10, "condicion": "FRAGIL" }
+    ]
+  }
+]
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "El usuario no tiene perfil de conductor" }` | Sin registro de conductor |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
+
+---
+
+### PUT /api/conductores/mis-vehiculos/:id
+
+Actualiza los datos de un vehículo propio del conductor. Solo se actualizan los campos presentes.
+
+**Rol requerido:** `CONDUCTOR`
+
+**Headers requeridos:**
+```
+Authorization: Bearer <firebase-id-token>
+```
+
+**Body (todos opcionales):**
+```json
+{
+  "marca": "string",
+  "modelo": "string",
+  "anio": 2023,
+  "color": "Negro",
+  "tipo_vehiculo": "camion"
+}
+```
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "id_vehiculo": 10,
+  "id_empresa": null,
+  "id_conductor": 3,
+  "patente": "ABC123",
+  "marca": "Ford",
+  "modelo": "Transit",
+  "anio": 2023,
+  "color": "Negro",
+  "tipo_vehiculo": "camion",
+  "condiciones": []
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "mensaje de validación" }` | Valor de campo inválido |
+| 400 | `{ "error": "El usuario no tiene perfil de conductor" }` | Sin registro de conductor |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
+| 403 | `{ "error": "Este vehiculo no te pertenece" }` | El vehículo pertenece a otro conductor |
+| 404 | `{ "error": "Vehiculo no encontrado" }` | No existe vehículo con ese id |
+
+---
+
+### DELETE /api/conductores/mis-vehiculos/:id
+
+Elimina un vehículo propio del conductor. No se puede eliminar si está en un viaje activo.
+
+**Rol requerido:** `CONDUCTOR`
+
+**Headers requeridos:**
+```
+Authorization: Bearer <firebase-id-token>
+```
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "mensaje": "Vehiculo eliminado"
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "El usuario no tiene perfil de conductor" }` | Sin registro de conductor |
+| 400 | `{ "error": "No se puede eliminar un vehiculo en uso" }` | El vehículo está en un viaje activo |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
+| 403 | `{ "error": "Este vehiculo no te pertenece" }` | El vehículo pertenece a otro conductor |
+| 404 | `{ "error": "Vehiculo no encontrado" }` | No existe vehículo con ese id |
+
+---
+
+### POST /api/conductores/mis-vehiculos/:id/condiciones/:condicion
+
+Agrega una condición a un vehículo propio del conductor.
+
+**Rol requerido:** `CONDUCTOR`
+
+**Headers requeridos:**
+```
+Authorization: Bearer <firebase-id-token>
+```
+
+- `:condicion`: uno de `FRAGIL`, `REFRIGERADO`, `CARGA_PESADA`, `PELIGROSO`, `VOLUMINOSO`
+
+**Respuesta exitosa — 201:**
+```json
+{
+  "id_vehiculo": 10,
+  "id_empresa": null,
+  "id_conductor": 3,
+  "patente": "ABC123",
+  "marca": "Ford",
+  "modelo": "Transit",
+  "anio": 2022,
+  "color": "Blanco",
+  "tipo_vehiculo": "furgon",
+  "condiciones": [
+    { "id_condicion": 7, "id_vehiculo": 10, "condicion": "FRAGIL" }
+  ]
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "Condicion invalida" }` | Valor de condición no reconocido |
+| 400 | `{ "error": "El usuario no tiene perfil de conductor" }` | Sin registro de conductor |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
+| 403 | `{ "error": "Este vehiculo no te pertenece" }` | El vehículo pertenece a otro conductor |
+| 404 | `{ "error": "Vehiculo no encontrado" }` | No existe vehículo con ese id |
+| 409 | `{ "error": "El vehiculo ya tiene esa condicion" }` | Condición duplicada |
+
+---
+
+### DELETE /api/conductores/mis-vehiculos/:id/condiciones/:condicion
+
+Elimina una condición de un vehículo propio del conductor.
+
+**Rol requerido:** `CONDUCTOR`
+
+**Headers requeridos:**
+```
+Authorization: Bearer <firebase-id-token>
+```
+
+- `:condicion`: uno de `FRAGIL`, `REFRIGERADO`, `CARGA_PESADA`, `PELIGROSO`, `VOLUMINOSO`
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "id_vehiculo": 10,
+  "id_empresa": null,
+  "id_conductor": 3,
+  "patente": "ABC123",
+  "marca": "Ford",
+  "modelo": "Transit",
+  "anio": 2022,
+  "color": "Blanco",
+  "tipo_vehiculo": "furgon",
+  "condiciones": []
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "Condicion invalida" }` | Valor de condición no reconocido |
+| 400 | `{ "error": "El usuario no tiene perfil de conductor" }` | Sin registro de conductor |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
+| 403 | `{ "error": "Este vehiculo no te pertenece" }` | El vehículo pertenece a otro conductor |
+| 404 | `{ "error": "Vehiculo no encontrado" }` | No existe vehículo con ese id |
 
 ---
 

@@ -121,6 +121,7 @@ model Conductor {
   usuario             Usuario             @relation(fields: [id_usuario], references: [id_usuario])
   conductor_empresas  ConductorEmpresa[]
   conductor_vehiculos ConductorVehiculo[]
+  vehiculos_propios   Vehiculo[]          @relation("VehiculoPropio")
   viajes              Viaje[]
   calificaciones      Calificacion[]
 
@@ -191,7 +192,8 @@ model MetodoPago {
 
 model Vehiculo {
   id_vehiculo   Int    @id @default(autoincrement())
-  id_empresa    Int
+  id_empresa    Int?
+  id_conductor  Int?
   patente       String @unique
   marca         String
   modelo        String
@@ -199,10 +201,11 @@ model Vehiculo {
   color         String
   tipo_vehiculo String
 
-  empresa             Empresa             @relation(fields: [id_empresa], references: [id_empresa])
-  conductor_vehiculos ConductorVehiculo[]
-  condiciones         CondicionVehiculo[]
-  viajes              Viaje[]
+  empresa               Empresa?            @relation(fields: [id_empresa], references: [id_empresa])
+  conductor_propietario Conductor?          @relation("VehiculoPropio", fields: [id_conductor], references: [id_conductor])
+  conductor_vehiculos   ConductorVehiculo[]
+  condiciones           CondicionVehiculo[]
+  viajes                Viaje[]
 
   @@map("vehiculos")
 }

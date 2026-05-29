@@ -13,11 +13,6 @@ export function manejarAceptarViaje(socket, io) {
       return;
     }
 
-    if (!payload.id_vehiculo) {
-      socket.emit('error', { error: 'Debes seleccionar un vehiculo' });
-      return;
-    }
-
     const conductor = await prisma.conductor.findUnique({
       where: { id_usuario: socket.data.usuario.id_usuario },
       include: {
@@ -30,36 +25,91 @@ export function manejarAceptarViaje(socket, io) {
       return;
     }
 
-    const vehiculo = await prisma.vehiculo.findUnique({
-      where: { id_vehiculo: parseInt(payload.id_vehiculo) },
-      include: { condiciones: true },
-    });
-
-    if (!vehiculo) {
-      socket.emit('error', { error: 'Vehiculo no encontrado' });
-      return;
-    }
-
-    if (vehiculo.id_conductor !== conductor.id_conductor) {
-      socket.emit('error', { error: 'Este vehiculo no te pertenece' });
-      return;
-    }
-
     const id_viaje = Number(payload.id_viaje);
 
-    const condicionesRequeridas = await prisma.condicionRequerida.findMany({
-      where: { id_viaje },
-    });
+    // ── CAMBIO A: id_vehiculo opcional con auto-selección ─────────────────
+    let vehiculoFinal = null;
 
-    const condicionesVehiculo = vehiculo.condiciones.map((c) => c.condicion);
-    const faltaAlguna = condicionesRequeridas.some(
-      (cr) => !condicionesVehiculo.includes(cr.condicion)
-    );
-    if (faltaAlguna) {
-      socket.emit('error', { error: 'Tu vehiculo no cumple las condiciones del viaje' });
-      return;
+    if (payload.id_vehiculo) {
+      vehiculoFinal = await prisma.vehiculo.findUnique({
+        where: { id_vehiculo: parseInt(payload.id_vehiculo) },
+        include: { condiciones: true },
+      });
+      if (!vehiculoFinal) {
+        socket.emit('error', { error: 'Vehiculo no encontrado' });
+        return;
+      }
+
+      // ── CAMBIO B: verificación de propiedad correcta ──────────────────
+      const esPropioDirecto = vehiculoFinal.id_conductor === conductor.id_conductor;
+      const asignadoViaEmpresa = await prisma.conductorVehiculo.findFirst({
+        where: {
+          id_vehiculo: vehiculoFinal.id_vehiculo,
+          id_conductor: conductor.id_conductor,
+        },
+      });
+      if (!esPropioDirecto && !asignadoViaEmpresa) {
+        socket.emit('error', { error: 'Ese vehiculo no te pertenece' });
+        return;
+      }
+
+      const condicionesRequeridas = await prisma.condicionRequerida.findMany({
+        where: { id_viaje },
+      });
+      const condicionesVehiculo = vehiculoFinal.condiciones.map((c) => c.condicion);
+      const faltaAlguna = condicionesRequeridas.some(
+        (cr) => !condicionesVehiculo.includes(cr.condicion)
+      );
+      if (faltaAlguna) {
+        socket.emit('error', { error: 'Tu vehiculo no cumple las condiciones del viaje' });
+        return;
+      }
+    } else {
+      // Auto-selección del primer vehículo elegible
+      const condicionesRequeridas = await prisma.condicionRequerida.findMany({
+        where: { id_viaje },
+      });
+      const condicionesNecesarias = condicionesRequeridas.map((c) => c.condicion);
+
+      const vehiculosPropios = await prisma.vehiculo.findMany({
+        where: { id_conductor: conductor.id_conductor },
+        include: { condiciones: true },
+      });
+
+      vehiculoFinal =
+        vehiculosPropios.find((v) => {
+          const tiene = v.condiciones.map((c) => c.condicion);
+          return condicionesNecesarias.every((c) => tiene.includes(c));
+        }) || null;
+
+      if (!vehiculoFinal && condicionesNecesarias.length === 0) {
+        vehiculoFinal = vehiculosPropios[0] || null;
+      }
+
+      if (!vehiculoFinal) {
+        // Intentar con vehículos asignados vía empresa
+        const conductorVehiculos = await prisma.conductorVehiculo.findMany({
+          where: { id_conductor: conductor.id_conductor },
+          include: { vehiculo: { include: { condiciones: true } } },
+        });
+        vehiculoFinal =
+          conductorVehiculos.find((cv) => {
+            const tiene = cv.vehiculo.condiciones.map((c) => c.condicion);
+            return condicionesNecesarias.every((c) => tiene.includes(c));
+          })?.vehiculo || null;
+
+        if (!vehiculoFinal && condicionesNecesarias.length === 0) {
+          vehiculoFinal = conductorVehiculos[0]?.vehiculo || null;
+        }
+      }
+
+      if (!vehiculoFinal) {
+        socket.emit('error', { error: 'No tenes vehiculos disponibles para este viaje' });
+        return;
+      }
     }
 
+    // ── Transacción atómica ───────────────────────────────────────────────
     let yaAsignado = false;
     try {
       await prisma.$transaction(async (tx) => {
@@ -73,7 +123,7 @@ export function manejarAceptarViaje(socket, io) {
           data: {
             estado: 'CONDUCTOR_ASIGNADO',
             id_conductor: conductor.id_conductor,
-            id_vehiculo: vehiculo.id_vehiculo,
+            id_vehiculo: vehiculoFinal.id_vehiculo,
           },
         });
       });
@@ -92,23 +142,43 @@ export function manejarAceptarViaje(socket, io) {
 
     cancelarTimer(id_viaje);
 
-    const room = `viaje:${id_viaje}`;
-    socket.emit('viaje:conductor_asignado', {
+    const payload_evento = {
       id_viaje,
+      id_usuario_conductor: conductor.id_usuario,
       conductor: {
         nombre: conductor.usuario.nombre,
         apellido: conductor.usuario.apellido,
         calificacion_promedio: conductor.calificacion_promedio,
       },
-      vehiculo: {
-        patente: vehiculo.patente,
-        marca: vehiculo.marca,
-        modelo: vehiculo.modelo,
-        tipo_vehiculo: vehiculo.tipo_vehiculo,
-      },
-    });
+      vehiculo: vehiculoFinal
+        ? {
+            patente: vehiculoFinal.patente,
+            marca: vehiculoFinal.marca,
+            modelo: vehiculoFinal.modelo,
+            tipo_vehiculo: vehiculoFinal.tipo_vehiculo,
+          }
+        : null,
+    };
 
-    socket.to(room).emit('viaje:no_disponible', { id_viaje });
+    // ── CAMBIO C: emitir correctamente a cada destinatario ────────────────
+
+    // 1. Al conductor ganador
+    socket.emit('viaje:conductor_asignado', payload_evento);
+
+    // 2. Al cliente directamente via su room personal
+    const viajeConCliente = await prisma.viaje.findUnique({
+      where: { id_viaje },
+      include: { cliente: { include: { usuario: true } } },
+    });
+    if (viajeConCliente?.cliente?.usuario) {
+      io.to('usuario:' + viajeConCliente.cliente.usuario.id_usuario).emit(
+        'viaje:conductor_asignado',
+        payload_evento
+      );
+    }
+
+    // 3. Al resto del room (conductores que no ganaron)
+    socket.to('viaje:' + id_viaje).emit('viaje:no_disponible', { id_viaje });
 
     console.log(`[Matching] viaje ${id_viaje} asignado al conductor ${conductor.id_conductor}`);
   });

@@ -15,6 +15,7 @@ export function inicializarSockets(httpServer) {
 
   io.on('connection', (socket) => {
     const { rol, id_usuario } = socket.data.usuario;
+    socket.join('usuario:' + id_usuario);
     console.log(`[Socket] conectado: ${rol} id:${socket.id}`);
 
     if (rol === 'CONDUCTOR') {

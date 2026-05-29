@@ -6,8 +6,12 @@ El cliente solicita un viaje, el sistema lo publica a conductores
 elegibles via WebSocket, el primero en aceptar queda asignado.
 
 ## Estado actual del proyecto
-- Fases 1-4 COMPLETAS
-- BUGS A CORREGIR EN ESTA SESION (ver seccion BUGS MAS ABAJO)
+- Fase 1 COMPLETA: autenticacion, registro, login, perfiles
+- Fase 2 COMPLETA: creacion de viajes, estimacion de costo, listado
+- Fase 3 COMPLETA: matching en tiempo real con Socket.io
+- Tarifas calculadas por el backend (tarifa.service.js), no por el usuario
+- Desglose de precio incluido en todas las respuestas con precio
+- Fase 4 EN DESARROLLO: GPS en tiempo real, algoritmos, costo acumulado
 
 ## Stack
 - Node.js 22 con ES Modules (import/export — NUNCA require)
@@ -23,85 +27,149 @@ elegibles via WebSocket, el primero en aceptar queda asignado.
 - ES Modules siempre. NUNCA require().
 - Modulos CommonJS: import pkg from 'modulo'; const { X } = pkg;
 - Async/await siempre.
-- Validar inputs con Zod en todos los endpoints REST.
+- Validar inputs con Zod en endpoints REST.
 - Respuestas de error: { error: "mensaje" }
 - Variables de entorno: todas en .env, nunca hardcodeadas.
 - Nombres de archivos: kebab-case.
 - Named exports en controllers y services.
+- Nunca modificar la DB directamente. Todo via schema.prisma + migrate.
 
-## BUGS A CORREGIR
+## ESTRATEGIA MOCK — Google Maps no disponible
+Todo lo que requiere Google Maps tiene mock que se activa cuando
+GOOGLE_MAPS_API_KEY esta vacia o no existe.
 
-### BUG 1 — Endpoint de viajes disponibles para conductores
-El equipo frontend reporta que no existe un endpoint para que el conductor
-consulte los viajes que puede aceptar.
+- Ruta optima (desvio.service.js): usa linea recta entre paradas
+  como mock. console.warn cuando se usa mock.
+- ETA (eta.service.js): retorna 15 minutos fijo como mock.
+  console.warn cuando se usa mock.
+- Distancia/tiempo (costo.service.js): ya implementado,
+  usa 10km / 0.5h como mock.
 
-IMPORTANTE: El endpoint GET /api/viajes/disponibles YA EXISTE desde Fase 2.
-Antes de crear nada, verificar que:
-  1. El endpoint existe en viajes.routes.js
-  2. Requiere rol CONDUCTOR
-  3. Devuelve viajes en estado BUSCANDO_CONDUCTOR con fecha futura
-  4. Filtra por condiciones del vehiculo del conductor
-  5. Incluye paradas y condiciones_req en la respuesta
+Cuando se agregue GOOGLE_MAPS_API_KEY al .env,
+todo funciona con datos reales sin cambiar codigo.
 
-Si todo esto esta correcto: el bug es del frontend, no del backend.
-Reportarlo claramente sin modificar nada del endpoint.
-Si algo falta o esta mal: corregirlo.
+## MODELO DE TARIFAS (implementado en modificacion pre-Fase 4)
+El usuario NO manda tarifa_hora ni tarifa_km.
+tarifa.service.js las calcula segun zona y hora del dia (pico/normal).
+Las tarifas se guardan en el Viaje en DB para calcular el costo real al finalizar.
 
-### BUG 2 — Race condition en WebSocket de matching
-PROBLEMA: cuando dos conductores aceptan el mismo viaje al mismo tiempo,
-ambos reciben viaje:conductor_asignado aunque solo uno gano la race.
+## DESGLOSE DE PRECIO (implementado)
+Toda respuesta con precio incluye campo desglose:
+{ precio_por_tiempo, precio_por_distancia, tiempo_horas,
+  distancia_km, tarifa_hora, tarifa_km, es_hora_pico }
 
-CAUSA: viaje:conductor_asignado se emite al room completo en lugar de
-solo al socket del conductor ganador.
+## ESTRATEGIA DE GPS EN REDIS
+Las coordenadas GPS NO se guardan en PostgreSQL.
+Se usan estas keys en Redis:
+  "gps:{id_viaje}:ultima"       → { lat, lng, timestamp } — SET con expire 2h
+  "gps:{id_viaje}:historial"    → lista de ultimas 20 coordenadas — LPUSH + LTRIM
+  "gps:{id_viaje}:ruta"         → array de [lng, lat] de la ruta — SET con expire 24h
+  "gps:{id_viaje}:acumulado"    → { tiempo_horas, distancia_km, ultima_lat,
+                                     ultima_lng, ultima_actualizacion } — SET
+  "gps:{id_viaje}:pings_detenido" → contador de pings consecutivos lentos — INCR
 
-FLUJO CORRECTO que debe implementar el backend:
+Al finalizar el viaje:
+  - Persistir tiempo_horas en Viaje.tiempo_capital
+  - Persistir distancia_km en Viaje.distancia_provincia
+  - DEL todas las keys de Redis del viaje
 
-  Evento                  | Destinatario
-  ------------------------|------------------------------------------
-  viaje:conductor_asignado| Solo el socket del conductor que GANO
-  viaje:ya_asignado       | Cada socket que intento aceptar y perdio
-  viaje:no_disponible     | Broadcast a todos los demas del room
+## ALGORITMOS DE FASE 4 — version simplificada
 
-Payload de viaje:no_disponible (NUEVO):
-  { id_viaje: number }
+Desvios:
+  - Ruta mock = linea recta entre la primera y ultima parada
+  - Con cada ping: Turf nearestPointOnLine para calcular distancia a esa linea
+  - Si distancia > DESVIO_UMBRAL_METROS: emitir alerta:desvio
 
-El archivo a modificar es src/sockets/matching.socket.js.
+Paradas sospechosas (solo CABA y MIXTO):
+  - Calcular velocidad entre el ping anterior y el actual
+  - Si velocidad < PARADA_SOSPECHOSA_VELOCIDAD_KMH: INCR contador en Redis
+  - Si contador * 15seg >= PARADA_SOSPECHOSA_MINUTOS * 60:
+    verificar que no esta dentro de 150m de alguna parada del viaje
+    Si es asi: emitir alerta:parada
+  - Si velocidad >= umbral: DEL contador (resetear)
 
-La logica actual probablemente hace:
-  io.to('viaje:' + id_viaje).emit('viaje:conductor_asignado', payload)
-  (esto emite a TODOS en el room)
+Acumulador de costo:
+  - Con cada ping: calcular delta de distancia y tiempo desde el ping anterior
+  - Acumular en Redis
+  - Cada 60 segundos (aproximado): emitir costo:actualizar al room
 
-Debe cambiarse a:
-  socket.emit('viaje:conductor_asignado', payload)
-  (esto emite SOLO al socket del conductor ganador)
-  
-  Y agregar:
-  socket.to('viaje:' + id_viaje).emit('viaje:no_disponible', { id_viaje })
-  (esto emite a TODOS en el room EXCEPTO al ganador)
+## CAMBIOS AUTOMATICOS DE ESTADO
+Al recibir el primer ping GPS de un viaje en estado CONDUCTOR_ASIGNADO:
+  → cambiar automaticamente a EN_CAMINO_A_ORIGEN y emitir viaje:estado_cambiado
 
-VERIFICACION PREVIA: antes de modificar, leer el archivo actual y confirmar
-si el bug existe realmente. Si ya emite solo al socket ganador, el bug es
-del frontend y no hay que cambiar nada.
+Los demas cambios de estado en Fase 4 son manuales via endpoint REST.
 
-## Estructura de carpetas relevante
+## Estructura de carpetas
 src/
-├── routes/viajes.routes.js
-├── controllers/viajes.controller.js
-└── sockets/matching.socket.js
+├── config/
+│   ├── firebase.js
+│   ├── prisma.js
+│   ├── redis.js
+│   └── storage.js
+├── routes/
+│   ├── auth.routes.js
+│   └── viajes.routes.js
+├── controllers/
+│   ├── auth.controller.js
+│   └── viajes.controller.js
+├── services/
+│   ├── tarifa.service.js
+│   ├── costo.service.js
+│   ├── elegibilidad.service.js
+│   ├── matching.service.js
+│   ├── gps.service.js          ← NUEVO Fase 4
+│   ├── desvio.service.js       ← NUEVO Fase 4
+│   ├── parada.service.js       ← NUEVO Fase 4
+│   └── eta.service.js          ← NUEVO Fase 4
+├── middlewares/
+│   └── auth.middleware.js
+├── sockets/
+│   ├── index.js
+│   ├── auth.socket.js
+│   ├── matching.socket.js
+│   └── gps.socket.js           ← NUEVO Fase 4
+└── app.js
+scripts/
+└── simular-gps.js              ← NUEVO Fase 4 (testing sin mobile)
+prisma/
+├── schema.prisma
+└── migrations/
 
-## Endpoints de viajes
-GET  /api/viajes/disponibles  → CONDUCTOR, lista viajes disponibles
-POST /api/viajes              → CLIENTE, crea viaje
-GET  /api/viajes/:id          → autenticado, detalle
+## Eventos Socket.io existentes (no tocar)
+viaje:disponible, viaje:aceptar, viaje:conductor_asignado,
+viaje:ya_asignado, viaje:cancelado_sin_conductor
 
-## Eventos WebSocket de matching
-viaje:disponible         → conductores elegibles (al crear viaje)
-viaje:aceptar            → conductor → servidor
-viaje:conductor_asignado → SOLO al conductor ganador
-viaje:ya_asignado        → conductores que intentaron y perdieron
-viaje:no_disponible      → resto de conductores del room (NUEVO)
-viaje:cancelado_sin_conductor → cliente
+## Nuevos eventos Socket.io — Fase 4
+conductor:ubicacion     conductor → servidor  { id_viaje, lat, lng, timestamp }
+mapa:actualizar         servidor → room       { lat, lng, timestamp, velocidad_kmh }
+costo:actualizar        servidor → room       { precio_acumulado, desglose }
+alerta:desvio           servidor → room       { id_viaje, distancia_metros, mensaje }
+alerta:parada           servidor → room       { id_viaje, minutos_detenido, mensaje }
+viaje:estado_cambiado   servidor → room       { id_viaje, estado_anterior, estado_nuevo }
 
-## Comandos
+## Endpoints existentes (no modificar)
+GET  /health
+POST /api/auth/* (todos)
+POST /api/viajes/estimar-costo
+POST /api/viajes
+GET  /api/viajes/disponibles
+GET  /api/viajes/mis-viajes
+GET  /api/viajes/:id
+
+## Nuevos endpoints REST — Fase 4
+PATCH /api/viajes/:id/estado         → conductor cambia estado manualmente
+GET   /api/viajes/:id/costo-acumulado → cliente consulta costo hasta el momento
+
+## Variables de entorno
+Todas en .env. Ver .env.example para la lista completa.
+Nuevas en Fase 4:
+  DESVIO_UMBRAL_METROS=300
+  PARADA_SOSPECHOSA_MINUTOS=5
+  PARADA_SOSPECHOSA_VELOCIDAD_KMH=3
+
+## Comandos importantes
 npm run dev
-node scripts/test-bugs2.js
+npm run start
+npx prisma migrate dev --name descripcion
+npx prisma studio
+node scripts/simular-gps.js <id_viaje>   ← para testear GPS sin mobile

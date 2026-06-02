@@ -568,6 +568,14 @@ socket.on('connect_error', (err) => {
 });
 ```
 
+**Errores de lógica emitidos durante el flujo (evento `error`):**
+```js
+socket.on('error', (data) => {
+  console.log(data.mensaje); // descripción del error
+});
+```
+Los errores de negocio del servidor usan `{ "mensaje": "..." }` — **no** `{ "error": "..." }`.
+
 ---
 
 ### Evento: viaje:disponible
@@ -610,23 +618,30 @@ socket.on('viaje:disponible', (data) => {
 **Payload a emitir:**
 ```json
 {
-  "id_viaje": 42,
-  "id_vehiculo": 7
+  "id_viaje": 42
 }
 ```
 
-- `id_vehiculo`: **requerido**. ID del vehículo propio del conductor con el que acepta el viaje.
+- `id_vehiculo`: **opcional**. Si se incluye, el servidor valida que pertenece al conductor y cumple las condiciones del viaje. Si se omite, el servidor elige automáticamente el primer vehículo elegible del conductor.
 
 **Cómo emitirlo:**
 ```js
+// sin vehículo (el backend lo elige automáticamente)
+socket.emit('viaje:aceptar', { id_viaje: 42 });
+
+// con vehículo específico
 socket.emit('viaje:aceptar', { id_viaje: 42, id_vehiculo: 7 });
 ```
 
 **Validaciones del servidor:**
-1. `id_vehiculo` debe estar presente; si falta: `error` con `"Debes seleccionar un vehiculo"`
-2. El vehículo debe existir; si no: `error` con `"Vehiculo no encontrado"`
-3. El vehículo debe pertenecer al conductor; si no: `error` con `"Este vehiculo no te pertenece"`
-4. El vehículo debe cumplir todas las condiciones requeridas del viaje; si falta alguna: `error` con `"Tu vehiculo no cumple las condiciones del viaje"`
+
+Si se envía `id_vehiculo`:
+1. El vehículo debe existir; si no: evento `error` con `{ "mensaje": "Vehiculo no encontrado" }`
+2. El vehículo debe pertenecer al conductor; si no: evento `error` con `{ "mensaje": "Ese vehiculo no te pertenece" }`
+3. El vehículo debe cumplir las condiciones del viaje; si falta alguna: evento `error` con `{ "mensaje": "Tu vehiculo no cumple las condiciones del viaje" }`
+
+Si NO se envía `id_vehiculo` (auto-selección):
+4. Si ningún vehículo cumple las condiciones: evento `error` con `{ "mensaje": "No tenes un vehiculo que cumpla las condiciones del viaje" }`
 
 **Nota:** después de emitir este evento el conductor recibirá `viaje:conductor_asignado`
 si ganó la carrera o `viaje:ya_asignado` si otro conductor fue más rápido.
@@ -1258,5 +1273,4 @@ Authorization: Bearer <firebase-id-token>
 - Fechas en formato ISO 8601 UTC
 - El campo `contrasena` nunca se almacena en la DB — solo va a Firebase
 - `id_conductor`, `id_vehiculo` e `id_empresa` en el viaje son `null` hasta que se asigne un conductor
-- El campo `vehiculo` en `viaje:conductor_asignado` puede ser `null` si el conductor
-  no tiene vehículo registrado en la DB (se resuelve en Fase 4)
+- El campo `vehiculo` en `viaje:conductor_asignado` siempre es un objeto no nulo — si el conductor no tiene vehículo elegible el servidor emite `error` antes de asignar el viaje

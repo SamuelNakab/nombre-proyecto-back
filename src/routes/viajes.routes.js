@@ -8,6 +8,10 @@ import {
   obtenerViaje,
   cambiarEstado,
   obtenerCostoAcumulado,
+  obtenerQRParadas,
+  confirmarParada,
+  calificarViaje,
+  obtenerRemito,
 } from '../controllers/viajes.controller.js';
 
 const router = Router();
@@ -18,6 +22,10 @@ router.get('/disponibles', verificarToken, requireRol('CONDUCTOR'), listarViajes
 router.get('/mis-viajes', verificarToken, requireRol('CLIENTE'), listarMisViajes);
 router.patch('/:id/estado', verificarToken, requireRol('CONDUCTOR'), cambiarEstado);
 router.get('/:id/costo-acumulado', verificarToken, obtenerCostoAcumulado);
+router.get('/:id/qr-paradas', verificarToken, requireRol('CLIENTE'), obtenerQRParadas);
+router.post('/:id/confirmar-parada', verificarToken, requireRol('CONDUCTOR'), confirmarParada);
+router.post('/:id/calificacion', verificarToken, requireRol('CLIENTE'), calificarViaje);
+router.get('/:id/remito', verificarToken, obtenerRemito);
 router.get('/:id', verificarToken, obtenerViaje);
 
 export default router;

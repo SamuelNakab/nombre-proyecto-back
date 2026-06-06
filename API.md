@@ -1267,6 +1267,284 @@ Authorization: Bearer <firebase-id-token>
 
 ---
 
+---
+
+## Fase 5 — Confirmación, cierre y remito
+
+
+### GET /api/viajes/:id/qr-paradas
+
+
+Devuelve los tokens QR firmados de cada parada del viaje. El cliente los muestra
+como código QR en pantalla para que el conductor los escanee al llegar.
+
+
+**Rol requerido:** `CLIENTE` (debe ser el dueño del viaje)
+
+
+**Respuesta exitosa — 200:**
+```json
+[
+  {
+    "id_parada": 1,
+    "orden": 1,
+    "direccion": "Plaza de Mayo, CABA",
+    "qr_firmado": "eyJpZF9wYXJhZGEiOjEsImlkX3ZpYWplIjo0Miwib3JkZW4iOjF9.a3f9c8..."
+  },
+  {
+    "id_parada": 2,
+    "orden": 2,
+    "direccion": "Recoleta, CABA",
+    "qr_firmado": "eyJpZF9wYXJhZGEiOjIsImlkX3ZpYWplIjo0Miwib3JkZW4iOjJ9.d72b1e..."
+  }
+]
+```
+
+
+El campo `qr_firmado` es un string `base64url_payload.hmac_hex`. Es lo que
+se debe codificar como imagen QR y mostrar al cliente para que el conductor lo escanee.
+
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CLIENTE |
+| 403 | `{ "error": "Sin acceso a este viaje" }` | El cliente no es el dueño del viaje |
+| 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
+
+
+---
+
+
+### POST /api/viajes/:id/confirmar-parada
+
+
+El conductor escanea el QR al llegar a una parada y confirma la entrega.
+Si era la última parada pendiente, cierra el viaje automáticamente.
+
+
+**Rol requerido:** `CONDUCTOR` (debe ser el conductor asignado al viaje)
+
+
+**Body:**
+```json
+{
+  "qr_firmado": "eyJpZF9wYXJhZGEiOjEsImlkX3ZpYWplIjo0Miwib3JkZW4iOjF9.a3f9c8...",
+  "lat": -34.6037,
+  "lng": -58.3816
+}
+```
+
+
+- `qr_firmado`: el string escaneado del QR (generado por `GET /api/viajes/:id/qr-paradas`)
+- `lat`, `lng`: coordenada GPS actual del conductor al momento del escaneo
+
+
+**Validaciones en orden:**
+1. Firma HMAC válida
+2. `id_viaje` del QR coincide con el `:id` de la URL
+3. El conductor es el asignado al viaje
+4. El viaje está en estado `EN_RUTA` o `DESCARGANDO`
+5. La parada no está ya en estado `ENTREGADO`
+6. El conductor está a menos de 200 metros de la parada (Turf.js)
+
+
+**Respuesta exitosa — 200 (parada confirmada, quedan pendientes):**
+```json
+{
+  "confirmada": true,
+  "viaje_finalizado": false
+}
+```
+
+
+**Respuesta exitosa — 200 (última parada → viaje cerrado):**
+```json
+{
+  "confirmada": true,
+  "viaje_finalizado": true,
+  "precio_real": 1750.00,
+  "remito_url": "https://pub.r2.example.com/remitos/42.pdf"
+}
+```
+
+
+**Efectos secundarios al cerrar el viaje:**
+- La parada queda en estado `ENTREGADO` con `fecha_entrega = now()`
+- El viaje pasa a estado `FINALIZADO` con `precio_real` calculado
+- Se genera el remito PDF y se sube a Cloudflare R2
+- Se emite el evento WebSocket `viaje:finalizado` al room del viaje
+- Se eliminan todas las keys GPS de Redis
+
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "QR invalido o firma incorrecta" }` | HMAC inválido o token malformado |
+| 400 | `{ "error": "El QR no corresponde a este viaje" }` | El QR es de otro viaje |
+| 400 | `{ "error": "El viaje debe estar en estado EN_RUTA o DESCARGANDO" }` | Estado incorrecto |
+| 400 | `{ "error": "La parada ya fue confirmada" }` | La parada ya tiene estado ENTREGADO |
+| 400 | `{ "error": "Estas a Xm de la parada. Debes estar a menos de 200m" }` | Demasiado lejos de la parada |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
+| 403 | `{ "error": "No sos el conductor de este viaje" }` | Conductor diferente al asignado |
+| 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
+| 404 | `{ "error": "Parada no encontrada" }` | La parada del QR no existe en este viaje |
+
+
+---
+
+
+### WebSocket — Evento: viaje:finalizado
+
+
+**Dirección:** servidor → room del viaje  
+**Quién lo recibe:** cliente y conductor conectados al room `viaje:{id_viaje}`  
+**Cuándo:** cuando se confirma la última parada via `POST /api/viajes/:id/confirmar-parada`
+
+
+**Payload:**
+```json
+{
+  "id_viaje": 42,
+  "precio_real": 1750.00,
+  "desglose": {
+    "precio_por_tiempo": 1750.00,
+    "precio_por_distancia": null,
+    "tiempo_horas": 0.5,
+    "distancia_km": 8.2,
+    "tarifa_hora": 3500,
+    "tarifa_km": null
+  },
+  "remito_url": "https://pub.r2.example.com/remitos/42.pdf"
+}
+```
+
+
+**Cómo escucharlo:**
+```js
+socket.on('viaje:finalizado', (data) => {
+  console.log('Viaje finalizado. Precio real:', data.precio_real);
+  console.log('Remito:', data.remito_url);
+});
+```
+
+
+---
+
+
+### POST /api/viajes/:id/calificacion
+
+
+El cliente califica al conductor después de que el viaje finalizó.
+Solo se permite una calificación por viaje.
+
+
+**Rol requerido:** `CLIENTE` (debe ser el dueño del viaje)
+
+
+**Body:**
+```json
+{
+  "puntuacion": 5,
+  "comentario": "Excelente servicio, muy puntual"
+}
+```
+
+
+- `puntuacion`: entero entre 1 y 5 (requerido)
+- `comentario`: string (opcional)
+
+
+**Respuesta exitosa — 201:**
+```json
+{
+  "id_calificacion": 7,
+  "puntuacion": 5,
+  "comentario": "Excelente servicio, muy puntual"
+}
+```
+
+
+**Efecto secundario:** recalcula y actualiza `conductor.calificacion_promedio`
+como el promedio de todos sus puntajes en DB.
+
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "mensaje de validación" }` | Puntuación fuera de rango o tipo inválido |
+| 400 | `{ "error": "Solo se puede calificar un viaje finalizado" }` | El viaje no está en estado FINALIZADO |
+| 400 | `{ "error": "El viaje no tiene conductor asignado" }` | Sin conductor asignado |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CLIENTE |
+| 403 | `{ "error": "Sin acceso a este viaje" }` | El cliente no es el dueño del viaje |
+| 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
+| 409 | `{ "error": "Este viaje ya tiene una calificacion" }` | Calificación duplicada |
+
+
+---
+
+
+### GET /api/viajes/:id/remito
+
+
+Devuelve la URL pública del remito PDF del viaje. Solo disponible para viajes finalizados.
+
+
+**Rol requerido:** `CLIENTE` o `CONDUCTOR` del viaje
+
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "remito_url": "https://pub.r2.example.com/remitos/42.pdf"
+}
+```
+
+
+El PDF incluye: datos del cliente y conductor, lista de paradas con fecha de entrega,
+y desglose de costo (tiempo, distancia, tarifas, precio real).
+
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "El remito solo esta disponible para viajes finalizados" }` | Estado incorrecto |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Sin acceso a este viaje" }` | No es el cliente ni el conductor del viaje |
+| 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
+
+
+---
+
+
+### GET /api/viajes/:id — cambios en Fase 5
+
+
+El endpoint ahora incluye el campo `calificacion` en la respuesta (si existe):
+
+```json
+{
+  "id_viaje": 42,
+  "estado": "FINALIZADO",
+  "precio_real": 1750.00,
+  "paradas": [...],
+  "calificacion": {
+    "id_calificacion": 7,
+    "puntaje": 5,
+    "comentario": "Excelente servicio",
+    "fecha_hora": "2026-06-06T15:00:00.000Z"
+  }
+}
+```
+
+`calificacion` es `null` si el viaje aún no fue calificado.
+
+
+---
+
 ## Convenciones generales
 
 - Todos los errores devuelven `{ "error": "mensaje legible" }`

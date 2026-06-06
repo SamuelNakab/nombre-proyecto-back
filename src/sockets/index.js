@@ -20,6 +20,8 @@ export function inicializarSockets(httpServer) {
 
     if (rol === 'CONDUCTOR') {
       unirseARoomsDisponibles(socket);
+    } else if (rol === 'CLIENTE') {
+      unirseARoomsCliente(socket);
     }
 
     manejarAceptarViaje(socket, io);
@@ -60,6 +62,20 @@ async function unirseARoomsDisponibles(socket) {
   }
 
   console.log(`[Socket] conductor ${conductor.id_conductor} unido a ${joined} rooms`);
+}
+
+async function unirseARoomsCliente(socket) {
+  const viajes = await prisma.viaje.findMany({
+    where: {
+      cliente: { id_usuario: socket.data.usuario.id_usuario },
+      estado: { notIn: ['FINALIZADO', 'CANCELADO'] },
+    },
+    select: { id_viaje: true },
+  });
+  for (const v of viajes) {
+    socket.join(`viaje:${v.id_viaje}`);
+  }
+  console.log(`[Socket] cliente unido a ${viajes.length} rooms de viajes activos`);
 }
 
 function conductorEsElegible(vehiculosConductor, vehiculosPropios, condicionesViaje) {

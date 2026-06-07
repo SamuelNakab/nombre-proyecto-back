@@ -3,7 +3,7 @@ import { z } from 'zod';
 import * as turf from '@turf/turf';
 import prisma from '../config/prisma.js';
 import { estimarCosto as estimarCostoService } from '../services/costo.service.js';
-import { obtenerConductoresElegibles } from '../services/elegibilidad.service.js';
+import { obtenerConductoresElegibles, conductorEsElegible } from '../services/elegibilidad.service.js';
 import { publicarViaje } from '../services/matching.service.js';
 import { obtenerAcumulado } from '../services/gps.service.js';
 import { cerrarViaje } from '../services/cierre.service.js';
@@ -73,23 +73,6 @@ const schemaCrear = z.object({
     .optional()
     .default([]),
 });
-
-// ─── Helper de elegibilidad en memoria ──────────────────────────────────────
-
-function conductorEsElegible(vehiculosConductor, vehiculosPropios, condicionesViaje) {
-  if (condicionesViaje.length === 0) return true;
-
-  const tieneViaEmpresa = vehiculosConductor.some((cv) => {
-    const tiene = cv.vehiculo.condiciones.map((c) => c.condicion);
-    return condicionesViaje.every((req) => tiene.includes(req));
-  });
-  if (tieneViaEmpresa) return true;
-
-  return vehiculosPropios.some((v) => {
-    const tiene = v.condiciones.map((c) => c.condicion);
-    return condicionesViaje.every((req) => tiene.includes(req));
-  });
-}
 
 // ─── Controllers ─────────────────────────────────────────────────────────────
 

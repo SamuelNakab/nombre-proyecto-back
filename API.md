@@ -409,8 +409,11 @@ Las tarifas se calculan automáticamente según la zona y si la `fecha_programad
 ### GET /api/viajes/disponibles
 
 Devuelve los viajes en estado `BUSCANDO_CONDUCTOR` con fecha futura para los que
-el conductor es elegible (tiene al menos un vehículo que cumple todas las
-condiciones requeridas del viaje).
+el conductor es elegible. Un conductor es elegible si y solo si tiene al menos
+un vehículo (propio o asignado vía empresa) que cumple todas las condiciones
+requeridas del viaje. Si el viaje no requiere condiciones, alcanza con tener
+al menos un vehículo — un conductor sin ningún vehículo registrado no es
+elegible para ningún viaje, tenga o no condiciones requeridas.
 
 **Rol requerido:** `CONDUCTOR`
 
@@ -641,7 +644,18 @@ Si se envía `id_vehiculo`:
 3. El vehículo debe cumplir las condiciones del viaje; si falta alguna: evento `error` con `{ "mensaje": "Tu vehiculo no cumple las condiciones del viaje" }`
 
 Si NO se envía `id_vehiculo` (auto-selección):
-4. Si ningún vehículo cumple las condiciones: evento `error` con `{ "mensaje": "No tenes un vehiculo que cumpla las condiciones del viaje" }`
+4. El servidor busca, entre los vehículos propios y los asignados vía empresa
+   del conductor, el primero que cumpla todas las condiciones requeridas del
+   viaje (si el viaje no tiene condiciones, alcanza con tener al menos un
+   vehículo). Si el conductor no tiene ningún vehículo, o ninguno cumple las
+   condiciones, el servidor **no asigna el viaje** y emite únicamente el
+   evento `error`:
+   ```json
+   { "mensaje": "No tenes un vehiculo que cumpla las condiciones del viaje" }
+   ```
+   Esta es la misma regla de elegibilidad usada para filtrar
+   `GET /api/viajes/disponibles`: un viaje que no aparece ahí tampoco puede
+   ser aceptado, y viceversa.
 
 **Nota:** después de emitir este evento el conductor recibirá `viaje:conductor_asignado`
 si ganó la carrera o `viaje:ya_asignado` si otro conductor fue más rápido.

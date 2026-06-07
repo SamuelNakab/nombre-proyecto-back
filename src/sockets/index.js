@@ -3,6 +3,7 @@ import prisma from '../config/prisma.js';
 import { autenticarSocket } from './auth.socket.js';
 import { manejarAceptarViaje } from './matching.socket.js';
 import { registrarHandlersGPS } from './gps.socket.js';
+import { conductorEsElegible } from '../services/elegibilidad.service.js';
 
 export let io = null;
 
@@ -78,17 +79,3 @@ async function unirseARoomsCliente(socket) {
   console.log(`[Socket] cliente unido a ${viajes.length} rooms de viajes activos`);
 }
 
-function conductorEsElegible(vehiculosConductor, vehiculosPropios, condicionesViaje) {
-  if (condicionesViaje.length === 0) return true;
-
-  const tieneViaEmpresa = vehiculosConductor.some((cv) => {
-    const tiene = cv.vehiculo.condiciones.map((c) => c.condicion);
-    return condicionesViaje.every((req) => tiene.includes(req));
-  });
-  if (tieneViaEmpresa) return true;
-
-  return vehiculosPropios.some((v) => {
-    const tiene = v.condiciones.map((c) => c.condicion);
-    return condicionesViaje.every((req) => tiene.includes(req));
-  });
-}

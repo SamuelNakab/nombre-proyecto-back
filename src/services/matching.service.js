@@ -19,6 +19,7 @@ export async function publicarViaje(io, viaje, conductoresElegibles, clienteIdUs
     zona: viaje.zona,
     precio_estimado: viaje.precio_estimado,
     fecha_programada: viaje.fecha_programada,
+    descripcion: viaje.descripcion ?? null,
     paradas: viaje.paradas.map((p) => ({ orden: p.orden, direccion: p.direccion })),
     condiciones_req: viaje.condiciones_req.map((c) => ({ condicion: c.condicion })),
   });

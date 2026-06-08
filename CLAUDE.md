@@ -10,7 +10,9 @@ Fee porcentual por viaje. MVP: CABA + Gran Buenos Aires.
 - Fases 0-4 COMPLETAS
 - Registro y gestion de vehiculos para conductores (extra) COMPLETO
 - Bugs de matching corregidos
-- **En curso: Fase 5 — Confirmacion y cierre (QR, costo real, remito PDF)**
+- Fase 5 COMPLETA (QR, confirmacion de paradas, cierre, remito PDF, calificaciones)
+- Pulido en curso: inconsistencia de elegibilidad corregida
+- **Siguiente: continuar pulido o Fase 6 — Pagos con MercadoPago**
 
 ## Stack
 - Node.js 22 con ES Modules (import/export — NUNCA require)
@@ -22,8 +24,8 @@ Fee porcentual por viaje. MVP: CABA + Gran Buenos Aires.
 - Turf.js para algoritmos geograficos
 - Zod para validacion de inputs
 - Helmet + CORS para seguridad HTTP
-- pdfkit para generacion de PDFs (Fase 5)
-- @aws-sdk/client-s3 para Cloudflare R2 (Fase 5)
+- pdfkit para generacion de PDFs
+- @aws-sdk/client-s3 para Cloudflare R2
 
 ## Reglas de codigo
 - ES Modules siempre. NUNCA require().
@@ -36,13 +38,19 @@ Fee porcentual por viaje. MVP: CABA + Gran Buenos Aires.
 - Named exports en controllers y services.
 - Instancia unica de PrismaClient en src/config/prisma.js
 
+## Reglas de migraciones Prisma
+- Cada vez que se modifica el schema, correr:
+  npx prisma migrate dev --name descripcion-del-cambio
+- Nunca usar prisma db push en produccion.
+- El script de start ya corre prisma generate automaticamente.
+
 ## Estructura de carpetas
 src/
 ├── config/
 │   ├── firebase.js
 │   ├── prisma.js
 │   ├── redis.js
-│   └── storage.js        → cliente Cloudflare R2 (se crea en Fase 5)
+│   └── storage.js
 ├── routes/
 │   ├── auth.routes.js
 │   ├── viajes.routes.js
@@ -60,8 +68,8 @@ src/
 │   ├── desvio.service.js
 │   ├── parada.service.js
 │   ├── eta.service.js
-│   ├── cierre.service.js  → se crea en Fase 5
-│   └── remito.service.js  → se crea en Fase 5
+│   ├── cierre.service.js
+│   └── remito.service.js
 ├── middlewares/
 │   └── auth.middleware.js
 ├── sockets/
@@ -73,7 +81,8 @@ src/
 scripts/
 ├── seed-test.js
 ├── simular-gps.js
-└── test-fase4.js
+├── test-fase4.js
+└── test-fase5.js
 prisma/
 ├── schema.prisma
 └── migrations/
@@ -111,7 +120,7 @@ prisma/
 | alerta:desvio                 | servidor → room      | Room viaje:{id_viaje}                       |
 | alerta:parada                 | servidor → room      | Room viaje:{id_viaje}                       |
 | viaje:estado_cambiado         | servidor → room      | Room viaje:{id_viaje}                       |
-| viaje:finalizado              | servidor → room      | Room viaje:{id_viaje} (Fase 5)              |
+| viaje:finalizado              | servidor → room      | Room viaje:{id_viaje}                       |
 
 ## Estados del viaje
 
@@ -122,15 +131,23 @@ prisma/
 | EN_CAMINO_A_ORIGEN → CARGANDO          | Manual, conductor via PATCH /viajes/:id/estado |
 | CARGANDO → EN_RUTA                     | Manual, conductor via PATCH /viajes/:id/estado |
 | EN_RUTA → DESCARGANDO                  | Manual, conductor via PATCH /viajes/:id/estado |
-| DESCARGANDO → FINALIZADO               | QR de ultima parada confirmado (Fase 5)        |
+| DESCARGANDO → FINALIZADO               | QR de ultima parada confirmado                 |
 
-## QR — Logica de firma (Fase 5)
+## Elegibilidad de conductores
+Un conductor es elegible para un viaje si y solo si:
+1. Tiene AL MENOS UN vehiculo (propio via vehiculos.id_conductor,
+   o asignado via tabla conductor_vehiculo), Y
+2. Al menos uno de esos vehiculos cumple TODAS las condiciones
+   requeridas del viaje (si el viaje no tiene condiciones, basta con
+   tener al menos un vehiculo).
+La logica vive exclusivamente en elegibilidad.service.js — no duplicar.
+
+## QR — Logica de firma
 - Cada parada tiene qr_token (cuid) generado al crear el viaje.
 - El backend firma { id_parada, id_viaje, orden } con HMAC-SHA256 usando QR_SECRET.
-- El token firmado es lo que se muestra como QR al cliente y lo que escanea el conductor.
 - Al confirmar: verificar firma + conductor a menos de 200 metros de la parada (Turf.js).
 
-## Cloudflare R2 (Fase 5)
+## Cloudflare R2
 - Bucket: fleter-remitos
 - Endpoint: https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com
 - Region: 'auto'
@@ -161,9 +178,9 @@ R2_BUCKET_NAME=fleter-remitos
 R2_PUBLIC_URL=
 QR_SECRET=
 MERCADOPAGO_ACCESS_TOKEN=   (Fase 6)
-PORT=3000
+PORT=                       (Railway lo inyecta automaticamente)
 NODE_ENV=development
-MATCHING_TIMEOUT_MINUTOS=10
+MATCHING_TIMEOUT_MINUTOS=10 (ya no tiene efecto funcional — pendiente eliminar en pulido)
 TARIFA_BASE_HORA_CABA=3500
 TARIFA_PICO_HORA_CABA=5000
 TARIFA_BASE_KM_PROVINCIA=150
@@ -175,8 +192,9 @@ PARADA_SOSPECHOSA_VELOCIDAD_KMH=3
 ## Deploy
 - Backend: Railway. Script: prisma generate && node src/app.js
 - DB: Neon (PostgreSQL serverless)
+- Redis: Railway (servicio Redis en el mismo proyecto)
 - Web: Vercel — https://fleter-mu.vercel.app
-- CORS: https://fleter-mu.vercel.app + localhost
+- CORS: abierto (cors() sin restricciones) — restringir en pulido
 - Branches: main (estable, deploy auto) / develop (trabajo diario)
 
 ## Comandos
@@ -185,8 +203,9 @@ redis-cli ping
 npx prisma studio
 node scripts/simular-gps.js
 node scripts/test-fase4.js
+node scripts/test-fase5.js
 
-## Historial de bugs corregidos
+## Historial de bugs y fixes
 - id_vehiculo requerido vs opcional en viaje:aceptar → RESUELTO
 - Verificacion propiedad vehiculo para vehiculos de empresa → RESUELTO
 - Cliente no recibia viaje:conductor_asignado → RESUELTO
@@ -194,7 +213,13 @@ node scripts/test-fase4.js
 - condiciones_req no incluidas en eventos WebSocket → RESUELTO
 - Conductores que conectan tarde no recibian viajes → RESUELTO
 - Clientes que conectan tarde no se unian a su room → RESUELTO
+- Redis con REDIS_URL apuntando a localhost en Railway → RESUELTO
+- Puerto 3000 vs 8080 en Railway → RESUELTO (Railway inyecta PORT)
+- Elegibilidad buggy: conductor sin vehiculos veia viajes sin requisitos → RESUELTO
+  (tres implementaciones duplicadas unificadas en elegibilidad.service.js)
 
-## Bug pendiente
-Timer de cancelacion se activa para viajes programados aunque sean para el dia siguiente.
-Fix: no iniciar timer si fecha_programada > ahora + 2 horas. Se corrige en Fase 8.
+## Bugs pendientes (fase de pulido)
+- Timer de cancelacion (MATCHING_TIMEOUT_MINUTOS) a eliminar
+- CORS abierto — restringir a dominios conocidos
+- Calculo zona MIXTO incorrecto — usar poligono CABA para separar tiempo/distancia
+- MATCHING_TIMEOUT_MINUTOS a eliminar del .env y del codigo

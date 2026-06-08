@@ -73,6 +73,16 @@ async function generarPDF(viaje) {
     }
     doc.moveDown(0.8);
 
+    // ── Descripcion ──
+    if (viaje.descripcion) {
+      doc.moveTo(50, doc.y).lineTo(50 + W, doc.y).stroke();
+      doc.moveDown(0.5);
+      doc.fontSize(11).font('Helvetica-Bold').text('DESCRIPCIÓN');
+      doc.moveDown(0.3);
+      doc.fontSize(10).font('Helvetica').text(viaje.descripcion);
+      doc.moveDown(0.8);
+    }
+
     // ── Paradas ──
     doc.moveTo(50, doc.y).lineTo(50 + W, doc.y).stroke();
     doc.moveDown(0.5);

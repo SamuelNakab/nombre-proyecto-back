@@ -72,6 +72,7 @@ const schemaCrear = z.object({
     .array(z.enum(CONDICIONES))
     .optional()
     .default([]),
+  descripcion: z.string().max(500).optional(),
 });
 
 // ─── Controllers ─────────────────────────────────────────────────────────────
@@ -99,7 +100,7 @@ export async function crearViaje(req, res) {
     return res.status(400).json({ error: parsed.error.issues[0].message });
   }
 
-  const { zona, paradas, fecha_programada, condiciones_requeridas } = parsed.data;
+  const { zona, paradas, fecha_programada, condiciones_requeridas, descripcion } = parsed.data;
 
   const cliente = await prisma.cliente.findUnique({
     where: { id_usuario: req.usuario.id_usuario },
@@ -124,6 +125,7 @@ export async function crearViaje(req, res) {
       tarifa_hora,
       tarifa_km,
       fecha_programada: new Date(fecha_programada),
+      descripcion: descripcion ?? null,
       precio_estimado: resultado.precio_estimado,
       paradas: {
         create: paradas.map((p, i) => ({

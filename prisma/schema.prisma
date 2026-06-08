@@ -275,6 +275,7 @@ model Viaje {
   distancia_provincia Float?
   tiempo_capital      Float?
   fecha_programada    DateTime
+  descripcion         String?
   estado              EstadoViaje @default(BUSCANDO_CONDUCTOR)
   precio_estimado     Float?
   precio_real         Float?

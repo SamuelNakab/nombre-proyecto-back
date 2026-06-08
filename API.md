@@ -337,13 +337,16 @@ instantáneamente a los conductores elegibles conectados via WebSocket.
     { "lat": -34.92, "lng": -57.95, "direccion": "La Plata, Buenos Aires" }
   ],
   "fecha_programada": "2026-07-01T10:00:00.000Z",
-  "condiciones_requeridas": ["FRAGIL", "REFRIGERADO"]
+  "condiciones_requeridas": ["FRAGIL", "REFRIGERADO"],
+  "descripcion": "Carga frágil, llamar al llegar, portón azul"
 }
 ```
 
 - `fecha_programada`: fecha ISO futura, mínimo 1 hora desde el momento del request
 - `condiciones_requeridas`: opcional. Valores posibles: `FRAGIL`, `REFRIGERADO`,
   `CARGA_PESADA`, `PELIGROSO`, `VOLUMINOSO`
+- `descripcion`: opcional. Texto libre visible para el conductor antes de aceptar y en el
+  remito PDF. Máximo 500 caracteres. No afecta matching ni costo.
 
 Las tarifas se calculan automáticamente según la zona y si la `fecha_programada` cae en hora pico
 (7–10 h o 17–20 h). Se usan las variables de entorno `TARIFA_*` o los valores por defecto.
@@ -360,6 +363,7 @@ Las tarifas se calculan automáticamente según la zona y si la `fecha_programad
   "tarifa_hora": 5000,
   "tarifa_km": 200,
   "fecha_programada": "2026-07-01T10:00:00.000Z",
+  "descripcion": "Carga frágil, llamar al llegar, portón azul",
   "estado": "BUSCANDO_CONDUCTOR",
   "precio_estimado": 4500,
   "precio_real": null,
@@ -425,6 +429,7 @@ elegible para ningún viaje, tenga o no condiciones requeridas.
     "zona": "CABA",
     "precio_estimado": 2500,
     "fecha_programada": "2026-07-01T10:00:00.000Z",
+    "descripcion": "Carga frágil, llamar al llegar, portón azul",
     "estado": "BUSCANDO_CONDUCTOR",
     "paradas": [
       {
@@ -445,6 +450,8 @@ elegible para ningún viaje, tenga o no condiciones requeridas.
   }
 ]
 ```
+
+`descripcion` es `null` si el cliente no escribió una.
 
 Ordenados por `fecha_programada` ascendente.
 
@@ -504,6 +511,7 @@ Detalle de un viaje. Solo puede acceder el cliente que lo creó o el conductor a
   "zona": "CABA",
   "precio_estimado": 2500,
   "precio_real": null,
+  "descripcion": "Carga frágil, llamar al llegar, portón azul",
   "estado": "CONDUCTOR_ASIGNADO",
   "fecha_programada": "2026-07-01T10:00:00.000Z",
   "creado_en": "2026-05-09T12:00:00.000Z",
@@ -594,6 +602,7 @@ Los errores de negocio del servidor usan `{ "mensaje": "..." }` — **no** `{ "e
   "zona": "CABA",
   "precio_estimado": 2500,
   "fecha_programada": "2026-07-01T10:00:00.000Z",
+  "descripcion": "Carga frágil, llamar al llegar, portón azul",
   "paradas": [
     { "orden": 1, "direccion": "Plaza de Mayo, CABA" },
     { "orden": 2, "direccion": "Recoleta, CABA" }

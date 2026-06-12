@@ -7,6 +7,8 @@ import { obtenerConductoresElegibles, conductorEsElegible } from '../services/el
 import { publicarViaje } from '../services/matching.service.js';
 import { obtenerAcumulado } from '../services/gps.service.js';
 import { cerrarViaje } from '../services/cierre.service.js';
+import { recalcularEtaInmediato } from '../services/eta-emisor.js';
+import { calcularYGuardarRuta, obtenerRutaPlaneada } from '../services/ruta.service.js';
 import { io } from '../sockets/index.js';
 
 // ─── QR helpers ──────────────────────────────────────────────────────────────
@@ -145,12 +147,22 @@ export async function crearViaje(req, res) {
     },
   });
 
+  // Calcular la ruta planeada ahora, al crear el viaje. Si Google Maps falla,
+  // no bloqueamos la creacion: ruta_planeada queda null y se reintenta en el
+  // primer ping GPS (fallback en gps.socket.js).
+  let ruta_planeada = null;
+  try {
+    ruta_planeada = await calcularYGuardarRuta(viaje.id_viaje);
+  } catch (err) {
+    console.error(`[crearViaje] No se pudo calcular la ruta planeada para viaje ${viaje.id_viaje}:`, err.message);
+  }
+
   if (io) {
     const conductoresElegibles = await obtenerConductoresElegibles(condiciones_requeridas);
     await publicarViaje(io, viaje, conductoresElegibles, req.usuario.id_usuario);
   }
 
-  return res.status(201).json({ ...viaje, desglose_estimado: resultado.desglose });
+  return res.status(201).json({ ...viaje, ruta_planeada, desglose_estimado: resultado.desglose });
 }
 
 export async function listarViajesDisponibles(req, res) {
@@ -228,7 +240,10 @@ export async function obtenerViaje(req, res) {
     return res.status(403).json({ error: 'Sin acceso a este viaje' });
   }
 
-  return res.status(200).json(viaje);
+  // null si el viaje ya termino (Redis limpio) o si la ruta nunca se calculo.
+  const ruta_planeada = await obtenerRutaPlaneada(viaje.id_viaje);
+
+  return res.status(200).json({ ...viaje, ruta_planeada });
 }
 
 export async function cambiarEstado(req, res) {
@@ -409,6 +424,8 @@ export async function confirmarParada(req, res) {
   });
 
   if (pendientes > 0) {
+    // La proxima parada pendiente cambio: forzamos recalculo de ETA inmediato.
+    await recalcularEtaInmediato(io, id_viaje);
     return res.status(200).json({ confirmada: true, viaje_finalizado: false });
   }
 

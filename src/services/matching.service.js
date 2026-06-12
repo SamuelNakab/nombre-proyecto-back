@@ -1,4 +1,5 @@
 import prisma from '../config/prisma.js';
+import { detenerEmisorEta } from './eta-emisor.js';
 
 const timers = new Map();
 
@@ -40,6 +41,8 @@ export async function cancelarPorTimeout(io, id_viaje) {
   } catch {
     return;
   }
+
+  detenerEmisorEta(id_viaje);
 
   const room = `viaje:${id_viaje}`;
   io.to(room).emit('viaje:cancelado_sin_conductor', {

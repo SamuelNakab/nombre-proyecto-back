@@ -384,6 +384,7 @@ Las tarifas se calculan automáticamente según la zona y si la `fecha_programad
     { "id_condicion_req": 1, "condicion": "FRAGIL" },
     { "id_condicion_req": 2, "condicion": "REFRIGERADO" }
   ],
+  "ruta_planeada": [[-58.38162, -34.60361], [-58.38201, -34.60280], "..."],
   "desglose_estimado": {
     "precio_por_tiempo": 2500,
     "precio_por_distancia": 2000,
@@ -395,6 +396,10 @@ Las tarifas se calculan automáticamente según la zona y si la `fecha_programad
   }
 }
 ```
+
+- `ruta_planeada`: array de puntos `[lng, lat]` (ver [Formato de ruta](#formato-de-ruta)). La
+  ruta se calcula al crear el viaje. Es **`null`** si Google Maps falla en ese momento; en ese
+  caso se reintenta automáticamente en el primer ping GPS y el viaje se crea igual (201).
 
 **Comportamiento adicional:** después de crear el viaje, el servidor emite el evento
 `viaje:disponible` via WebSocket a todos los conductores elegibles conectados.
@@ -544,9 +549,14 @@ Detalle de un viaje. Solo puede acceder el cliente que lo creó o el conductor a
       "apellido": "López",
       "telefono": "+5491187654321"
     }
-  }
+  },
+  "ruta_planeada": [[-58.38162, -34.60361], [-58.38201, -34.60280], "..."]
 }
 ```
+
+- `ruta_planeada`: array de puntos `[lng, lat]` (ver [Formato de ruta](#formato-de-ruta)). Es
+  **`null`** si el viaje ya terminó (`FINALIZADO`/`CANCELADO`, con el cache de Redis ya limpio)
+  o si la ruta nunca llegó a calcularse.
 
 **Errores posibles:**
 | Status | Body | Causa |
@@ -677,7 +687,7 @@ si ganó la carrera o `viaje:ya_asignado` si otro conductor fue más rápido.
 **Quién lo recibe:** el cliente que creó el viaje y el conductor que aceptó  
 **Cuándo:** cuando un conductor acepta exitosamente el viaje
 
-**Payload:**
+**Payload:** (idéntico para ambos destinatarios — cliente y conductor)
 ```json
 {
   "id_viaje": 42,
@@ -691,9 +701,14 @@ si ganó la carrera o `viaje:ya_asignado` si otro conductor fue más rápido.
     "marca": "Ford",
     "modelo": "Transit",
     "tipo_vehiculo": "camioneta"
-  }
+  },
+  "ruta_planeada": [[-58.38162, -34.60361], [-58.38201, -34.60280], "..."]
 }
 ```
+
+- `ruta_planeada`: array de puntos `[lng, lat]` (ver [Formato de ruta](#formato-de-ruta)) para
+  dibujar la ruta en el mapa apenas se asigna el conductor. Puede ser `null` si la ruta falló al
+  crearse y todavía no se recalculó.
 
 **Cómo escucharlo:**
 ```js
@@ -701,6 +716,7 @@ socket.on('viaje:conductor_asignado', (data) => {
   // para el cliente: mostrar datos del conductor asignado
   // para el conductor: navegar a la pantalla del viaje activo
   console.log('Conductor asignado:', data.conductor.nombre);
+  if (data.ruta_planeada) mapa.setRuta(data.ruta_planeada);
 });
 ```
 
@@ -872,8 +888,9 @@ socket.emit('conductor:ubicacion', {
 - Guarda coordenada en Redis (historial de últimas 20)
 - Acumula distancia y tiempo
 - Si el viaje estaba en `CONDUCTOR_ASIGNADO` y es el primer ping: cambia automáticamente a `EN_CAMINO_A_ORIGEN`
+- Arranca (si no estaba activo) el emisor periódico de ETA del viaje, que emite `eta:actualizar` cada 30 s al room
 - Emite `mapa:actualizar`, y cada ~60 s emite `costo:actualizar`
-- Si el viaje está en `EN_RUTA`: verifica desvíos y paradas sospechosas
+- Si el viaje está en `EN_RUTA`: verifica desvíos (y recalcula la ruta si corresponde) y paradas sospechosas
 
 ---
 
@@ -983,6 +1000,92 @@ fuera de las paradas del viaje
 socket.on('alerta:parada', (data) => {
   // mostrar alerta al cliente
   console.log(data.mensaje);
+});
+```
+
+---
+
+### Evento: eta:actualizar
+
+**Dirección:** servidor → room del viaje  
+**Quién lo recibe:** cliente y conductor  
+**Cuándo:** cada `ETA_EMISION_SEGUNDOS` (default 30 s) mientras el viaje tiene GPS activo
+(estados `EN_CAMINO_A_ORIGEN` … `EN_RUTA`). El emisor arranca con el primer ping GPS y se
+detiene al finalizar o cancelar el viaje.
+
+El ETA hacia la próxima parada **pendiente** se calcula con Google Maps Directions API
+(con tráfico). Para no consumir la API en cada emisión, el servidor recalcula con la API
+sólo cada `ETA_RECALCULO_SEGUNDOS` (default 360 s), cuando cambia la próxima parada (al
+confirmar una parada) o cuando se recalcula la ruta por desvío. **Entre recalculos, el valor
+emitido es un countdown local del servidor** (último ETA de la API menos el tiempo
+transcurrido). El countdown nunca baja de 0; si llega a 0 se fuerza un recálculo con la API.
+
+**Payload:**
+```json
+{
+  "id_viaje": 42,
+  "proxima_parada_id": 18,
+  "segundos_restantes": 1827,
+  "minutos_restantes": 31
+}
+```
+
+- `segundos_restantes`: entero, nunca negativo.
+- `minutos_restantes`: `Math.ceil(segundos_restantes / 60)`, listo para mostrar.
+- `proxima_parada_id`: id de la parada pendiente de menor orden hacia la que se mide el ETA.
+
+**Cómo escucharlo:**
+```js
+socket.on('eta:actualizar', (data) => {
+  // actualizar el contador de "llega en X min" en la UI
+  console.log(`Llega en ~${data.minutos_restantes} min`);
+});
+```
+
+---
+
+### Evento: ruta:recalculada
+
+**Dirección:** servidor → room del viaje  
+**Quién lo recibe:** cliente y conductor  
+**Cuándo:** cuando el conductor se desvía de la ruta en **2 pings GPS consecutivos** (cada uno
+a más de `DESVIO_UMBRAL_METROS`, default 300 m) y además pasó el cooldown de
+`RUTA_RECALCULO_COOLDOWN_SEGUNDOS` (default 120 s) desde el último recálculo.  
+**Solo aplica:** viajes en estado `EN_RUTA`
+
+Un único ping desviado sólo emite `alerta:desvio` (puede ser ruido GPS). Al segundo ping
+consecutivo desviado, si pasó el cooldown, el servidor recalcula la ruta con Google Maps
+Directions API desde la posición actual del conductor hasta la última parada pendiente
+(las paradas pendientes intermedias se pasan como waypoints en orden), reemplaza la ruta
+guardada y fuerza un recálculo de ETA inmediato (llega un `eta:actualizar` nuevo justo
+después). Si el desvío persiste pero no pasó el cooldown, sólo se emite `alerta:desvio`.
+
+`nueva_ruta` **reemplaza a la `ruta_planeada`** original del viaje (la que llegó al crear el
+viaje, al asignar conductor y en `GET /api/viajes/:id`): es el mismo formato y representa lo
+mismo — la ruta vigente que el front dibuja en el mapa —, sólo que recalculada desde la
+posición actual del conductor. El front debe descartar la ruta anterior y quedarse con esta.
+
+**Payload:**
+```json
+{
+  "id_viaje": 42,
+  "nueva_ruta": [[-58.4066, -34.6287], [-58.4050, -34.6270], "..."],
+  "proxima_parada_id": 18,
+  "motivo": "desvio"
+}
+```
+
+- `nueva_ruta`: array de puntos `[lng, lat]` de la ruta recalculada (ver
+  [Formato de ruta](#formato-de-ruta)). El front debe **redibujar la ruta del mapa** con este
+  array, reemplazando la `ruta_planeada` anterior.
+- `proxima_parada_id`: id de la parada pendiente de menor orden (destino inmediato).
+- `motivo`: `"desvio"`.
+
+**Cómo escucharlo:**
+```js
+socket.on('ruta:recalculada', (data) => {
+  // redibujar la polilínea de la ruta en el mapa
+  mapa.setRuta(data.nueva_ruta);
 });
 ```
 
@@ -1575,3 +1678,24 @@ El endpoint ahora incluye el campo `calificacion` en la respuesta (si existe):
 - El campo `contrasena` nunca se almacena en la DB — solo va a Firebase
 - `id_conductor`, `id_vehiculo` e `id_empresa` en el viaje son `null` hasta que se asigne un conductor
 - El campo `vehiculo` en `viaje:conductor_asignado` siempre es un objeto no nulo — si el conductor no tiene vehículo elegible el servidor emite `error` antes de asignar el viaje
+
+<a id="formato-de-ruta"></a>
+### Formato de ruta
+
+La ruta de un viaje (la polilínea que el front dibuja en el mapa) es siempre un **array de
+puntos `[lng, lat]`** — primero longitud, después latitud — trazado por Google Maps Directions
+desde la primera parada hasta la última, con las paradas intermedias como waypoints en orden:
+
+```json
+[[-58.38162, -34.60361], [-58.38201, -34.60280], "..."]
+```
+
+Este mismo formato se usa en los cuatro lugares donde la ruta viaja al front:
+- `ruta_planeada` en la respuesta de `POST /api/viajes`
+- `ruta_planeada` en la respuesta de `GET /api/viajes/:id`
+- `ruta_planeada` en el payload del evento `viaje:conductor_asignado`
+- `nueva_ruta` en el payload del evento `ruta:recalculada`
+
+La ruta se calcula y cachea al **crear** el viaje. `ruta_planeada` puede ser `null` si Google
+Maps falló en la creación (se reintenta en el primer ping GPS) o si el viaje ya terminó y se
+limpió el cache. El evento `ruta:recalculada` reemplaza esta ruta cuando el conductor se desvía.

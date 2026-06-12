@@ -4,11 +4,11 @@ import {
   obtenerUltimaCoordenada,
   actualizarAcumulado,
   calcularVelocidad,
-  guardarRuta,
-  obtenerRuta,
 } from '../services/gps.service.js';
-import { obtenerRutaOptima, verificarDesvio } from '../services/desvio.service.js';
+import { manejarDesvio } from '../services/desvio.service.js';
+import { obtenerRutaPlaneada, calcularYGuardarRuta } from '../services/ruta.service.js';
 import { verificarParadaSospechosa } from '../services/parada.service.js';
+import { iniciarEmisorEta } from '../services/eta-emisor.js';
 
 export function registrarHandlersGPS(socket, io) {
   socket.on('conductor:ubicacion', async (data) => {
@@ -55,6 +55,10 @@ export function registrarHandlersGPS(socket, io) {
         });
       }
 
+      // El viaje tiene GPS activo: arrancamos el emisor periodico de ETA
+      // (idempotente — si ya corre, no hace nada). Se detiene al cerrar/cancelar.
+      iniciarEmisorEta(io, id_viaje);
+
       io.to(`viaje:${id_viaje}`).emit('mapa:actualizar', {
         lat,
         lng,
@@ -96,20 +100,24 @@ export function registrarHandlersGPS(socket, io) {
         });
       }
 
-      let ruta = await obtenerRuta(id_viaje);
+      // La ruta planeada se calcula al crear el viaje. Fallback para viajes
+      // viejos (creados antes de este cambio) o cuya ruta fallo en la creacion.
+      let ruta = await obtenerRutaPlaneada(id_viaje);
       if (!ruta) {
-        ruta = await obtenerRutaOptima(viaje.paradas);
-        await guardarRuta(id_viaje, ruta);
+        console.warn(`[gps.socket] viaje ${id_viaje} sin ruta en Redis — recalculando como fallback`);
+        try {
+          ruta = await calcularYGuardarRuta(id_viaje);
+        } catch (e) {
+          console.error(`[gps.socket] fallback de ruta fallo para viaje ${id_viaje}:`, e.message);
+          ruta = null;
+        }
       }
 
       if (viaje.estado === 'EN_RUTA') {
-        const desvio = verificarDesvio(lat, lng, ruta);
-        if (desvio.desviado) {
-          io.to(`viaje:${id_viaje}`).emit('alerta:desvio', {
-            id_viaje,
-            distancia_metros: Math.round(desvio.distancia_metros),
-            mensaje: `El conductor se desvio ${Math.round(desvio.distancia_metros)}m de la ruta`,
-          });
+        // Deteccion de desvio + recalculo de ruta (2 pings consecutivos
+        // desviados con cooldown). Lee/escribe la ruta vigente en Redis.
+        if (ruta) {
+          await manejarDesvio(io, id_viaje, lat, lng, ruta);
         }
 
         const parada_result = await verificarParadaSospechosa(

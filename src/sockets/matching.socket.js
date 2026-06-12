@@ -1,5 +1,6 @@
 import prisma from '../config/prisma.js';
 import { cancelarTimer } from '../services/matching.service.js';
+import { obtenerRutaPlaneada } from '../services/ruta.service.js';
 
 export function manejarAceptarViaje(socket, io) {
   socket.on('viaje:aceptar', async (payload) => {
@@ -150,6 +151,10 @@ export function manejarAceptarViaje(socket, io) {
 
       cancelarTimer(id_viaje);
 
+      // Ruta planeada (calculada al crear el viaje) para que el front la dibuje
+      // apenas se asigna el conductor. Mismo formato [[lng, lat], ...].
+      const ruta_planeada = await obtenerRutaPlaneada(id_viaje);
+
       const payload_evento = {
         id_viaje,
         id_usuario_conductor: conductor.id_usuario,
@@ -164,6 +169,7 @@ export function manejarAceptarViaje(socket, io) {
           modelo: vehiculoFinal.modelo,
           tipo_vehiculo: vehiculoFinal.tipo_vehiculo,
         },
+        ruta_planeada,
       };
 
       // 1. Al conductor ganador

@@ -1,6 +1,7 @@
 import prisma from '../config/prisma.js';
 import { obtenerAcumulado, limpiarGPS } from './gps.service.js';
 import { generarRemito } from './remito.service.js';
+import { detenerEmisorEta } from './eta-emisor.js';
 
 export async function cerrarViaje(id_viaje, io) {
   const viaje = await prisma.viaje.findUnique({
@@ -58,6 +59,7 @@ export async function cerrarViaje(id_viaje, io) {
     });
   }
 
+  detenerEmisorEta(id_viaje);
   await limpiarGPS(id_viaje);
 
   return { precio_real, desglose, remito_url };

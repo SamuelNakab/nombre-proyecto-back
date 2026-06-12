@@ -83,5 +83,8 @@ export async function limpiarGPS(id_viaje) {
     redis.del(`gps:${id_viaje}:ruta`),
     redis.del(`gps:${id_viaje}:acumulado`),
     redis.del(`gps:${id_viaje}:pings_detenido`),
+    redis.del(`gps:${id_viaje}:eta`),
+    redis.del(`gps:${id_viaje}:ultimo_recalculo`),
+    redis.del(`gps:${id_viaje}:pings_desviado`),
   ]);
 }

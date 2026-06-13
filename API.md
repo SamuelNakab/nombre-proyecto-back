@@ -503,6 +503,57 @@ Devuelve todos los viajes del cliente autenticado, del más reciente al más ant
 
 ---
 
+### GET /api/viajes/mis-viajes-conductor
+
+Devuelve todos los viajes que el conductor autenticado tiene asignados (donde es el conductor
+del viaje), del más reciente al más antiguo. Es el equivalente de `mis-viajes` para el conductor.
+
+**Rol requerido:** `CONDUCTOR`
+
+**Query params (opcionales):**
+- `estado`: filtra por estado del viaje. Debe ser un `EstadoViaje` válido: `BUSCANDO_CONDUCTOR`,
+  `CONDUCTOR_ASIGNADO`, `EN_CAMINO_A_ORIGEN`, `CARGANDO`, `EN_RUTA`, `DESCARGANDO`, `FINALIZADO`
+  o `CANCELADO`. Sin este parámetro se devuelven todos los estados.
+
+**Respuesta exitosa — 200:**
+```json
+[
+  {
+    "id_viaje": 42,
+    "zona": "CABA",
+    "precio_estimado": 2500,
+    "precio_real": null,
+    "estado": "CONDUCTOR_ASIGNADO",
+    "fecha_programada": "2026-07-01T10:00:00.000Z",
+    "descripcion": "Carga frágil, llamar al llegar, portón azul",
+    "creado_en": "2026-05-09T12:00:00.000Z",
+    "paradas": [
+      { "orden": 1, "direccion": "Plaza de Mayo, CABA", "estado": "PENDIENTE", "fecha_entrega": null }
+    ],
+    "cliente": {
+      "usuario": {
+        "nombre": "Juan",
+        "apellido": "Pérez",
+        "telefono": "+5491112345678"
+      }
+    }
+  }
+]
+```
+
+Un conductor sin viajes asignados recibe un array vacío `[]` (no es un error). Cada conductor
+ve únicamente sus propios viajes.
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "Estado invalido" }` | El query param `estado` no es un `EstadoViaje` válido |
+| 400 | `{ "error": "El usuario no tiene perfil de conductor" }` | Sin registro de conductor |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
+
+---
+
 ### GET /api/viajes/:id
 
 Detalle de un viaje. Solo puede acceder el cliente que lo creó o el conductor asignado.

@@ -524,3 +524,57 @@ export async function listarMisViajes(req, res) {
 
   return res.status(200).json(viajes);
 }
+
+const ESTADOS_VIAJE = [
+  'BUSCANDO_CONDUCTOR',
+  'CONDUCTOR_ASIGNADO',
+  'EN_CAMINO_A_ORIGEN',
+  'CARGANDO',
+  'EN_RUTA',
+  'DESCARGANDO',
+  'FINALIZADO',
+  'CANCELADO',
+];
+
+export async function listarMisViajesConductor(req, res) {
+  const conductor = await prisma.conductor.findUnique({
+    where: { id_usuario: req.usuario.id_usuario },
+  });
+  if (!conductor) {
+    return res.status(400).json({ error: 'El usuario no tiene perfil de conductor' });
+  }
+
+  const { estado } = req.query;
+  if (estado !== undefined && !ESTADOS_VIAJE.includes(estado)) {
+    return res.status(400).json({ error: 'Estado invalido' });
+  }
+
+  const viajes = await prisma.viaje.findMany({
+    where: {
+      id_conductor: conductor.id_conductor,
+      ...(estado ? { estado } : {}),
+    },
+    select: {
+      id_viaje: true,
+      zona: true,
+      precio_estimado: true,
+      precio_real: true,
+      estado: true,
+      fecha_programada: true,
+      descripcion: true,
+      creado_en: true,
+      paradas: {
+        select: { orden: true, direccion: true, estado: true, fecha_entrega: true },
+        orderBy: { orden: 'asc' },
+      },
+      cliente: {
+        select: {
+          usuario: { select: { nombre: true, apellido: true, telefono: true } },
+        },
+      },
+    },
+    orderBy: { creado_en: 'desc' },
+  });
+
+  return res.status(200).json(viajes);
+}

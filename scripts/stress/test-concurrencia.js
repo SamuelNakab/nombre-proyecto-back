@@ -68,48 +68,89 @@ async function main() {
   sA.disconnect();
 
   // ────────────────────────────────────────────────────────────────────────
-  r.seccion('2. DOS conductores aceptan EL MISMO viaje (race)');
+  r.seccion('2. DOS conductores aceptan EL MISMO viaje (race) — 10 iteraciones');
 
-  const vc = await crearViajeNuevo(tokenCli);
+  // Las race conditions son intermitentes: una sola corrida puede "pasar de
+  // suerte". Repetimos el escenario ITER veces y exigimos que SIEMPRE gane
+  // exactamente uno. En cada iteracion verificamos:
+  //   - exactamente un conductor recibe viaje:conductor_asignado
+  //   - el otro recibe viaje:ya_asignado
+  //   - la DB queda con exactamente un id_conductor
+  //   - el cliente recibe conductor_asignado UNA sola vez
+  const ITER = 10;
   const sA2 = await conectar(tokenA);
   const sB = await conectar(tokenB);
+  const sCliRace = await conectar(tokenCli); // recibe conductor_asignado en su room personal
 
-  let resultsA = [];
-  let resultsB = [];
-  sA2.on('viaje:conductor_asignado', () => resultsA.push('ganador'));
-  sA2.on('viaje:ya_asignado', () => resultsA.push('ya_asignado'));
-  sB.on('viaje:conductor_asignado', () => resultsB.push('ganador'));
-  sB.on('viaje:ya_asignado', () => resultsB.push('ya_asignado'));
+  let iterOk = 0;
+  const detalleIters = [];
 
-  await esperar(1200);
-  // Emitir simultaneo
-  await Promise.all([
-    new Promise(res => { sA2.emit('viaje:aceptar', { id_viaje: vc.id_viaje }); res(); }),
-    new Promise(res => { sB.emit('viaje:aceptar', { id_viaje: vc.id_viaje }); res(); }),
-  ]);
-  await esperar(3500);
+  for (let i = 1; i <= ITER; i++) {
+    const vc = await crearViajeNuevo(tokenCli);
 
-  const { data: viajeC } = await api('GET', `/api/viajes/${vc.id_viaje}`, null, tokenCli);
-  const ganadorEnDB = viajeC.conductor?.id_conductor;
-  const gA = resultsA.includes('ganador');
-  const gB = resultsB.includes('ganador');
-  const ambosGanaron = gA && gB;
+    const resultsA = [];
+    const resultsB = [];
+    let clienteAsignado = 0;
 
-  r.paso(`Cantidad de "ganador" emitidos: A=${gA?1:0}, B=${gB?1:0} (DB: cond=${ganadorEnDB})`, true,
-    `A: ${JSON.stringify(resultsA)} | B: ${JSON.stringify(resultsB)}`);
+    const onA   = d => { if (d.id_viaje === vc.id_viaje) resultsA.push('ganador'); };
+    const onAya = d => { if (d.id_viaje === vc.id_viaje) resultsA.push('ya_asignado'); };
+    const onB   = d => { if (d.id_viaje === vc.id_viaje) resultsB.push('ganador'); };
+    const onBya = d => { if (d.id_viaje === vc.id_viaje) resultsB.push('ya_asignado'); };
+    const onCli = d => { if (d.id_viaje === vc.id_viaje) clienteAsignado++; };
 
-  if (ambosGanaron) {
-    r.paso('CRITICO: ambos conductores recibieron viaje:conductor_asignado',
-      false, 'Bug de race condition en la transaccion atomica', 'bug');
-  } else {
-    r.paso('Solo un conductor recibio viaje:conductor_asignado', true);
-    const elOtroRecibioYaAsignado = (gA && resultsB.includes('ya_asignado')) || (gB && resultsA.includes('ya_asignado'));
-    r.paso('El otro conductor recibio viaje:ya_asignado',
-      elOtroRecibioYaAsignado, elOtroRecibioYaAsignado ? '' : 'no se observo viaje:ya_asignado');
+    sA2.on('viaje:conductor_asignado', onA);
+    sA2.on('viaje:ya_asignado', onAya);
+    sB.on('viaje:conductor_asignado', onB);
+    sB.on('viaje:ya_asignado', onBya);
+    sCliRace.on('viaje:conductor_asignado', onCli);
+
+    await esperar(400); // el viaje ya existe (POST await); pequeño margen
+
+    // Emitir lo mas simultaneo posible — ambos en el mismo tick
+    sA2.emit('viaje:aceptar', { id_viaje: vc.id_viaje });
+    sB.emit('viaje:aceptar', { id_viaje: vc.id_viaje });
+
+    await esperar(2000);
+
+    const { data: viajeC } = await api('GET', `/api/viajes/${vc.id_viaje}`, null, tokenCli);
+    const ganadorEnDB = viajeC.conductor?.id_conductor;
+    const gA = resultsA.includes('ganador');
+    const gB = resultsB.includes('ganador');
+    const yaA = resultsA.includes('ya_asignado');
+    const yaB = resultsB.includes('ya_asignado');
+
+    const exactamenteUnGanador = (gA && !gB) || (gB && !gA);
+    const perdedorAvisado = (gA && yaB) || (gB && yaA);
+    const dbUnConductor = !!ganadorEnDB;
+    const clienteUnaVez = clienteAsignado === 1;
+
+    const iterPasa = exactamenteUnGanador && perdedorAvisado && dbUnConductor && clienteUnaVez;
+    if (iterPasa) iterOk++;
+
+    detalleIters.push(
+      `#${String(i).padStart(2)}: ${iterPasa ? 'OK ' : 'FALLO'} ` +
+      `(ganadorA=${gA?1:0} ganadorB=${gB?1:0} yaA=${yaA?1:0} yaB=${yaB?1:0} ` +
+      `db_cond=${ganadorEnDB ?? 'null'} cliente_asignado=${clienteAsignado})`
+    );
+
+    sA2.off('viaje:conductor_asignado', onA);
+    sA2.off('viaje:ya_asignado', onAya);
+    sB.off('viaje:conductor_asignado', onB);
+    sB.off('viaje:ya_asignado', onBya);
+    sCliRace.off('viaje:conductor_asignado', onCli);
   }
+
+  console.log('\n  Detalle por iteracion:');
+  detalleIters.forEach(d => console.log('    ' + d));
+
+  r.paso(`Race condition resuelta: exactamente un ganador en TODAS las iteraciones (${iterOk}/${ITER})`,
+    iterOk === ITER,
+    `${iterOk}/${ITER} corridas correctas`,
+    iterOk === ITER ? 'ok' : 'bug');
 
   sA2.disconnect();
   sB.disconnect();
+  sCliRace.disconnect();
 
   // ────────────────────────────────────────────────────────────────────────
   r.seccion('3. Cliente con 5 viajes en paralelo (limitamos a 3 conductores reales — reusamos A y B)');

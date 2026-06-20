@@ -61,7 +61,8 @@ async function main() {
 
   let serverCrash = false;
   let errorRecibido = false;
-  sA.on('error', () => { errorRecibido = true; });
+  let errorMsg = null;
+  sA.on('error', (e) => { errorRecibido = true; errorMsg = e?.error; });
 
   sA.emit('conductor:ubicacion', {
     id_viaje: id1, lat: 200, lng: 500, timestamp: Date.now(),
@@ -82,6 +83,87 @@ async function main() {
     !guardoInvalida,
     guardoInvalida ? `Redis guardo lat=${ultima.lat}/lng=${ultima.lng}` : `ultima=${ultima ? `${ultima.lat},${ultima.lng}` : 'null'}`,
     guardoInvalida ? 'bug' : 'ok');
+
+  r.paso("Conductor recibe error 'Coordenadas fuera de rango'",
+    errorRecibido && errorMsg === 'Coordenadas fuera de rango',
+    errorRecibido ? `error recibido: "${errorMsg}"` : 'no se recibio ningun error');
+
+  // ────────────────────────────────────────────────────────────────────────
+  r.seccion('2b. Limites exactos de coordenadas (casos borde inclusivos)');
+
+  // Viaje aislado para no contaminar el acumulado de id1
+  const viajeBorde = await crearViajeNuevo(tokenCli);
+  const idB = viajeBorde.id_viaje;
+  await esperar(300);
+  sA.emit('viaje:aceptar', { id_viaje: idB });
+  await esperar(1500);
+
+  // Manda un ping y devuelve lo que quedo en gps:{idB}:ultima
+  async function pingYUltima(lat, lng) {
+    sA.emit('conductor:ubicacion', { id_viaje: idB, lat, lng, timestamp: Date.now() });
+    await esperar(700);
+    const raw = await redis.get(`gps:${idB}:ultima`);
+    return raw ? JSON.parse(raw) : null;
+  }
+
+  // Limites validos (inclusive) → deben ACEPTARSE y guardarse en Redis
+  const lim1 = await pingYUltima(90, 180);
+  r.paso('lat=90 / lng=180 (limite) se acepta y guarda en Redis',
+    !!lim1 && lim1.lat === 90 && lim1.lng === 180,
+    lim1 ? `ultima=${lim1.lat},${lim1.lng}` : 'null');
+
+  const lim2 = await pingYUltima(-90, -180);
+  r.paso('lat=-90 / lng=-180 (limite) se acepta y guarda en Redis',
+    !!lim2 && lim2.lat === -90 && lim2.lng === -180,
+    lim2 ? `ultima=${lim2.lat},${lim2.lng}` : 'null');
+
+  // Apenas fuera de rango → deben RECHAZARSE (Redis :ultima no cambia a la invalida)
+  const trasLatInv = await pingYUltima(90.0001, 0);
+  r.paso('lat=90.0001 se rechaza (Redis no guarda la coord invalida)',
+    !!trasLatInv && trasLatInv.lat !== 90.0001,
+    trasLatInv ? `ultima sigue en ${trasLatInv.lat},${trasLatInv.lng}` : 'null');
+
+  const trasLngInv = await pingYUltima(0, 180.0001);
+  r.paso('lng=180.0001 se rechaza (Redis no guarda la coord invalida)',
+    !!trasLngInv && trasLngInv.lng !== 180.0001,
+    trasLngInv ? `ultima sigue en ${trasLngInv.lat},${trasLngInv.lng}` : 'null');
+
+  // ────────────────────────────────────────────────────────────────────────
+  r.seccion('2c. Ping invalido NO contamina el acumulado del ping valido siguiente');
+
+  const viajeCont = await crearViajeNuevo(tokenCli);
+  const idC = viajeCont.id_viaje;
+  await esperar(300);
+  sA.emit('viaje:aceptar', { id_viaje: idC });
+  await esperar(1500);
+
+  const tBase = Date.now();
+  // Ping valido 1 (ancla en PARADA_A)
+  sA.emit('conductor:ubicacion', { id_viaje: idC, lat: PARADA_A.lat, lng: PARADA_A.lng, timestamp: tBase });
+  await esperar(700);
+  // Ping INVALIDO (lat=200/lng=500) — debe ignorarse por completo
+  sA.emit('conductor:ubicacion', { id_viaje: idC, lat: 200, lng: 500, timestamp: tBase + 3000 });
+  await esperar(700);
+  // Ping valido 2 (PARADA_B)
+  sA.emit('conductor:ubicacion', { id_viaje: idC, lat: PARADA_B.lat, lng: PARADA_B.lng, timestamp: tBase + 6000 });
+  await esperar(900);
+
+  const acumContRaw = await redis.get(`gps:${idC}:acumulado`);
+  const acumCont = acumContRaw ? JSON.parse(acumContRaw) : null;
+  // Distancia real PARADA_A → PARADA_B ~2.4 km. Si el ping invalido hubiera
+  // contaminado, el acumulado saltaria a miles de km (distancia desde lat=200).
+  const distOk = !!acumCont && Number.isFinite(acumCont.distancia_km) &&
+    acumCont.distancia_km > 0 && acumCont.distancia_km < 50;
+  r.paso('Acumulado tras [valido, invalido, valido] es la distancia real (no contaminado)',
+    distOk,
+    acumCont ? `distancia_km=${acumCont.distancia_km.toFixed(3)} (esperado ~2.4, no miles)` : 'null',
+    distOk ? 'ok' : 'bug');
+
+  const ultContRaw = await redis.get(`gps:${idC}:ultima`);
+  const ultCont = ultContRaw ? JSON.parse(ultContRaw) : null;
+  r.paso('Ultima coord guardada es el ping valido (PARADA_B), no la invalida',
+    !!ultCont && ultCont.lat !== 200 && Math.abs(ultCont.lat - PARADA_B.lat) < 0.001,
+    ultCont ? `ultima=${ultCont.lat},${ultCont.lng}` : 'null');
 
   // ────────────────────────────────────────────────────────────────────────
   r.seccion('3. 10 pings en 1 segundo — burst');
@@ -108,25 +190,60 @@ async function main() {
     acum ? `valores numericos finitos` : 'sin acumulado');
 
   // ────────────────────────────────────────────────────────────────────────
-  r.seccion('4. Ping de conductor NO asignado → debe rechazarse');
+  r.seccion('4. Ping de conductor NO asignado → debe rechazarse (B-003)');
 
   const sB = await conectar(tokenB);
+  let errorB = null;
+  sB.on('error', (e) => { errorB = e?.error; });
   await esperar(800);
-  let mapaCountAntes = mapaCount;
+
+  // Coordenada VALIDA pero distintiva: pasa el chequeo de rango, asi el unico
+  // motivo de rechazo posible es la verificacion de propiedad (B-003).
+  const COORD_INTRUSO = { lat: -34.6100, lng: -58.4050 };
+  const mapaCountAntes = mapaCount;
+  const ultimaAntesRaw = await redis.get(`gps:${id1}:ultima`);
+
   sB.emit('conductor:ubicacion', {
-    id_viaje: id1, lat: PARADA_A.lat, lng: PARADA_A.lng, timestamp: Date.now(),
+    id_viaje: id1, lat: COORD_INTRUSO.lat, lng: COORD_INTRUSO.lng, timestamp: Date.now(),
   });
   await esperar(1500);
+
   const mapaCountDespues = mapaCount;
-  // El backend actualmente no valida que sea el conductor asignado, asi que
-  // probablemente emita igual. Documentamos el comportamiento.
-  if (mapaCountDespues > mapaCountAntes) {
-    r.paso('Backend rechaza ping de conductor no asignado',
-      false, `Emitio ${mapaCountDespues - mapaCountAntes} mapa:actualizar igualmente`, 'bug');
-  } else {
-    r.paso('Backend rechaza ping de conductor no asignado', true,
-      `No hubo mapa:actualizar nuevo`);
-  }
+  const ultimaDespuesRaw = await redis.get(`gps:${id1}:ultima`);
+  const ultimaDespues = ultimaDespuesRaw ? JSON.parse(ultimaDespuesRaw) : null;
+
+  const noEmitio = mapaCountDespues === mapaCountAntes;
+  const noGuardoCoordIntrusa = !ultimaDespues || ultimaDespues.lat !== COORD_INTRUSO.lat;
+  const redisIntacto = ultimaAntesRaw === ultimaDespuesRaw;
+
+  r.paso('Conductor no asignado: NO se emite mapa:actualizar',
+    noEmitio, `mapa antes=${mapaCountAntes}, despues=${mapaCountDespues}`,
+    noEmitio ? 'ok' : 'bug');
+  r.paso('Conductor no asignado: su coordenada NO se guarda en Redis',
+    noGuardoCoordIntrusa && redisIntacto,
+    ultimaDespues ? `ultima sigue en ${ultimaDespues.lat},${ultimaDespues.lng}` : 'null',
+    (noGuardoCoordIntrusa && redisIntacto) ? 'ok' : 'bug');
+  r.paso("Conductor no asignado recibe error 'No autorizado para este viaje'",
+    errorB === 'No autorizado para este viaje',
+    errorB ? `error recibido: "${errorB}"` : 'no se recibio ningun error',
+    errorB === 'No autorizado para este viaje' ? 'ok' : 'bug');
+
+  // El conductor LEGITIMO (A, asignado) debe seguir pudiendo mandar sus pings
+  const mapaCountPreA = mapaCount;
+  const COORD_LEGIT = { lat: PARADA_A.lat + 0.0009, lng: PARADA_A.lng + 0.0009 };
+  sA.emit('conductor:ubicacion', {
+    id_viaje: id1, lat: COORD_LEGIT.lat, lng: COORD_LEGIT.lng, timestamp: Date.now(),
+  });
+  await esperar(1500);
+  const ultimaLegitRaw = await redis.get(`gps:${id1}:ultima`);
+  const ultimaLegit = ultimaLegitRaw ? JSON.parse(ultimaLegitRaw) : null;
+  const aEmitio = mapaCount > mapaCountPreA;
+  const aGuardo = !!ultimaLegit && Math.abs(ultimaLegit.lat - COORD_LEGIT.lat) < 0.00001;
+  r.paso('Conductor asignado (A) SI puede mandar pings (sin regresion)',
+    aEmitio && aGuardo,
+    `mapa +${mapaCount - mapaCountPreA}, ultima=${ultimaLegit ? `${ultimaLegit.lat},${ultimaLegit.lng}` : 'null'}`,
+    (aEmitio && aGuardo) ? 'ok' : 'bug');
+
   sB.disconnect();
 
   // ────────────────────────────────────────────────────────────────────────

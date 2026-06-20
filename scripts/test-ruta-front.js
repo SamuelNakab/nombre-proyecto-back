@@ -197,8 +197,10 @@ async function main() {
   const rutaRecalcEvents = [];
   sConductor.on('viaje:conductor_asignado', (d) => { asignadoConductor = d; });
   sCliente.on('viaje:conductor_asignado', (d) => { asignadoCliente = d; });
-  sCliente.on('eta:actualizar', (d) => { etaEvents.push({ t: Date.now(), ...d }); });
-  sCliente.on('ruta:recalculada', (d) => { rutaRecalcEvents.push({ t: Date.now(), ...d }); });
+  // Filtramos por id_viaje: el cliente puede estar unido a rooms de otros
+  // viajes activos suyos y recibir sus eta:actualizar/ruta:recalculada.
+  sCliente.on('eta:actualizar', (d) => { if (d.id_viaje === id_viaje) etaEvents.push({ t: Date.now(), ...d }); });
+  sCliente.on('ruta:recalculada', (d) => { if (d.id_viaje === id_viaje) rutaRecalcEvents.push({ t: Date.now(), ...d }); });
 
   await esperar(1500); // joins de room
   sConductor.emit('viaje:aceptar', { id_viaje });

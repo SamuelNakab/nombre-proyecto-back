@@ -48,6 +48,10 @@ async function unirseARoomsDisponibles(socket) {
   });
   if (!conductor) return;
 
+  // Cache del id_conductor para verificar propiedad en cada ping GPS (B-003)
+  // sin re-query por ping. El handler de conductor:ubicacion lo reutiliza.
+  socket.data.id_conductor = conductor.id_conductor;
+
   const viajes = await prisma.viaje.findMany({
     where: { estado: 'BUSCANDO_CONDUCTOR', fecha_programada: { gt: new Date() } },
     include: { condiciones_req: true },

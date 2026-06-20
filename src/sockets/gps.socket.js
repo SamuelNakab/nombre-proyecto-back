@@ -28,11 +28,39 @@ export function registrarHandlersGPS(socket, io) {
         return;
       }
 
+      // Rango geografico valido: lat [-90, 90], lng [-180, 180]. Corre ANTES
+      // de tocar Redis o calcular distancia, asi un ping fuera de rango (ej.
+      // lat=200) no se guarda en gps:{id}:ultima ni contamina el acumulado.
+      if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+        socket.emit('error', { error: 'Coordenadas fuera de rango' });
+        return;
+      }
+
       const viaje = await prisma.viaje.findUnique({
         where: { id_viaje },
         include: { paradas: true },
       });
-      if (!viaje) return;
+
+      // B-003: solo el conductor ASIGNADO puede enviar pings de este viaje.
+      // Otro conductor autenticado no puede falsificar posicion/distancia ni
+      // disparar alertas en un viaje ajeno. id_conductor se cachea en
+      // socket.data al conectar (unirseARoomsDisponibles, ver sockets/index.js);
+      // fallback a query si no esta (ej. ping antes de terminar el join).
+      let id_conductor = socket.data.id_conductor;
+      if (id_conductor == null) {
+        const conductor = await prisma.conductor.findUnique({
+          where: { id_usuario: socket.data.usuario.id_usuario },
+        });
+        if (conductor) {
+          id_conductor = conductor.id_conductor;
+          socket.data.id_conductor = id_conductor;
+        }
+      }
+      if (!viaje || id_conductor == null || viaje.id_conductor !== id_conductor) {
+        socket.emit('error', { error: 'No autorizado para este viaje' });
+        return;
+      }
+
       if (viaje.estado === 'FINALIZADO' || viaje.estado === 'CANCELADO') return;
 
       const anterior = await obtenerUltimaCoordenada(id_viaje);

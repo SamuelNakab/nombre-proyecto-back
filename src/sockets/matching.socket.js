@@ -116,31 +116,31 @@ export function manejarAceptarViaje(socket, io) {
         }
       }
 
-      // Transaccion atomica para evitar race conditions
-      let yaAsignado = false;
+      // Asignacion ATOMICA: updateMany con WHERE compuesto (id + estado).
+      // El UPDATE ... WHERE estado = 'BUSCANDO_CONDUCTOR' es atomico a nivel
+      // DB: de varias transacciones concurrentes, solo una matchea la fila y
+      // la pasa a CONDUCTOR_ASIGNADO; las demas matchean 0 filas. Esto elimina
+      // la race condition que tenia el findUnique + update (ambas transacciones
+      // leian el viaje en BUSCANDO_CONDUCTOR sin lock de fila y ambas "ganaban").
+      let resultado;
       try {
-        await prisma.$transaction(async (tx) => {
-          const viaje = await tx.viaje.findUnique({ where: { id_viaje } });
-          if (!viaje || viaje.estado !== 'BUSCANDO_CONDUCTOR') {
-            yaAsignado = true;
-            return;
-          }
-          await tx.viaje.update({
-            where: { id_viaje },
-            data: {
-              estado: 'CONDUCTOR_ASIGNADO',
-              id_conductor: conductor.id_conductor,
-              id_vehiculo: vehiculoFinal.id_vehiculo,
-            },
-          });
+        resultado = await prisma.viaje.updateMany({
+          where: { id_viaje, estado: 'BUSCANDO_CONDUCTOR' },
+          data: {
+            estado: 'CONDUCTOR_ASIGNADO',
+            id_conductor: conductor.id_conductor,
+            id_vehiculo: vehiculoFinal.id_vehiculo,
+          },
         });
       } catch (txError) {
-        console.error('[viaje:aceptar] Error en transaccion:', txError);
+        console.error('[viaje:aceptar] Error en asignacion atomica:', txError);
         socket.emit('error', { mensaje: 'Error al procesar la asignacion' });
         return;
       }
 
-      if (yaAsignado) {
+      // count === 0 → otro conductor ya lo tomo (o el viaje dejo de estar en
+      // BUSCANDO_CONDUCTOR). Este conductor perdio: avisarle y cortar.
+      if (resultado.count === 0) {
         socket.emit('viaje:ya_asignado', {
           id_viaje,
           mensaje: 'Otro conductor fue mas rapido',
@@ -148,6 +148,8 @@ export function manejarAceptarViaje(socket, io) {
         console.log('[viaje:aceptar] Resultado: viaje ya asignado');
         return;
       }
+
+      // count === 1 → este conductor gano. Continua el flujo de asignacion.
 
       cancelarTimer(id_viaje);
 

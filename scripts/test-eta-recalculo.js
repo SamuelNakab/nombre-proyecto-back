@@ -123,8 +123,11 @@ async function main() {
   sCliente = await conectar(clienteToken);   // se une al room del viaje (BUSCANDO_CONDUCTOR)
   sConductor = await conectar(conductorToken);
 
-  sCliente.on('eta:actualizar', (d) => { etaEvents.push({ t: Date.now(), ...d }); });
-  sCliente.on('ruta:recalculada', (d) => { rutaEvents.push({ t: Date.now(), ...d }); });
+  // Filtramos por id_viaje: el cliente puede estar unido a rooms de otros
+  // viajes activos suyos y recibir sus eta:actualizar/ruta:recalculada. El
+  // payload trae id_viaje justamente para distinguirlos.
+  sCliente.on('eta:actualizar', (d) => { if (d.id_viaje === id_viaje) etaEvents.push({ t: Date.now(), ...d }); });
+  sCliente.on('ruta:recalculada', (d) => { if (d.id_viaje === id_viaje) rutaEvents.push({ t: Date.now(), ...d }); });
 
   await esperar(1500); // esperar joins de room
 

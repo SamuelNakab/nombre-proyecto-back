@@ -7,9 +7,15 @@ import { calcularEtaConApi, obtenerEtaActual, leerEstadoEta } from './eta.servic
 // ultimo calculo es muy viejo, vuelve a pegarle a la API.
 
 const timers = new Map(); // id_viaje → intervalId
+const ultimaActividad = new Map(); // id_viaje → wall-clock ms del ultimo ping
 
 const emisionSeg = () => parseInt(process.env.ETA_EMISION_SEGUNDOS) || 30;
 const recalculoSeg = () => parseInt(process.env.ETA_RECALCULO_SEGUNDOS) || 360;
+// Si un viaje no recibe pings por este tiempo, el emisor se auto-detiene en vez
+// de quedar como timer huerfano emitiendo eta:actualizar al room para siempre
+// (lo normal es que detenerEmisorEta lo corte al finalizar; esto cubre viajes
+// que nunca finalizan: conductor que abandona, app cerrada, etc.).
+const idleSeg = () => parseInt(process.env.ETA_EMISOR_IDLE_SEGUNDOS) || 300;
 
 function construirPayload(id_viaje, resultado) {
   const segundos_restantes = Math.max(0, Math.round(resultado.segundos_restantes));
@@ -48,9 +54,19 @@ async function emitirEta(io, id_viaje) {
 // Arranca el emisor para un viaje (idempotente). Emite una vez de inmediato y
 // luego cada ETA_EMISION_SEGUNDOS.
 export function iniciarEmisorEta(io, id_viaje) {
+  // Registrar actividad en CADA ping (aunque el emisor ya este corriendo) para
+  // que el watchdog de inactividad sepa que el viaje sigue vivo.
+  ultimaActividad.set(id_viaje, Date.now());
+
   if (timers.has(id_viaje)) return;
 
   const handle = setInterval(() => {
+    // Watchdog: si el viaje dejo de mandar pings, cortamos el emisor huerfano.
+    const ultima = ultimaActividad.get(id_viaje) || 0;
+    if (Date.now() - ultima > idleSeg() * 1000) {
+      detenerEmisorEta(id_viaje);
+      return;
+    }
     emitirEta(io, id_viaje).catch((e) =>
       console.error(`[eta-emisor] viaje ${id_viaje}:`, e.message)
     );
@@ -71,6 +87,7 @@ export function detenerEmisorEta(id_viaje) {
     timers.delete(id_viaje);
     console.log(`[eta-emisor] detenido para viaje ${id_viaje}`);
   }
+  ultimaActividad.delete(id_viaje);
 }
 
 // Fuerza un recalculo con la API y emite el resultado de inmediato. Lo usan el

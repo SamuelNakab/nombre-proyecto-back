@@ -646,7 +646,10 @@ socket.on('error', (data) => {
   console.log(data.mensaje); // descripción del error
 });
 ```
-Los errores de negocio del servidor usan `{ "mensaje": "..." }` — **no** `{ "error": "..." }`.
+La mayoría de los errores de negocio del servidor usan `{ "mensaje": "..." }` — **no**
+`{ "error": "..." }`. **Excepción:** los errores del evento `conductor:ubicacion` (GPS) se
+emiten con `{ "error": "..." }` (ver esa sección). Conviene leer ambos campos:
+`data.mensaje ?? data.error`.
 
 ---
 
@@ -778,6 +781,11 @@ socket.on('viaje:conductor_asignado', (data) => {
 **Dirección:** servidor → conductor  
 **Quién lo recibe:** el conductor que intentó aceptar pero llegó tarde  
 **Cuándo:** cuando dos conductores aceptan al mismo tiempo y el otro ganó
+
+La asignación es **atómica**: aunque dos (o más) conductores emitan `viaje:aceptar` para el
+mismo viaje de forma prácticamente simultánea, el servidor garantiza un único ganador. El
+ganador recibe `viaje:conductor_asignado` y **todos los demás** reciben `viaje:ya_asignado`
+(nunca dos `viaje:conductor_asignado` para el mismo viaje).
 
 **Payload:**
 ```json
@@ -935,6 +943,31 @@ socket.emit('conductor:ubicacion', {
 });
 ```
 
+**Validaciones del servidor (en orden):**
+1. El usuario debe tener rol `CONDUCTOR`.
+2. `id_viaje`, `lat`, `lng` y `timestamp` deben estar presentes y ser numéricos.
+3. **Rango geográfico válido:** `lat` en `[-90, 90]` y `lng` en `[-180, 180]`. Un ping fuera
+   de rango se descarta **antes** de tocar Redis o acumular distancia (no contamina el costo
+   ni la posición guardada).
+4. **Solo el conductor asignado al viaje puede enviar pings de ese viaje.** Un conductor
+   autenticado distinto al asignado no puede falsificar posición/distancia ni disparar alertas
+   en un viaje ajeno. Lo mismo aplica si el viaje no existe.
+
+Si el viaje ya está `FINALIZADO` o `CANCELADO`, el ping se ignora silenciosamente (sin error).
+
+**Errores (evento `error`):**
+
+A diferencia del resto de los eventos de negocio, los errores de `conductor:ubicacion` se
+emiten con la forma `{ "error": "..." }` (no `{ "mensaje": "..." }`):
+
+| Payload del evento `error` | Causa |
+|----------------------------|-------|
+| `{ "error": "Solo conductores pueden enviar GPS" }` | El usuario no tiene rol `CONDUCTOR` |
+| `{ "error": "Datos GPS invalidos" }` | Falta un campo o `lat`/`lng`/`timestamp` no es numérico |
+| `{ "error": "Coordenadas fuera de rango" }` | `lat`/`lng` fuera del rango geográfico válido |
+| `{ "error": "No autorizado para este viaje" }` | El conductor no es el asignado al viaje, o el viaje no existe |
+| `{ "error": "Error interno al procesar ubicacion" }` | Error inesperado del servidor |
+
 **Efectos secundarios en el servidor:**
 - Guarda coordenada en Redis (historial de últimas 20)
 - Acumula distancia y tiempo
@@ -1063,6 +1096,12 @@ socket.on('alerta:parada', (data) => {
 **Cuándo:** cada `ETA_EMISION_SEGUNDOS` (default 30 s) mientras el viaje tiene GPS activo
 (estados `EN_CAMINO_A_ORIGEN` … `EN_RUTA`). El emisor arranca con el primer ping GPS y se
 detiene al finalizar o cancelar el viaje.
+
+Además, el emisor tiene un **watchdog de inactividad**: si el viaje deja de recibir pings GPS
+durante más de `ETA_EMISOR_IDLE_SEGUNDOS` (default 300 s), el emisor se auto-detiene y dejan de
+llegar `eta:actualizar`. Cubre viajes que nunca finalizan formalmente (el conductor abandona,
+cierra la app, etc.) para no dejar un timer huérfano emitiendo al room para siempre. El emisor
+vuelve a arrancar solo en cuanto llega un nuevo ping GPS válido.
 
 El ETA hacia la próxima parada **pendiente** se calcula con Google Maps Directions API
 (con tráfico). Para no consumir la API en cada emisión, el servidor recalcula con la API

@@ -305,7 +305,7 @@ export async function obtenerCostoAcumulado(req, res) {
     return res.status(200).json({ precio_acumulado: 0, desglose: null });
   }
 
-  let precio_acumulado = 0;
+  let precio_acumulado;
   let precio_por_tiempo = null;
   let precio_por_distancia = null;
 

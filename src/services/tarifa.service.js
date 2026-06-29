@@ -3,9 +3,13 @@ const DEFAULT_TARIFA_PICO_HORA_CABA = 5000;
 const DEFAULT_TARIFA_BASE_KM_PROVINCIA = 150;
 const DEFAULT_TARIFA_PICO_KM_PROVINCIA = 200;
 
-export function obtenerTarifas(zona, fecha) {
+export function esHoraPico(fecha) {
   const hora = fecha.getHours();
-  const es_hora_pico = (hora >= 7 && hora <= 10) || (hora >= 17 && hora <= 20);
+  return (hora >= 7 && hora <= 10) || (hora >= 17 && hora <= 20);
+}
+
+export function obtenerTarifas(zona, fecha) {
+  const es_hora_pico = esHoraPico(fecha);
 
   const tarifaBaseHora =
     parseFloat(process.env.TARIFA_BASE_HORA_CABA) || DEFAULT_TARIFA_BASE_HORA_CABA;

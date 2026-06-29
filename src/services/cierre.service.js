@@ -13,7 +13,7 @@ export async function cerrarViaje(id_viaje, io) {
   const tiempo_horas = acumulado?.tiempo_horas ?? 0;
   const distancia_km = acumulado?.distancia_km ?? 0;
 
-  let precio_real = 0;
+  let precio_real;
   let precio_por_tiempo = null;
   let precio_por_distancia = null;
 

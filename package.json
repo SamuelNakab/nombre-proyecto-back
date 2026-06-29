@@ -17,7 +17,7 @@
   "scripts": {
     "dev": "node --watch --import tsx/esm src/app.js",
     "start": "prisma generate && node src/app.js",
-    "test": "vitest run",
+    "test": "vitest run src/",
     "lint": "eslint src/",
     "test:e2e": "vitest run e2e/"
   },

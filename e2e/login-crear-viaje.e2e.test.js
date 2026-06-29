@@ -43,5 +43,5 @@ describe('E2E: login y creacion de viaje contra staging', () => {
     expect(res.status).toBe(201);
     const viaje = await res.json();
     expect(viaje.id_viaje).toBeTruthy();
-  });
+  }, 15000);
 });

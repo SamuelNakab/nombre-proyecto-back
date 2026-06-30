@@ -870,6 +870,64 @@ Estados válidos para este endpoint: `CARGANDO`, `DESCARGANDO`.
 
 ---
 
+### POST /api/viajes/:id/cancelar-conductor
+
+El conductor asignado cancela el viaje y lo devuelve al pool de búsqueda. El viaje
+**mantiene su `id_viaje`**, vuelve a estado `BUSCANDO_CONDUCTOR` con `id_conductor` e
+`id_vehiculo` en `null`, y se vuelve a publicar a los conductores elegibles reutilizando
+el mismo flujo que la creación (`POST /api/viajes`). Solo se permite mientras el viaje está
+en estado `CONDUCTOR_ASIGNADO` (es decir, antes del primer ping GPS, que ya lo lleva a
+`EN_CAMINO_A_ORIGEN`).
+
+**Rol requerido:** `CONDUCTOR` (debe ser el conductor asignado al viaje)
+
+**Body:** Ninguno (vacío)
+
+**Validaciones en orden:**
+1. El viaje existe.
+2. El usuario autenticado es el conductor asignado al viaje. Si hay otro conductor asignado
+   distinto al autenticado → `403`. (Si el viaje no tiene conductor asignado no es un problema
+   de autorización sino de estado, y cae en la validación 3.)
+3. El viaje está en estado `CONDUCTOR_ASIGNADO`. Cualquier otro estado → `400`.
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "mensaje": "Viaje cancelado y republicado",
+  "id_viaje": 42,
+  "estado": "BUSCANDO_CONDUCTOR"
+}
+```
+
+**Efectos secundarios al cancelar:**
+- El viaje vuelve a `BUSCANDO_CONDUCTOR` con `id_conductor` e `id_vehiculo` en `null` (mismo `id_viaje`).
+- Se detiene el emisor de ETA del viaje (dejan de llegar `eta:actualizar`).
+- Se eliminan **todas** las keys `gps:{id_viaje}:*` de Redis (mismo cleanup que al finalizar).
+- Se vuelve a emitir el evento `viaje:disponible` a los conductores elegibles conectados,
+  reutilizando el flujo de la creación del viaje. El recálculo de `ruta_planeada` con Google
+  Maps ocurre cuando el siguiente conductor acepte y se haga el primer ping, igual que en un
+  viaje nuevo.
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "Solo se puede cancelar un viaje en estado CONDUCTOR_ASIGNADO, el viaje actual esta en estado <ESTADO>" }` | El viaje no está en `CONDUCTOR_ASIGNADO` (incluye un viaje en `BUSCANDO_CONDUCTOR` sin conductor) |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
+| 403 | `{ "error": "No autorizado para cancelar este viaje" }` | El viaje está asignado a otro conductor |
+| 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
+
+> **Notas:**
+> - El conductor que canceló **sigue siendo elegible** para este mismo viaje: puede volver a
+>   recibir `viaje:disponible` y reaceptarlo. No hay penalización ni límite por ahora (esa
+>   lógica queda pendiente para futuro).
+> - **No se envía una notificación específica al cliente** sobre la cancelación (decisión
+>   explícita por ahora, pendiente para futuro). El cliente solo verá que el viaje volvió a
+>   `BUSCANDO_CONDUCTOR` y, eventualmente, recibirá un nuevo `viaje:conductor_asignado` cuando
+>   otro conductor acepte.
+
+---
+
 ### GET /api/viajes/:id/costo-acumulado
 
 Devuelve el costo acumulado del viaje en curso calculado a partir de los datos GPS en Redis.

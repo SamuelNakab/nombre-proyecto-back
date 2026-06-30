@@ -1,7 +1,19 @@
 import prisma from '../config/prisma.js';
 import { detenerEmisorEta } from './eta-emisor.js';
+import { obtenerConductoresElegibles } from './elegibilidad.service.js';
 
 const timers = new Map();
+
+// Resuelve los conductores elegibles del viaje (segun sus condiciones_req) y lo
+// publica con publicarViaje. Es el flujo de publicacion compartido entre la
+// creacion del viaje (POST /api/viajes) y la republicacion tras una cancelacion
+// del conductor, para no duplicar la logica de "buscar elegibles + emitir
+// viaje:disponible". El `viaje` debe venir con paradas y condiciones_req.
+export async function publicarViajeAConductoresElegibles(io, viaje, clienteIdUsuario) {
+  const condiciones = viaje.condiciones_req.map((c) => c.condicion);
+  const conductoresElegibles = await obtenerConductoresElegibles(condiciones);
+  await publicarViaje(io, viaje, conductoresElegibles, clienteIdUsuario);
+}
 
 export async function publicarViaje(io, viaje, conductoresElegibles, clienteIdUsuario) {
   const room = `viaje:${viaje.id_viaje}`;

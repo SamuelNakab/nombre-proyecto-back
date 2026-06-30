@@ -17,7 +17,9 @@
   "scripts": {
     "dev": "node --watch --import tsx/esm src/app.js",
     "start": "prisma generate && node src/app.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "vitest run src/",
+    "lint": "eslint src/",
+    "test:e2e": "vitest run e2e/"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1038.0",
@@ -30,6 +32,7 @@
     "firebase-admin": "^13.8.0",
     "helmet": "^8.1.0",
     "ioredis": "^5.10.1",
+    "pdfkit": "^0.18.0",
     "pg": "^8.20.0",
     "prisma": "6.19.3",
     "redis": "^5.12.1",
@@ -38,7 +41,10 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "eslint": "^10.2.1",
-    "tsx": "^4.21.0"
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.6.0",
+    "socket.io-client": "^4.8.3",
+    "tsx": "^4.21.0",
+    "vitest": "^4.1.9"
   }
 }

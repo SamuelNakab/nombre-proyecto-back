@@ -337,13 +337,16 @@ instantáneamente a los conductores elegibles conectados via WebSocket.
     { "lat": -34.92, "lng": -57.95, "direccion": "La Plata, Buenos Aires" }
   ],
   "fecha_programada": "2026-07-01T10:00:00.000Z",
-  "condiciones_requeridas": ["FRAGIL", "REFRIGERADO"]
+  "condiciones_requeridas": ["FRAGIL", "REFRIGERADO"],
+  "descripcion": "Carga frágil, llamar al llegar, portón azul"
 }
 ```
 
 - `fecha_programada`: fecha ISO futura, mínimo 1 hora desde el momento del request
 - `condiciones_requeridas`: opcional. Valores posibles: `FRAGIL`, `REFRIGERADO`,
   `CARGA_PESADA`, `PELIGROSO`, `VOLUMINOSO`
+- `descripcion`: opcional. Texto libre visible para el conductor antes de aceptar y en el
+  remito PDF. Máximo 500 caracteres. No afecta matching ni costo.
 
 Las tarifas se calculan automáticamente según la zona y si la `fecha_programada` cae en hora pico
 (7–10 h o 17–20 h). Se usan las variables de entorno `TARIFA_*` o los valores por defecto.
@@ -360,6 +363,7 @@ Las tarifas se calculan automáticamente según la zona y si la `fecha_programad
   "tarifa_hora": 5000,
   "tarifa_km": 200,
   "fecha_programada": "2026-07-01T10:00:00.000Z",
+  "descripcion": "Carga frágil, llamar al llegar, portón azul",
   "estado": "BUSCANDO_CONDUCTOR",
   "precio_estimado": 4500,
   "precio_real": null,
@@ -380,6 +384,7 @@ Las tarifas se calculan automáticamente según la zona y si la `fecha_programad
     { "id_condicion_req": 1, "condicion": "FRAGIL" },
     { "id_condicion_req": 2, "condicion": "REFRIGERADO" }
   ],
+  "ruta_planeada": [[-58.38162, -34.60361], [-58.38201, -34.60280], "..."],
   "desglose_estimado": {
     "precio_por_tiempo": 2500,
     "precio_por_distancia": 2000,
@@ -391,6 +396,10 @@ Las tarifas se calculan automáticamente según la zona y si la `fecha_programad
   }
 }
 ```
+
+- `ruta_planeada`: array de puntos `[lng, lat]` (ver [Formato de ruta](#formato-de-ruta)). La
+  ruta se calcula al crear el viaje. Es **`null`** si Google Maps falla en ese momento; en ese
+  caso se reintenta automáticamente en el primer ping GPS y el viaje se crea igual (201).
 
 **Comportamiento adicional:** después de crear el viaje, el servidor emite el evento
 `viaje:disponible` via WebSocket a todos los conductores elegibles conectados.
@@ -409,8 +418,11 @@ Las tarifas se calculan automáticamente según la zona y si la `fecha_programad
 ### GET /api/viajes/disponibles
 
 Devuelve los viajes en estado `BUSCANDO_CONDUCTOR` con fecha futura para los que
-el conductor es elegible (tiene al menos un vehículo que cumple todas las
-condiciones requeridas del viaje).
+el conductor es elegible. Un conductor es elegible si y solo si tiene al menos
+un vehículo (propio o asignado vía empresa) que cumple todas las condiciones
+requeridas del viaje. Si el viaje no requiere condiciones, alcanza con tener
+al menos un vehículo — un conductor sin ningún vehículo registrado no es
+elegible para ningún viaje, tenga o no condiciones requeridas.
 
 **Rol requerido:** `CONDUCTOR`
 
@@ -422,6 +434,7 @@ condiciones requeridas del viaje).
     "zona": "CABA",
     "precio_estimado": 2500,
     "fecha_programada": "2026-07-01T10:00:00.000Z",
+    "descripcion": "Carga frágil, llamar al llegar, portón azul",
     "estado": "BUSCANDO_CONDUCTOR",
     "paradas": [
       {
@@ -442,6 +455,8 @@ condiciones requeridas del viaje).
   }
 ]
 ```
+
+`descripcion` es `null` si el cliente no escribió una.
 
 Ordenados por `fecha_programada` ascendente.
 
@@ -488,6 +503,57 @@ Devuelve todos los viajes del cliente autenticado, del más reciente al más ant
 
 ---
 
+### GET /api/viajes/mis-viajes-conductor
+
+Devuelve todos los viajes que el conductor autenticado tiene asignados (donde es el conductor
+del viaje), del más reciente al más antiguo. Es el equivalente de `mis-viajes` para el conductor.
+
+**Rol requerido:** `CONDUCTOR`
+
+**Query params (opcionales):**
+- `estado`: filtra por estado del viaje. Debe ser un `EstadoViaje` válido: `BUSCANDO_CONDUCTOR`,
+  `CONDUCTOR_ASIGNADO`, `EN_CAMINO_A_ORIGEN`, `CARGANDO`, `EN_RUTA`, `DESCARGANDO`, `FINALIZADO`
+  o `CANCELADO`. Sin este parámetro se devuelven todos los estados.
+
+**Respuesta exitosa — 200:**
+```json
+[
+  {
+    "id_viaje": 42,
+    "zona": "CABA",
+    "precio_estimado": 2500,
+    "precio_real": null,
+    "estado": "CONDUCTOR_ASIGNADO",
+    "fecha_programada": "2026-07-01T10:00:00.000Z",
+    "descripcion": "Carga frágil, llamar al llegar, portón azul",
+    "creado_en": "2026-05-09T12:00:00.000Z",
+    "paradas": [
+      { "orden": 1, "direccion": "Plaza de Mayo, CABA", "estado": "PENDIENTE", "fecha_entrega": null }
+    ],
+    "cliente": {
+      "usuario": {
+        "nombre": "Juan",
+        "apellido": "Pérez",
+        "telefono": "+5491112345678"
+      }
+    }
+  }
+]
+```
+
+Un conductor sin viajes asignados recibe un array vacío `[]` (no es un error). Cada conductor
+ve únicamente sus propios viajes.
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "Estado invalido" }` | El query param `estado` no es un `EstadoViaje` válido |
+| 400 | `{ "error": "El usuario no tiene perfil de conductor" }` | Sin registro de conductor |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
+
+---
+
 ### GET /api/viajes/:id
 
 Detalle de un viaje. Solo puede acceder el cliente que lo creó o el conductor asignado.
@@ -501,6 +567,7 @@ Detalle de un viaje. Solo puede acceder el cliente que lo creó o el conductor a
   "zona": "CABA",
   "precio_estimado": 2500,
   "precio_real": null,
+  "descripcion": "Carga frágil, llamar al llegar, portón azul",
   "estado": "CONDUCTOR_ASIGNADO",
   "fecha_programada": "2026-07-01T10:00:00.000Z",
   "creado_en": "2026-05-09T12:00:00.000Z",
@@ -533,9 +600,14 @@ Detalle de un viaje. Solo puede acceder el cliente que lo creó o el conductor a
       "apellido": "López",
       "telefono": "+5491187654321"
     }
-  }
+  },
+  "ruta_planeada": [[-58.38162, -34.60361], [-58.38201, -34.60280], "..."]
 }
 ```
+
+- `ruta_planeada`: array de puntos `[lng, lat]` (ver [Formato de ruta](#formato-de-ruta)). Es
+  **`null`** si el viaje ya terminó (`FINALIZADO`/`CANCELADO`, con el cache de Redis ya limpio)
+  o si la ruta nunca llegó a calcularse.
 
 **Errores posibles:**
 | Status | Body | Causa |
@@ -568,6 +640,17 @@ socket.on('connect_error', (err) => {
 });
 ```
 
+**Errores de lógica emitidos durante el flujo (evento `error`):**
+```js
+socket.on('error', (data) => {
+  console.log(data.mensaje); // descripción del error
+});
+```
+La mayoría de los errores de negocio del servidor usan `{ "mensaje": "..." }` — **no**
+`{ "error": "..." }`. **Excepción:** los errores del evento `conductor:ubicacion` (GPS) se
+emiten con `{ "error": "..." }` (ver esa sección). Conviene leer ambos campos:
+`data.mensaje ?? data.error`.
+
 ---
 
 ### Evento: viaje:disponible
@@ -583,6 +666,7 @@ socket.on('connect_error', (err) => {
   "zona": "CABA",
   "precio_estimado": 2500,
   "fecha_programada": "2026-07-01T10:00:00.000Z",
+  "descripcion": "Carga frágil, llamar al llegar, portón azul",
   "paradas": [
     { "orden": 1, "direccion": "Plaza de Mayo, CABA" },
     { "orden": 2, "direccion": "Recoleta, CABA" }
@@ -610,23 +694,41 @@ socket.on('viaje:disponible', (data) => {
 **Payload a emitir:**
 ```json
 {
-  "id_viaje": 42,
-  "id_vehiculo": 7
+  "id_viaje": 42
 }
 ```
 
-- `id_vehiculo`: **requerido**. ID del vehículo propio del conductor con el que acepta el viaje.
+- `id_vehiculo`: **opcional**. Si se incluye, el servidor valida que pertenece al conductor y cumple las condiciones del viaje. Si se omite, el servidor elige automáticamente el primer vehículo elegible del conductor.
 
 **Cómo emitirlo:**
 ```js
+// sin vehículo (el backend lo elige automáticamente)
+socket.emit('viaje:aceptar', { id_viaje: 42 });
+
+// con vehículo específico
 socket.emit('viaje:aceptar', { id_viaje: 42, id_vehiculo: 7 });
 ```
 
 **Validaciones del servidor:**
-1. `id_vehiculo` debe estar presente; si falta: `error` con `"Debes seleccionar un vehiculo"`
-2. El vehículo debe existir; si no: `error` con `"Vehiculo no encontrado"`
-3. El vehículo debe pertenecer al conductor; si no: `error` con `"Este vehiculo no te pertenece"`
-4. El vehículo debe cumplir todas las condiciones requeridas del viaje; si falta alguna: `error` con `"Tu vehiculo no cumple las condiciones del viaje"`
+
+Si se envía `id_vehiculo`:
+1. El vehículo debe existir; si no: evento `error` con `{ "mensaje": "Vehiculo no encontrado" }`
+2. El vehículo debe pertenecer al conductor; si no: evento `error` con `{ "mensaje": "Ese vehiculo no te pertenece" }`
+3. El vehículo debe cumplir las condiciones del viaje; si falta alguna: evento `error` con `{ "mensaje": "Tu vehiculo no cumple las condiciones del viaje" }`
+
+Si NO se envía `id_vehiculo` (auto-selección):
+4. El servidor busca, entre los vehículos propios y los asignados vía empresa
+   del conductor, el primero que cumpla todas las condiciones requeridas del
+   viaje (si el viaje no tiene condiciones, alcanza con tener al menos un
+   vehículo). Si el conductor no tiene ningún vehículo, o ninguno cumple las
+   condiciones, el servidor **no asigna el viaje** y emite únicamente el
+   evento `error`:
+   ```json
+   { "mensaje": "No tenes un vehiculo que cumpla las condiciones del viaje" }
+   ```
+   Esta es la misma regla de elegibilidad usada para filtrar
+   `GET /api/viajes/disponibles`: un viaje que no aparece ahí tampoco puede
+   ser aceptado, y viceversa.
 
 **Nota:** después de emitir este evento el conductor recibirá `viaje:conductor_asignado`
 si ganó la carrera o `viaje:ya_asignado` si otro conductor fue más rápido.
@@ -639,7 +741,7 @@ si ganó la carrera o `viaje:ya_asignado` si otro conductor fue más rápido.
 **Quién lo recibe:** el cliente que creó el viaje y el conductor que aceptó  
 **Cuándo:** cuando un conductor acepta exitosamente el viaje
 
-**Payload:**
+**Payload:** (idéntico para ambos destinatarios — cliente y conductor)
 ```json
 {
   "id_viaje": 42,
@@ -653,9 +755,14 @@ si ganó la carrera o `viaje:ya_asignado` si otro conductor fue más rápido.
     "marca": "Ford",
     "modelo": "Transit",
     "tipo_vehiculo": "camioneta"
-  }
+  },
+  "ruta_planeada": [[-58.38162, -34.60361], [-58.38201, -34.60280], "..."]
 }
 ```
+
+- `ruta_planeada`: array de puntos `[lng, lat]` (ver [Formato de ruta](#formato-de-ruta)) para
+  dibujar la ruta en el mapa apenas se asigna el conductor. Puede ser `null` si la ruta falló al
+  crearse y todavía no se recalculó.
 
 **Cómo escucharlo:**
 ```js
@@ -663,6 +770,7 @@ socket.on('viaje:conductor_asignado', (data) => {
   // para el cliente: mostrar datos del conductor asignado
   // para el conductor: navegar a la pantalla del viaje activo
   console.log('Conductor asignado:', data.conductor.nombre);
+  if (data.ruta_planeada) mapa.setRuta(data.ruta_planeada);
 });
 ```
 
@@ -673,6 +781,11 @@ socket.on('viaje:conductor_asignado', (data) => {
 **Dirección:** servidor → conductor  
 **Quién lo recibe:** el conductor que intentó aceptar pero llegó tarde  
 **Cuándo:** cuando dos conductores aceptan al mismo tiempo y el otro ganó
+
+La asignación es **atómica**: aunque dos (o más) conductores emitan `viaje:aceptar` para el
+mismo viaje de forma prácticamente simultánea, el servidor garantiza un único ganador. El
+ganador recibe `viaje:conductor_asignado` y **todos los demás** reciben `viaje:ya_asignado`
+(nunca dos `viaje:conductor_asignado` para el mismo viaje).
 
 **Payload:**
 ```json
@@ -830,12 +943,38 @@ socket.emit('conductor:ubicacion', {
 });
 ```
 
+**Validaciones del servidor (en orden):**
+1. El usuario debe tener rol `CONDUCTOR`.
+2. `id_viaje`, `lat`, `lng` y `timestamp` deben estar presentes y ser numéricos.
+3. **Rango geográfico válido:** `lat` en `[-90, 90]` y `lng` en `[-180, 180]`. Un ping fuera
+   de rango se descarta **antes** de tocar Redis o acumular distancia (no contamina el costo
+   ni la posición guardada).
+4. **Solo el conductor asignado al viaje puede enviar pings de ese viaje.** Un conductor
+   autenticado distinto al asignado no puede falsificar posición/distancia ni disparar alertas
+   en un viaje ajeno. Lo mismo aplica si el viaje no existe.
+
+Si el viaje ya está `FINALIZADO` o `CANCELADO`, el ping se ignora silenciosamente (sin error).
+
+**Errores (evento `error`):**
+
+A diferencia del resto de los eventos de negocio, los errores de `conductor:ubicacion` se
+emiten con la forma `{ "error": "..." }` (no `{ "mensaje": "..." }`):
+
+| Payload del evento `error` | Causa |
+|----------------------------|-------|
+| `{ "error": "Solo conductores pueden enviar GPS" }` | El usuario no tiene rol `CONDUCTOR` |
+| `{ "error": "Datos GPS invalidos" }` | Falta un campo o `lat`/`lng`/`timestamp` no es numérico |
+| `{ "error": "Coordenadas fuera de rango" }` | `lat`/`lng` fuera del rango geográfico válido |
+| `{ "error": "No autorizado para este viaje" }` | El conductor no es el asignado al viaje, o el viaje no existe |
+| `{ "error": "Error interno al procesar ubicacion" }` | Error inesperado del servidor |
+
 **Efectos secundarios en el servidor:**
 - Guarda coordenada en Redis (historial de últimas 20)
 - Acumula distancia y tiempo
 - Si el viaje estaba en `CONDUCTOR_ASIGNADO` y es el primer ping: cambia automáticamente a `EN_CAMINO_A_ORIGEN`
+- Arranca (si no estaba activo) el emisor periódico de ETA del viaje, que emite `eta:actualizar` cada 30 s al room
 - Emite `mapa:actualizar`, y cada ~60 s emite `costo:actualizar`
-- Si el viaje está en `EN_RUTA`: verifica desvíos y paradas sospechosas
+- Si el viaje está en `EN_RUTA`: verifica desvíos (y recalcula la ruta si corresponde) y paradas sospechosas
 
 ---
 
@@ -945,6 +1084,98 @@ fuera de las paradas del viaje
 socket.on('alerta:parada', (data) => {
   // mostrar alerta al cliente
   console.log(data.mensaje);
+});
+```
+
+---
+
+### Evento: eta:actualizar
+
+**Dirección:** servidor → room del viaje  
+**Quién lo recibe:** cliente y conductor  
+**Cuándo:** cada `ETA_EMISION_SEGUNDOS` (default 30 s) mientras el viaje tiene GPS activo
+(estados `EN_CAMINO_A_ORIGEN` … `EN_RUTA`). El emisor arranca con el primer ping GPS y se
+detiene al finalizar o cancelar el viaje.
+
+Además, el emisor tiene un **watchdog de inactividad**: si el viaje deja de recibir pings GPS
+durante más de `ETA_EMISOR_IDLE_SEGUNDOS` (default 300 s), el emisor se auto-detiene y dejan de
+llegar `eta:actualizar`. Cubre viajes que nunca finalizan formalmente (el conductor abandona,
+cierra la app, etc.) para no dejar un timer huérfano emitiendo al room para siempre. El emisor
+vuelve a arrancar solo en cuanto llega un nuevo ping GPS válido.
+
+El ETA hacia la próxima parada **pendiente** se calcula con Google Maps Directions API
+(con tráfico). Para no consumir la API en cada emisión, el servidor recalcula con la API
+sólo cada `ETA_RECALCULO_SEGUNDOS` (default 360 s), cuando cambia la próxima parada (al
+confirmar una parada) o cuando se recalcula la ruta por desvío. **Entre recalculos, el valor
+emitido es un countdown local del servidor** (último ETA de la API menos el tiempo
+transcurrido). El countdown nunca baja de 0; si llega a 0 se fuerza un recálculo con la API.
+
+**Payload:**
+```json
+{
+  "id_viaje": 42,
+  "proxima_parada_id": 18,
+  "segundos_restantes": 1827,
+  "minutos_restantes": 31
+}
+```
+
+- `segundos_restantes`: entero, nunca negativo.
+- `minutos_restantes`: `Math.ceil(segundos_restantes / 60)`, listo para mostrar.
+- `proxima_parada_id`: id de la parada pendiente de menor orden hacia la que se mide el ETA.
+
+**Cómo escucharlo:**
+```js
+socket.on('eta:actualizar', (data) => {
+  // actualizar el contador de "llega en X min" en la UI
+  console.log(`Llega en ~${data.minutos_restantes} min`);
+});
+```
+
+---
+
+### Evento: ruta:recalculada
+
+**Dirección:** servidor → room del viaje  
+**Quién lo recibe:** cliente y conductor  
+**Cuándo:** cuando el conductor se desvía de la ruta en **2 pings GPS consecutivos** (cada uno
+a más de `DESVIO_UMBRAL_METROS`, default 300 m) y además pasó el cooldown de
+`RUTA_RECALCULO_COOLDOWN_SEGUNDOS` (default 120 s) desde el último recálculo.  
+**Solo aplica:** viajes en estado `EN_RUTA`
+
+Un único ping desviado sólo emite `alerta:desvio` (puede ser ruido GPS). Al segundo ping
+consecutivo desviado, si pasó el cooldown, el servidor recalcula la ruta con Google Maps
+Directions API desde la posición actual del conductor hasta la última parada pendiente
+(las paradas pendientes intermedias se pasan como waypoints en orden), reemplaza la ruta
+guardada y fuerza un recálculo de ETA inmediato (llega un `eta:actualizar` nuevo justo
+después). Si el desvío persiste pero no pasó el cooldown, sólo se emite `alerta:desvio`.
+
+`nueva_ruta` **reemplaza a la `ruta_planeada`** original del viaje (la que llegó al crear el
+viaje, al asignar conductor y en `GET /api/viajes/:id`): es el mismo formato y representa lo
+mismo — la ruta vigente que el front dibuja en el mapa —, sólo que recalculada desde la
+posición actual del conductor. El front debe descartar la ruta anterior y quedarse con esta.
+
+**Payload:**
+```json
+{
+  "id_viaje": 42,
+  "nueva_ruta": [[-58.4066, -34.6287], [-58.4050, -34.6270], "..."],
+  "proxima_parada_id": 18,
+  "motivo": "desvio"
+}
+```
+
+- `nueva_ruta`: array de puntos `[lng, lat]` de la ruta recalculada (ver
+  [Formato de ruta](#formato-de-ruta)). El front debe **redibujar la ruta del mapa** con este
+  array, reemplazando la `ruta_planeada` anterior.
+- `proxima_parada_id`: id de la parada pendiente de menor orden (destino inmediato).
+- `motivo`: `"desvio"`.
+
+**Cómo escucharlo:**
+```js
+socket.on('ruta:recalculada', (data) => {
+  // redibujar la polilínea de la ruta en el mapa
+  mapa.setRuta(data.nueva_ruta);
 });
 ```
 
@@ -1252,11 +1483,309 @@ Authorization: Bearer <firebase-id-token>
 
 ---
 
+---
+
+## Fase 5 — Confirmación, cierre y remito
+
+
+### GET /api/viajes/:id/qr-paradas
+
+
+Devuelve los tokens QR firmados de cada parada del viaje. El cliente los muestra
+como código QR en pantalla para que el conductor los escanee al llegar.
+
+
+**Rol requerido:** `CLIENTE` (debe ser el dueño del viaje)
+
+
+**Respuesta exitosa — 200:**
+```json
+[
+  {
+    "id_parada": 1,
+    "orden": 1,
+    "direccion": "Plaza de Mayo, CABA",
+    "qr_firmado": "eyJpZF9wYXJhZGEiOjEsImlkX3ZpYWplIjo0Miwib3JkZW4iOjF9.a3f9c8..."
+  },
+  {
+    "id_parada": 2,
+    "orden": 2,
+    "direccion": "Recoleta, CABA",
+    "qr_firmado": "eyJpZF9wYXJhZGEiOjIsImlkX3ZpYWplIjo0Miwib3JkZW4iOjJ9.d72b1e..."
+  }
+]
+```
+
+
+El campo `qr_firmado` es un string `base64url_payload.hmac_hex`. Es lo que
+se debe codificar como imagen QR y mostrar al cliente para que el conductor lo escanee.
+
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CLIENTE |
+| 403 | `{ "error": "Sin acceso a este viaje" }` | El cliente no es el dueño del viaje |
+| 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
+
+
+---
+
+
+### POST /api/viajes/:id/confirmar-parada
+
+
+El conductor escanea el QR al llegar a una parada y confirma la entrega.
+Si era la última parada pendiente, cierra el viaje automáticamente.
+
+
+**Rol requerido:** `CONDUCTOR` (debe ser el conductor asignado al viaje)
+
+
+**Body:**
+```json
+{
+  "qr_firmado": "eyJpZF9wYXJhZGEiOjEsImlkX3ZpYWplIjo0Miwib3JkZW4iOjF9.a3f9c8...",
+  "lat": -34.6037,
+  "lng": -58.3816
+}
+```
+
+
+- `qr_firmado`: el string escaneado del QR (generado por `GET /api/viajes/:id/qr-paradas`)
+- `lat`, `lng`: coordenada GPS actual del conductor al momento del escaneo
+
+
+**Validaciones en orden:**
+1. Firma HMAC válida
+2. `id_viaje` del QR coincide con el `:id` de la URL
+3. El conductor es el asignado al viaje
+4. El viaje está en estado `EN_RUTA` o `DESCARGANDO`
+5. La parada no está ya en estado `ENTREGADO`
+6. El conductor está a menos de 200 metros de la parada (Turf.js)
+
+
+**Respuesta exitosa — 200 (parada confirmada, quedan pendientes):**
+```json
+{
+  "confirmada": true,
+  "viaje_finalizado": false
+}
+```
+
+
+**Respuesta exitosa — 200 (última parada → viaje cerrado):**
+```json
+{
+  "confirmada": true,
+  "viaje_finalizado": true,
+  "precio_real": 1750.00,
+  "remito_url": "https://pub.r2.example.com/remitos/42.pdf"
+}
+```
+
+
+**Efectos secundarios al cerrar el viaje:**
+- La parada queda en estado `ENTREGADO` con `fecha_entrega = now()`
+- El viaje pasa a estado `FINALIZADO` con `precio_real` calculado
+- Se genera el remito PDF y se sube a Cloudflare R2
+- Se emite el evento WebSocket `viaje:finalizado` al room del viaje
+- Se eliminan todas las keys GPS de Redis
+
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "QR invalido o firma incorrecta" }` | HMAC inválido o token malformado |
+| 400 | `{ "error": "El QR no corresponde a este viaje" }` | El QR es de otro viaje |
+| 400 | `{ "error": "El viaje debe estar en estado EN_RUTA o DESCARGANDO" }` | Estado incorrecto |
+| 400 | `{ "error": "La parada ya fue confirmada" }` | La parada ya tiene estado ENTREGADO |
+| 400 | `{ "error": "Estas a Xm de la parada. Debes estar a menos de 200m" }` | Demasiado lejos de la parada |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
+| 403 | `{ "error": "No sos el conductor de este viaje" }` | Conductor diferente al asignado |
+| 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
+| 404 | `{ "error": "Parada no encontrada" }` | La parada del QR no existe en este viaje |
+
+
+---
+
+
+### WebSocket — Evento: viaje:finalizado
+
+
+**Dirección:** servidor → room del viaje  
+**Quién lo recibe:** cliente y conductor conectados al room `viaje:{id_viaje}`  
+**Cuándo:** cuando se confirma la última parada via `POST /api/viajes/:id/confirmar-parada`
+
+
+**Payload:**
+```json
+{
+  "id_viaje": 42,
+  "precio_real": 1750.00,
+  "desglose": {
+    "precio_por_tiempo": 1750.00,
+    "precio_por_distancia": null,
+    "tiempo_horas": 0.5,
+    "distancia_km": 8.2,
+    "tarifa_hora": 3500,
+    "tarifa_km": null
+  },
+  "remito_url": "https://pub.r2.example.com/remitos/42.pdf"
+}
+```
+
+
+**Cómo escucharlo:**
+```js
+socket.on('viaje:finalizado', (data) => {
+  console.log('Viaje finalizado. Precio real:', data.precio_real);
+  console.log('Remito:', data.remito_url);
+});
+```
+
+
+---
+
+
+### POST /api/viajes/:id/calificacion
+
+
+El cliente califica al conductor después de que el viaje finalizó.
+Solo se permite una calificación por viaje.
+
+
+**Rol requerido:** `CLIENTE` (debe ser el dueño del viaje)
+
+
+**Body:**
+```json
+{
+  "puntuacion": 5,
+  "comentario": "Excelente servicio, muy puntual"
+}
+```
+
+
+- `puntuacion`: entero entre 1 y 5 (requerido)
+- `comentario`: string (opcional)
+
+
+**Respuesta exitosa — 201:**
+```json
+{
+  "id_calificacion": 7,
+  "puntuacion": 5,
+  "comentario": "Excelente servicio, muy puntual"
+}
+```
+
+
+**Efecto secundario:** recalcula y actualiza `conductor.calificacion_promedio`
+como el promedio de todos sus puntajes en DB.
+
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "mensaje de validación" }` | Puntuación fuera de rango o tipo inválido |
+| 400 | `{ "error": "Solo se puede calificar un viaje finalizado" }` | El viaje no está en estado FINALIZADO |
+| 400 | `{ "error": "El viaje no tiene conductor asignado" }` | Sin conductor asignado |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CLIENTE |
+| 403 | `{ "error": "Sin acceso a este viaje" }` | El cliente no es el dueño del viaje |
+| 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
+| 409 | `{ "error": "Este viaje ya tiene una calificacion" }` | Calificación duplicada |
+
+
+---
+
+
+### GET /api/viajes/:id/remito
+
+
+Devuelve la URL pública del remito PDF del viaje. Solo disponible para viajes finalizados.
+
+
+**Rol requerido:** `CLIENTE` o `CONDUCTOR` del viaje
+
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "remito_url": "https://pub.r2.example.com/remitos/42.pdf"
+}
+```
+
+
+El PDF incluye: datos del cliente y conductor, lista de paradas con fecha de entrega,
+y desglose de costo (tiempo, distancia, tarifas, precio real).
+
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "El remito solo esta disponible para viajes finalizados" }` | Estado incorrecto |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Sin acceso a este viaje" }` | No es el cliente ni el conductor del viaje |
+| 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
+
+
+---
+
+
+### GET /api/viajes/:id — cambios en Fase 5
+
+
+El endpoint ahora incluye el campo `calificacion` en la respuesta (si existe):
+
+```json
+{
+  "id_viaje": 42,
+  "estado": "FINALIZADO",
+  "precio_real": 1750.00,
+  "paradas": [...],
+  "calificacion": {
+    "id_calificacion": 7,
+    "puntaje": 5,
+    "comentario": "Excelente servicio",
+    "fecha_hora": "2026-06-06T15:00:00.000Z"
+  }
+}
+```
+
+`calificacion` es `null` si el viaje aún no fue calificado.
+
+
+---
+
 ## Convenciones generales
 
 - Todos los errores devuelven `{ "error": "mensaje legible" }`
 - Fechas en formato ISO 8601 UTC
 - El campo `contrasena` nunca se almacena en la DB — solo va a Firebase
 - `id_conductor`, `id_vehiculo` e `id_empresa` en el viaje son `null` hasta que se asigne un conductor
-- El campo `vehiculo` en `viaje:conductor_asignado` puede ser `null` si el conductor
-  no tiene vehículo registrado en la DB (se resuelve en Fase 4)
+- El campo `vehiculo` en `viaje:conductor_asignado` siempre es un objeto no nulo — si el conductor no tiene vehículo elegible el servidor emite `error` antes de asignar el viaje
+
+<a id="formato-de-ruta"></a>
+### Formato de ruta
+
+La ruta de un viaje (la polilínea que el front dibuja en el mapa) es siempre un **array de
+puntos `[lng, lat]`** — primero longitud, después latitud — trazado por Google Maps Directions
+desde la primera parada hasta la última, con las paradas intermedias como waypoints en orden:
+
+```json
+[[-58.38162, -34.60361], [-58.38201, -34.60280], "..."]
+```
+
+Este mismo formato se usa en los cuatro lugares donde la ruta viaja al front:
+- `ruta_planeada` en la respuesta de `POST /api/viajes`
+- `ruta_planeada` en la respuesta de `GET /api/viajes/:id`
+- `ruta_planeada` en el payload del evento `viaje:conductor_asignado`
+- `nueva_ruta` en el payload del evento `ruta:recalculada`
+
+La ruta se calcula y cachea al **crear** el viaje. `ruta_planeada` puede ser `null` si Google
+Maps falló en la creación (se reintenta en el primer ping GPS) o si el viaje ya terminó y se
+limpió el cache. El evento `ruta:recalculada` reemplaza esta ruta cuando el conductor se desvía.

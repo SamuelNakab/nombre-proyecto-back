@@ -1,15 +1,14 @@
 import prisma from '../config/prisma.js';
-import redis from '../config/redis.js';
 import {
   guardarCoordenada,
   obtenerUltimaCoordenada,
   actualizarAcumulado,
   calcularVelocidad,
-  guardarRuta,
-  obtenerRuta,
 } from '../services/gps.service.js';
-import { obtenerRutaOptima, verificarDesvio } from '../services/desvio.service.js';
+import { manejarDesvio } from '../services/desvio.service.js';
+import { obtenerRutaPlaneada, calcularYGuardarRuta } from '../services/ruta.service.js';
 import { verificarParadaSospechosa } from '../services/parada.service.js';
+import { iniciarEmisorEta } from '../services/eta-emisor.js';
 
 export function registrarHandlersGPS(socket, io) {
   socket.on('conductor:ubicacion', async (data) => {
@@ -29,11 +28,39 @@ export function registrarHandlersGPS(socket, io) {
         return;
       }
 
+      // Rango geografico valido: lat [-90, 90], lng [-180, 180]. Corre ANTES
+      // de tocar Redis o calcular distancia, asi un ping fuera de rango (ej.
+      // lat=200) no se guarda en gps:{id}:ultima ni contamina el acumulado.
+      if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+        socket.emit('error', { error: 'Coordenadas fuera de rango' });
+        return;
+      }
+
       const viaje = await prisma.viaje.findUnique({
         where: { id_viaje },
         include: { paradas: true },
       });
-      if (!viaje) return;
+
+      // B-003: solo el conductor ASIGNADO puede enviar pings de este viaje.
+      // Otro conductor autenticado no puede falsificar posicion/distancia ni
+      // disparar alertas en un viaje ajeno. id_conductor se cachea en
+      // socket.data al conectar (unirseARoomsDisponibles, ver sockets/index.js);
+      // fallback a query si no esta (ej. ping antes de terminar el join).
+      let id_conductor = socket.data.id_conductor;
+      if (id_conductor == null) {
+        const conductor = await prisma.conductor.findUnique({
+          where: { id_usuario: socket.data.usuario.id_usuario },
+        });
+        if (conductor) {
+          id_conductor = conductor.id_conductor;
+          socket.data.id_conductor = id_conductor;
+        }
+      }
+      if (!viaje || id_conductor == null || viaje.id_conductor !== id_conductor) {
+        socket.emit('error', { error: 'No autorizado para este viaje' });
+        return;
+      }
+
       if (viaje.estado === 'FINALIZADO' || viaje.estado === 'CANCELADO') return;
 
       const anterior = await obtenerUltimaCoordenada(id_viaje);
@@ -55,6 +82,10 @@ export function registrarHandlersGPS(socket, io) {
           estado_nuevo: 'EN_CAMINO_A_ORIGEN',
         });
       }
+
+      // El viaje tiene GPS activo: arrancamos el emisor periodico de ETA
+      // (idempotente — si ya corre, no hace nada). Se detiene al cerrar/cancelar.
+      iniciarEmisorEta(io, id_viaje);
 
       io.to(`viaje:${id_viaje}`).emit('mapa:actualizar', {
         lat,
@@ -97,24 +128,28 @@ export function registrarHandlersGPS(socket, io) {
         });
       }
 
-      let ruta = await obtenerRuta(id_viaje);
+      // La ruta planeada se calcula al crear el viaje. Fallback para viajes
+      // viejos (creados antes de este cambio) o cuya ruta fallo en la creacion.
+      let ruta = await obtenerRutaPlaneada(id_viaje);
       if (!ruta) {
-        ruta = await obtenerRutaOptima(viaje.paradas);
-        await guardarRuta(id_viaje, ruta);
+        console.warn(`[gps.socket] viaje ${id_viaje} sin ruta en Redis — recalculando como fallback`);
+        try {
+          ruta = await calcularYGuardarRuta(id_viaje);
+        } catch (e) {
+          console.error(`[gps.socket] fallback de ruta fallo para viaje ${id_viaje}:`, e.message);
+          ruta = null;
+        }
       }
 
       if (viaje.estado === 'EN_RUTA') {
-        const desvio = verificarDesvio(lat, lng, ruta);
-        if (desvio.desviado) {
-          io.to(`viaje:${id_viaje}`).emit('alerta:desvio', {
-            id_viaje,
-            distancia_metros: Math.round(desvio.distancia_metros),
-            mensaje: `El conductor se desvio ${Math.round(desvio.distancia_metros)}m de la ruta`,
-          });
+        // Deteccion de desvio + recalculo de ruta (2 pings consecutivos
+        // desviados con cooldown). Lee/escribe la ruta vigente en Redis.
+        if (ruta) {
+          await manejarDesvio(io, id_viaje, lat, lng, ruta);
         }
 
         const parada_result = await verificarParadaSospechosa(
-          id_viaje, viaje.zona, velocidad_kmh, lat, lng, viaje.paradas, redis
+          id_viaje, viaje.zona, velocidad_kmh, lat, lng, viaje.paradas
         );
         if (parada_result.sospechosa) {
           io.to(`viaje:${id_viaje}`).emit('alerta:parada', {

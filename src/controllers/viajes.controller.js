@@ -1,10 +1,43 @@
+import { createHmac, timingSafeEqual } from 'crypto';
 import { z } from 'zod';
+import * as turf from '@turf/turf';
 import prisma from '../config/prisma.js';
 import { estimarCosto as estimarCostoService } from '../services/costo.service.js';
-import { obtenerConductoresElegibles } from '../services/elegibilidad.service.js';
+import { obtenerConductoresElegibles, conductorEsElegible } from '../services/elegibilidad.service.js';
 import { publicarViaje } from '../services/matching.service.js';
 import { obtenerAcumulado } from '../services/gps.service.js';
+import { cerrarViaje } from '../services/cierre.service.js';
+import { recalcularEtaInmediato } from '../services/eta-emisor.js';
+import { calcularYGuardarRuta, obtenerRutaPlaneada } from '../services/ruta.service.js';
 import { io } from '../sockets/index.js';
+
+// ─── QR helpers ──────────────────────────────────────────────────────────────
+
+function firmarQR(payload) {
+  const data = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const firma = createHmac('sha256', process.env.QR_SECRET).update(data).digest('hex');
+  return `${data}.${firma}`;
+}
+
+function verificarQR(qr_firmado) {
+  const dot = qr_firmado.lastIndexOf('.');
+  if (dot === -1) return null;
+  const data = qr_firmado.slice(0, dot);
+  const firma = qr_firmado.slice(dot + 1);
+  const firmaEsperada = createHmac('sha256', process.env.QR_SECRET).update(data).digest('hex');
+  try {
+    const a = Buffer.from(firma, 'hex');
+    const b = Buffer.from(firmaEsperada, 'hex');
+    if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
+  } catch {
+    return null;
+  }
+  try {
+    return JSON.parse(Buffer.from(data, 'base64url').toString());
+  } catch {
+    return null;
+  }
+}
 
 // ─── Schemas de validacion ───────────────────────────────────────────────────
 
@@ -41,24 +74,8 @@ const schemaCrear = z.object({
     .array(z.enum(CONDICIONES))
     .optional()
     .default([]),
+  descripcion: z.string().max(500).optional(),
 });
-
-// ─── Helper de elegibilidad en memoria ──────────────────────────────────────
-
-function conductorEsElegible(vehiculosConductor, vehiculosPropios, condicionesViaje) {
-  if (condicionesViaje.length === 0) return true;
-
-  const tieneViaEmpresa = vehiculosConductor.some((cv) => {
-    const tiene = cv.vehiculo.condiciones.map((c) => c.condicion);
-    return condicionesViaje.every((req) => tiene.includes(req));
-  });
-  if (tieneViaEmpresa) return true;
-
-  return vehiculosPropios.some((v) => {
-    const tiene = v.condiciones.map((c) => c.condicion);
-    return condicionesViaje.every((req) => tiene.includes(req));
-  });
-}
 
 // ─── Controllers ─────────────────────────────────────────────────────────────
 
@@ -85,7 +102,7 @@ export async function crearViaje(req, res) {
     return res.status(400).json({ error: parsed.error.issues[0].message });
   }
 
-  const { zona, paradas, fecha_programada, condiciones_requeridas } = parsed.data;
+  const { zona, paradas, fecha_programada, condiciones_requeridas, descripcion } = parsed.data;
 
   const cliente = await prisma.cliente.findUnique({
     where: { id_usuario: req.usuario.id_usuario },
@@ -110,6 +127,7 @@ export async function crearViaje(req, res) {
       tarifa_hora,
       tarifa_km,
       fecha_programada: new Date(fecha_programada),
+      descripcion: descripcion ?? null,
       precio_estimado: resultado.precio_estimado,
       paradas: {
         create: paradas.map((p, i) => ({
@@ -129,12 +147,22 @@ export async function crearViaje(req, res) {
     },
   });
 
+  // Calcular la ruta planeada ahora, al crear el viaje. Si Google Maps falla,
+  // no bloqueamos la creacion: ruta_planeada queda null y se reintenta en el
+  // primer ping GPS (fallback en gps.socket.js).
+  let ruta_planeada = null;
+  try {
+    ruta_planeada = await calcularYGuardarRuta(viaje.id_viaje);
+  } catch (err) {
+    console.error(`[crearViaje] No se pudo calcular la ruta planeada para viaje ${viaje.id_viaje}:`, err.message);
+  }
+
   if (io) {
     const conductoresElegibles = await obtenerConductoresElegibles(condiciones_requeridas);
     await publicarViaje(io, viaje, conductoresElegibles, req.usuario.id_usuario);
   }
 
-  return res.status(201).json({ ...viaje, desglose_estimado: resultado.desglose });
+  return res.status(201).json({ ...viaje, ruta_planeada, desglose_estimado: resultado.desglose });
 }
 
 export async function listarViajesDisponibles(req, res) {
@@ -192,10 +220,11 @@ export async function obtenerViaje(req, res) {
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje: Number(req.params.id) },
     include: {
-      paradas: true,
+      paradas: { orderBy: { orden: 'asc' } },
       condiciones_req: true,
       cliente: { include: { usuario: true } },
       conductor: { include: { usuario: true } },
+      calificacion: true,
     },
   });
 
@@ -211,7 +240,10 @@ export async function obtenerViaje(req, res) {
     return res.status(403).json({ error: 'Sin acceso a este viaje' });
   }
 
-  return res.status(200).json(viaje);
+  // null si el viaje ya termino (Redis limpio) o si la ruta nunca se calculo.
+  const ruta_planeada = await obtenerRutaPlaneada(viaje.id_viaje);
+
+  return res.status(200).json({ ...viaje, ruta_planeada });
 }
 
 export async function cambiarEstado(req, res) {
@@ -273,7 +305,7 @@ export async function obtenerCostoAcumulado(req, res) {
     return res.status(200).json({ precio_acumulado: 0, desglose: null });
   }
 
-  let precio_acumulado = 0;
+  let precio_acumulado;
   let precio_por_tiempo = null;
   let precio_por_distancia = null;
 
@@ -306,6 +338,173 @@ export async function obtenerCostoAcumulado(req, res) {
   });
 }
 
+// ─── Fase 5 ───────────────────────────────────────────────────────────────────
+
+export async function obtenerQRParadas(req, res) {
+  const id_viaje = Number(req.params.id);
+
+  const viaje = await prisma.viaje.findUnique({
+    where: { id_viaje },
+    include: {
+      cliente: true,
+      paradas: { orderBy: { orden: 'asc' } },
+    },
+  });
+
+  if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
+  if (viaje.cliente.id_usuario !== req.usuario.id_usuario) {
+    return res.status(403).json({ error: 'Sin acceso a este viaje' });
+  }
+
+  const qrs = viaje.paradas.map((p) => ({
+    id_parada: p.id_parada,
+    orden: p.orden,
+    direccion: p.direccion,
+    qr_firmado: firmarQR({ id_parada: p.id_parada, id_viaje, orden: p.orden }),
+  }));
+
+  return res.status(200).json(qrs);
+}
+
+export async function confirmarParada(req, res) {
+  const schema = z.object({
+    qr_firmado: z.string(),
+    lat: z.number(),
+    lng: z.number(),
+  });
+
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
+
+  const { qr_firmado, lat, lng } = parsed.data;
+  const id_viaje = Number(req.params.id);
+
+  const payload = verificarQR(qr_firmado);
+  if (!payload) return res.status(400).json({ error: 'QR invalido o firma incorrecta' });
+  if (payload.id_viaje !== id_viaje) return res.status(400).json({ error: 'El QR no corresponde a este viaje' });
+
+  const viaje = await prisma.viaje.findUnique({
+    where: { id_viaje },
+    include: {
+      conductor: true,
+      paradas: true,
+    },
+  });
+
+  if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
+  if (!viaje.conductor || viaje.conductor.id_usuario !== req.usuario.id_usuario) {
+    return res.status(403).json({ error: 'No sos el conductor de este viaje' });
+  }
+  if (viaje.estado !== 'EN_RUTA' && viaje.estado !== 'DESCARGANDO') {
+    return res.status(400).json({ error: 'El viaje debe estar en estado EN_RUTA o DESCARGANDO' });
+  }
+
+  const parada = viaje.paradas.find((p) => p.id_parada === payload.id_parada);
+  if (!parada) return res.status(404).json({ error: 'Parada no encontrada' });
+  if (parada.estado === 'ENTREGADO') return res.status(400).json({ error: 'La parada ya fue confirmada' });
+
+  const distancia_metros = turf.distance(
+    turf.point([lng, lat]),
+    turf.point([parada.longitud, parada.latitud]),
+    { units: 'meters' }
+  );
+  if (distancia_metros > 200) {
+    return res.status(400).json({
+      error: `Estas a ${Math.round(distancia_metros)}m de la parada. Debes estar a menos de 200m`,
+    });
+  }
+
+  await prisma.parada.update({
+    where: { id_parada: parada.id_parada },
+    data: { estado: 'ENTREGADO', fecha_entrega: new Date() },
+  });
+
+  const pendientes = await prisma.parada.count({
+    where: { id_viaje, estado: 'PENDIENTE' },
+  });
+
+  if (pendientes > 0) {
+    // La proxima parada pendiente cambio: forzamos recalculo de ETA inmediato.
+    await recalcularEtaInmediato(io, id_viaje);
+    return res.status(200).json({ confirmada: true, viaje_finalizado: false });
+  }
+
+  const { precio_real, remito_url } = await cerrarViaje(id_viaje, io);
+  return res.status(200).json({ confirmada: true, viaje_finalizado: true, precio_real, remito_url });
+}
+
+export async function calificarViaje(req, res) {
+  const schema = z.object({
+    puntuacion: z.number().int().min(1).max(5),
+    comentario: z.string().optional(),
+  });
+
+  const parsed = schema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
+
+  const { puntuacion, comentario } = parsed.data;
+  const id_viaje = Number(req.params.id);
+
+  const viaje = await prisma.viaje.findUnique({
+    where: { id_viaje },
+    include: {
+      cliente: true,
+      conductor: true,
+      calificacion: true,
+    },
+  });
+
+  if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
+  if (viaje.estado !== 'FINALIZADO') return res.status(400).json({ error: 'Solo se puede calificar un viaje finalizado' });
+  if (viaje.cliente.id_usuario !== req.usuario.id_usuario) return res.status(403).json({ error: 'Sin acceso a este viaje' });
+  if (viaje.calificacion) return res.status(409).json({ error: 'Este viaje ya tiene una calificacion' });
+  if (!viaje.conductor) return res.status(400).json({ error: 'El viaje no tiene conductor asignado' });
+
+  const calificacion = await prisma.calificacion.create({
+    data: {
+      id_viaje,
+      id_cliente: viaje.cliente.id_cliente,
+      id_conductor: viaje.conductor.id_conductor,
+      puntaje: puntuacion,
+      comentario: comentario ?? null,
+    },
+  });
+
+  const promedio = await prisma.calificacion.aggregate({
+    where: { id_conductor: viaje.conductor.id_conductor },
+    _avg: { puntaje: true },
+  });
+
+  await prisma.conductor.update({
+    where: { id_conductor: viaje.conductor.id_conductor },
+    data: { calificacion_promedio: promedio._avg.puntaje ?? 0 },
+  });
+
+  return res.status(201).json({
+    id_calificacion: calificacion.id_calificacion,
+    puntuacion: calificacion.puntaje,
+    comentario: calificacion.comentario,
+  });
+}
+
+export async function obtenerRemito(req, res) {
+  const id_viaje = Number(req.params.id);
+
+  const viaje = await prisma.viaje.findUnique({
+    where: { id_viaje },
+    include: { cliente: true, conductor: true },
+  });
+
+  if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
+
+  const esCliente = viaje.cliente.id_usuario === req.usuario.id_usuario;
+  const esConductor = viaje.conductor?.id_usuario === req.usuario.id_usuario;
+  if (!esCliente && !esConductor) return res.status(403).json({ error: 'Sin acceso a este viaje' });
+  if (viaje.estado !== 'FINALIZADO') return res.status(400).json({ error: 'El remito solo esta disponible para viajes finalizados' });
+
+  return res.status(200).json({ remito_url: `${process.env.R2_PUBLIC_URL}/remitos/${id_viaje}.pdf` });
+}
+
 export async function listarMisViajes(req, res) {
   const cliente = await prisma.cliente.findUnique({
     where: { id_usuario: req.usuario.id_usuario },
@@ -319,6 +518,60 @@ export async function listarMisViajes(req, res) {
     include: {
       paradas: true,
       conductor: { include: { usuario: true } },
+    },
+    orderBy: { creado_en: 'desc' },
+  });
+
+  return res.status(200).json(viajes);
+}
+
+const ESTADOS_VIAJE = [
+  'BUSCANDO_CONDUCTOR',
+  'CONDUCTOR_ASIGNADO',
+  'EN_CAMINO_A_ORIGEN',
+  'CARGANDO',
+  'EN_RUTA',
+  'DESCARGANDO',
+  'FINALIZADO',
+  'CANCELADO',
+];
+
+export async function listarMisViajesConductor(req, res) {
+  const conductor = await prisma.conductor.findUnique({
+    where: { id_usuario: req.usuario.id_usuario },
+  });
+  if (!conductor) {
+    return res.status(400).json({ error: 'El usuario no tiene perfil de conductor' });
+  }
+
+  const { estado } = req.query;
+  if (estado !== undefined && !ESTADOS_VIAJE.includes(estado)) {
+    return res.status(400).json({ error: 'Estado invalido' });
+  }
+
+  const viajes = await prisma.viaje.findMany({
+    where: {
+      id_conductor: conductor.id_conductor,
+      ...(estado ? { estado } : {}),
+    },
+    select: {
+      id_viaje: true,
+      zona: true,
+      precio_estimado: true,
+      precio_real: true,
+      estado: true,
+      fecha_programada: true,
+      descripcion: true,
+      creado_en: true,
+      paradas: {
+        select: { orden: true, direccion: true, estado: true, fecha_entrega: true },
+        orderBy: { orden: 'asc' },
+      },
+      cliente: {
+        select: {
+          usuario: { select: { nombre: true, apellido: true, telefono: true } },
+        },
+      },
     },
     orderBy: { creado_en: 'desc' },
   });

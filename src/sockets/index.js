@@ -3,6 +3,7 @@ import prisma from '../config/prisma.js';
 import { autenticarSocket } from './auth.socket.js';
 import { manejarAceptarViaje } from './matching.socket.js';
 import { registrarHandlersGPS } from './gps.socket.js';
+import { conductorEsElegible } from '../services/elegibilidad.service.js';
 
 export let io = null;
 
@@ -20,6 +21,8 @@ export function inicializarSockets(httpServer) {
 
     if (rol === 'CONDUCTOR') {
       unirseARoomsDisponibles(socket);
+    } else if (rol === 'CLIENTE') {
+      unirseARoomsCliente(socket);
     }
 
     manejarAceptarViaje(socket, io);
@@ -45,6 +48,10 @@ async function unirseARoomsDisponibles(socket) {
   });
   if (!conductor) return;
 
+  // Cache del id_conductor para verificar propiedad en cada ping GPS (B-003)
+  // sin re-query por ping. El handler de conductor:ubicacion lo reutiliza.
+  socket.data.id_conductor = conductor.id_conductor;
+
   const viajes = await prisma.viaje.findMany({
     where: { estado: 'BUSCANDO_CONDUCTOR', fecha_programada: { gt: new Date() } },
     include: { condiciones_req: true },
@@ -62,17 +69,17 @@ async function unirseARoomsDisponibles(socket) {
   console.log(`[Socket] conductor ${conductor.id_conductor} unido a ${joined} rooms`);
 }
 
-function conductorEsElegible(vehiculosConductor, vehiculosPropios, condicionesViaje) {
-  if (condicionesViaje.length === 0) return true;
-
-  const tieneViaEmpresa = vehiculosConductor.some((cv) => {
-    const tiene = cv.vehiculo.condiciones.map((c) => c.condicion);
-    return condicionesViaje.every((req) => tiene.includes(req));
+async function unirseARoomsCliente(socket) {
+  const viajes = await prisma.viaje.findMany({
+    where: {
+      cliente: { id_usuario: socket.data.usuario.id_usuario },
+      estado: { notIn: ['FINALIZADO', 'CANCELADO'] },
+    },
+    select: { id_viaje: true },
   });
-  if (tieneViaEmpresa) return true;
-
-  return vehiculosPropios.some((v) => {
-    const tiene = v.condiciones.map((c) => c.condicion);
-    return condicionesViaje.every((req) => tiene.includes(req));
-  });
+  for (const v of viajes) {
+    socket.join(`viaje:${v.id_viaje}`);
+  }
+  console.log(`[Socket] cliente unido a ${viajes.length} rooms de viajes activos`);
 }
+

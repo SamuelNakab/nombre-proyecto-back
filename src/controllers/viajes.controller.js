@@ -3,11 +3,11 @@ import { z } from 'zod';
 import * as turf from '@turf/turf';
 import prisma from '../config/prisma.js';
 import { estimarCosto as estimarCostoService } from '../services/costo.service.js';
-import { obtenerConductoresElegibles, conductorEsElegible } from '../services/elegibilidad.service.js';
-import { publicarViaje } from '../services/matching.service.js';
-import { obtenerAcumulado } from '../services/gps.service.js';
+import { conductorEsElegible } from '../services/elegibilidad.service.js';
+import { publicarViajeAConductoresElegibles } from '../services/matching.service.js';
+import { obtenerAcumulado, limpiarGPS } from '../services/gps.service.js';
 import { cerrarViaje } from '../services/cierre.service.js';
-import { recalcularEtaInmediato } from '../services/eta-emisor.js';
+import { recalcularEtaInmediato, detenerEmisorEta } from '../services/eta-emisor.js';
 import { calcularYGuardarRuta, obtenerRutaPlaneada } from '../services/ruta.service.js';
 import { io } from '../sockets/index.js';
 
@@ -158,8 +158,7 @@ export async function crearViaje(req, res) {
   }
 
   if (io) {
-    const conductoresElegibles = await obtenerConductoresElegibles(condiciones_requeridas);
-    await publicarViaje(io, viaje, conductoresElegibles, req.usuario.id_usuario);
+    await publicarViajeAConductoresElegibles(io, viaje, req.usuario.id_usuario);
   }
 
   return res.status(201).json({ ...viaje, ruta_planeada, desglose_estimado: resultado.desglose });
@@ -280,6 +279,90 @@ export async function cambiarEstado(req, res) {
   }
 
   return res.status(200).json({ id_viaje, estado_anterior, estado_nuevo: estado });
+}
+
+export async function cancelarViajeConductor(req, res) {
+  const id_viaje = Number(req.params.id);
+
+  const viaje = await prisma.viaje.findUnique({
+    where: { id_viaje },
+    include: { conductor: true },
+  });
+
+  // 1. El viaje existe.
+  if (!viaje) {
+    return res.status(404).json({ error: 'Viaje no encontrado' });
+  }
+
+  // 2. Autorizacion: si hay OTRO conductor asignado distinto al autenticado, 403.
+  //    Cuando no hay conductor asignado (p. ej. BUSCANDO_CONDUCTOR), no es un
+  //    problema de autorizacion sino de estado, y cae al chequeo 3 (400).
+  if (viaje.conductor && viaje.conductor.id_usuario !== req.usuario.id_usuario) {
+    return res.status(403).json({ error: 'No autorizado para cancelar este viaje' });
+  }
+
+  // 3. Solo se puede cancelar desde CONDUCTOR_ASIGNADO.
+  if (viaje.estado !== 'CONDUCTOR_ASIGNADO') {
+    return res.status(400).json({
+      error: `Solo se puede cancelar un viaje en estado CONDUCTOR_ASIGNADO, el viaje actual esta en estado ${viaje.estado}`,
+    });
+  }
+
+  // El viaje mantiene su id_viaje: vuelve a BUSCANDO_CONDUCTOR y se libera
+  // conductor/vehiculo en una sola transaccion.
+  await prisma.$transaction([
+    prisma.viaje.update({
+      where: { id_viaje },
+      data: { estado: 'BUSCANDO_CONDUCTOR', id_conductor: null, id_vehiculo: null },
+    }),
+  ]);
+
+  // Fuera de la transaccion: cortar el emisor de ETA y limpiar TODAS las keys
+  // gps:{id_viaje}:* (mismo cleanup que al finalizar el viaje).
+  detenerEmisorEta(id_viaje);
+  await limpiarGPS(id_viaje);
+
+  if (io) {
+    // El socket del conductor que cancelo sale del room del viaje (best-effort,
+    // no bloqueante). Si sigue siendo elegible, publicarViajeAConductoresElegibles
+    // lo vuelve a unir enseguida: puede recibir viaje:disponible y reaceptar.
+    try {
+      const sockets = await io.in(`viaje:${id_viaje}`).fetchSockets();
+      for (const s of sockets) {
+        if (s.data?.usuario?.id_usuario === req.usuario.id_usuario) {
+          await s.leave(`viaje:${id_viaje}`);
+        }
+      }
+    } catch (err) {
+      console.error(
+        `[cancelarViajeConductor] No se pudo sacar el socket del conductor del room viaje:${id_viaje}:`,
+        err.message
+      );
+    }
+
+    // Republicar reutilizando el mismo flujo que la creacion del viaje. El
+    // recalculo de ruta_planeada (Google Maps) ocurre cuando el siguiente
+    // conductor acepte y se haga el primer ping, igual que en un viaje nuevo.
+    const viajeRepublicar = await prisma.viaje.findUnique({
+      where: { id_viaje },
+      include: {
+        paradas: true,
+        condiciones_req: true,
+        cliente: { include: { usuario: { select: { id_usuario: true } } } },
+      },
+    });
+    await publicarViajeAConductoresElegibles(
+      io,
+      viajeRepublicar,
+      viajeRepublicar.cliente.usuario.id_usuario
+    );
+  }
+
+  return res.status(200).json({
+    mensaje: 'Viaje cancelado y republicado',
+    id_viaje,
+    estado: 'BUSCANDO_CONDUCTOR',
+  });
 }
 
 export async function obtenerCostoAcumulado(req, res) {

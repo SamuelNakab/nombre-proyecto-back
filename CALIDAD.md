@@ -202,6 +202,18 @@ Somos honestos sobre lo que quedó sin cubrir:
   para staging. Separar Firebase también en dos proyectos es la mejora
   arquitectónica correcta a largo plazo, pero no era necesaria para este TP.
 
+## Nota sobre el equipo de trabajo
+
+Este TP se realizó individualmente sobre el repositorio del backend de
+Fleter. La consigna prevé equipos de dos personas con revisión cruzada de
+Pull Requests; al trabajar solo, la revisión de cada PR fue una
+autorrevisión — releer el diff completo, verificar que el check de CI
+pasara, y confirmar que el cambio respondía exactamente al issue que
+referenciaba, antes de aprobar el merge. La branch protection (PR
+obligatorio + al menos 1 aprobación) se mantuvo igual de estricta que si
+hubiera dos personas: no se mergeó nada directo a `main` ni a `develop` en
+ningún momento del desarrollo.
+
 ## Uso de IA
 
 Usamos Claude (vía la interfaz de chat y Claude Code) de forma extensiva

@@ -928,6 +928,57 @@ en estado `CONDUCTOR_ASIGNADO` (es decir, antes del primer ping GPS, que ya lo l
 
 ---
 
+### POST /api/viajes/:id/cancelar-cliente
+
+El cliente dueño del viaje lo cancela. Solo se permite **antes de que el viaje comience**, es
+decir mientras está en `BUSCANDO_CONDUCTOR` (todavía nadie lo aceptó) o `CONDUCTOR_ASIGNADO`
+(un conductor lo aceptó pero aún no se movió — antes del primer ping GPS, que lo llevaría a
+`EN_CAMINO_A_ORIGEN`). El viaje pasa a `CANCELADO`, que es un estado **terminal**.
+
+**Rol requerido:** `CLIENTE` (debe ser el dueño del viaje)
+
+**Body:** Ninguno (vacío)
+
+**Validaciones en orden:**
+1. El viaje existe.
+2. El cliente autenticado es el dueño del viaje (`viaje.id_cliente` coincide con el del usuario
+   autenticado). Si no → `403`.
+3. El viaje está en `BUSCANDO_CONDUCTOR` o `CONDUCTOR_ASIGNADO`. Cualquier otro estado
+   (`EN_CAMINO_A_ORIGEN`, `CARGANDO`, `EN_RUTA`, `DESCARGANDO`, `FINALIZADO`, `CANCELADO`) → `400`.
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "mensaje": "Viaje cancelado",
+  "id_viaje": 42,
+  "estado": "CANCELADO"
+}
+```
+
+**Efectos secundarios al cancelar:**
+- El viaje pasa a `CANCELADO` (terminal — no hay transiciones desde `CANCELADO`).
+- **`id_conductor` e `id_vehiculo` se preservan** tal como estaban al momento de cancelar (no se
+  ponen en `null`): si el viaje estaba en `CONDUCTOR_ASIGNADO`, el viaje `CANCELADO` retiene con
+  qué conductor/vehículo estaba asociado, para historial.
+- Si el viaje estaba en `CONDUCTOR_ASIGNADO`, se detiene el emisor de ETA y se eliminan **todas**
+  las keys `gps:{id_viaje}:*` de Redis. Si estaba en `BUSCANDO_CONDUCTOR` no hay ETA ni GPS que
+  limpiar (el cleanup es idempotente y se llama igual, sin efecto).
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "Solo se puede cancelar un viaje antes de que comience, el viaje actual esta en estado <ESTADO>" }` | El viaje no está en `BUSCANDO_CONDUCTOR` ni `CONDUCTOR_ASIGNADO` (incluye un viaje ya `CANCELADO`) |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CLIENTE |
+| 403 | `{ "error": "No autorizado para cancelar este viaje" }` | El usuario no es el dueño del viaje |
+| 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
+
+> **Nota:** por ahora **no se envía ninguna notificación WebSocket a otros usuarios** por esta
+> cancelación (en particular, no se notifica al conductor asignado si lo había). Es una decisión
+> explícita, pendiente para el futuro.
+
+---
+
 ### GET /api/viajes/:id/costo-acumulado
 
 Devuelve el costo acumulado del viaje en curso calculado a partir de los datos GPS en Redis.

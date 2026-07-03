@@ -5,9 +5,10 @@ import prisma from '../config/prisma.js';
 import { estimarCosto as estimarCostoService } from '../services/costo.service.js';
 import { conductorEsElegible } from '../services/elegibilidad.service.js';
 import { publicarViajeAConductoresElegibles } from '../services/matching.service.js';
-import { obtenerAcumulado, limpiarGPS } from '../services/gps.service.js';
+import { obtenerAcumulado } from '../services/gps.service.js';
 import { cerrarViaje } from '../services/cierre.service.js';
-import { recalcularEtaInmediato, detenerEmisorEta } from '../services/eta-emisor.js';
+import { recalcularEtaInmediato } from '../services/eta-emisor.js';
+import { limpiarViajeActivo } from '../services/cancelacion.service.js';
 import { calcularYGuardarRuta, obtenerRutaPlaneada } from '../services/ruta.service.js';
 import { io } from '../sockets/index.js';
 
@@ -317,10 +318,10 @@ export async function cancelarViajeConductor(req, res) {
     }),
   ]);
 
-  // Fuera de la transaccion: cortar el emisor de ETA y limpiar TODAS las keys
-  // gps:{id_viaje}:* (mismo cleanup que al finalizar el viaje).
-  detenerEmisorEta(id_viaje);
-  await limpiarGPS(id_viaje);
+  // Fuera de la transaccion: cleanup del estado activo del viaje (corta el
+  // emisor de ETA y borra TODAS las keys gps:{id_viaje}:*). Mismo helper que usa
+  // la cancelacion por cliente.
+  await limpiarViajeActivo(id_viaje);
 
   if (io) {
     // El socket del conductor que cancelo sale del room del viaje (best-effort,
@@ -362,6 +363,59 @@ export async function cancelarViajeConductor(req, res) {
     mensaje: 'Viaje cancelado y republicado',
     id_viaje,
     estado: 'BUSCANDO_CONDUCTOR',
+  });
+}
+
+export async function cancelarViajeCliente(req, res) {
+  const id_viaje = Number(req.params.id);
+
+  const viaje = await prisma.viaje.findUnique({
+    where: { id_viaje },
+    include: { cliente: true },
+  });
+
+  // 1. El viaje existe.
+  if (!viaje) {
+    return res.status(404).json({ error: 'Viaje no encontrado' });
+  }
+
+  // 2. El cliente autenticado es el dueño del viaje.
+  if (viaje.cliente.id_usuario !== req.usuario.id_usuario) {
+    return res.status(403).json({ error: 'No autorizado para cancelar este viaje' });
+  }
+
+  // 3. Solo se puede cancelar antes de que el viaje comience.
+  const ESTADOS_CANCELABLES = ['BUSCANDO_CONDUCTOR', 'CONDUCTOR_ASIGNADO'];
+  if (!ESTADOS_CANCELABLES.includes(viaje.estado)) {
+    return res.status(400).json({
+      error: `Solo se puede cancelar un viaje antes de que comience, el viaje actual esta en estado ${viaje.estado}`,
+    });
+  }
+
+  // El viaje pasa a CANCELADO (terminal). NO se tocan id_conductor ni
+  // id_vehiculo: se preservan como estaban al momento de cancelar, para
+  // conservar el historial de con quien estaba asociado el viaje.
+  await prisma.$transaction([
+    prisma.viaje.update({
+      where: { id_viaje },
+      data: { estado: 'CANCELADO' },
+    }),
+  ]);
+
+  // Fuera de la transaccion: cleanup del estado activo. Si estaba en
+  // CONDUCTOR_ASIGNADO, esto corta el emisor de ETA y borra las keys GPS. Si
+  // estaba en BUSCANDO_CONDUCTOR, limpiarViajeActivo es idempotente (no hay ETA
+  // corriendo y limpiarGPS no falla si no encuentra keys), asi que es seguro
+  // llamarlo igual.
+  await limpiarViajeActivo(id_viaje);
+
+  // Decision explicita: por ahora NO se emite ningun evento WebSocket (ni al
+  // conductor asignado, si lo habia). Queda pendiente para el futuro.
+
+  return res.status(200).json({
+    mensaje: 'Viaje cancelado',
+    id_viaje,
+    estado: 'CANCELADO',
   });
 }
 

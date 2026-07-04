@@ -85,6 +85,7 @@ model Usuario {
   conductor        Conductor?
   empresas_gerente Empresa[]
   metodos_pago     MetodoPago[]
+  viajes_cancelados_por_admin Viaje[] @relation("ViajesCanceladosPorAdmin")
 
   @@map("usuarios")
 }
@@ -280,11 +281,14 @@ model Viaje {
   precio_estimado     Float?
   precio_real         Float?
   creado_en           DateTime    @default(now())
+  motivo_cancelacion     String?
+  cancelado_por_admin_id Int?
 
   cliente          Cliente              @relation(fields: [id_cliente], references: [id_cliente])
   conductor        Conductor?           @relation(fields: [id_conductor], references: [id_conductor])
   vehiculo         Vehiculo?            @relation(fields: [id_vehiculo], references: [id_vehiculo])
   empresa          Empresa?             @relation(fields: [id_empresa], references: [id_empresa])
+  cancelado_por_admin Usuario?          @relation("ViajesCanceladosPorAdmin", fields: [cancelado_por_admin_id], references: [id_usuario])
   paradas          Parada[]
   transacciones    Transaccion[]
   condiciones_req  CondicionRequerida[]

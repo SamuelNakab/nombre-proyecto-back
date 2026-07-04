@@ -1870,6 +1870,366 @@ El endpoint ahora incluye el campo `calificacion` en la respuesta (si existe):
 
 ---
 
+## /admin — Panel de administración
+
+Endpoints de solo lectura + cancelación para el rol `ADMIN`. Sirven para monitorear
+la operación: listar e inspeccionar usuarios y viajes, ver estadísticas agregadas y
+cancelar viajes.
+
+**El registro de un admin no es público:** no existe endpoint de alta. Un admin se
+crea con el script `scripts/crear-admin.js`, que lo da de alta en Firebase **y** en la
+DB en una sola operación (con rollback en Firebase si falla la DB), leyendo las
+variables `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `ADMIN_NOMBRE`, `ADMIN_APELLIDO`,
+`ADMIN_DNI` del entorno. Es idempotente.
+
+**Autenticación:** todos los endpoints requieren `Authorization: Bearer <token>` de un
+usuario con rol `ADMIN`. Sin token → `401`; con token de un rol distinto de ADMIN →
+`403`.
+
+**Nota:** `POST /api/admin/viajes/:id/cancelar` es la **única** cancelación que puede
+interrumpir un viaje en marcha (`EN_CAMINO_A_ORIGEN`, `CARGANDO`, `EN_RUTA`,
+`DESCARGANDO`) — la cancelación por conductor y por cliente solo operan antes de que el
+viaje arranque. Está pensada para debugging/operación en desarrollo.
+
+---
+
+### GET /api/admin/usuarios
+
+Lista paginada de usuarios. Cada usuario trae sus campos públicos (sin `firebase_uid`)
+más el registro asociado a su rol (`cliente` / `conductor` / `empresas_gerente`; los no
+aplicables vienen `null` o `[]`).
+
+**Rol requerido:** `ADMIN`
+
+**Query params (opcionales):**
+- `rol`: filtra por rol. Uno de `CLIENTE`, `CONDUCTOR`, `GERENTE`, `ADMIN`.
+- `page`: número de página (default `1`).
+- `limit`: tamaño de página (default `50`, se topa en `200`).
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "total": 14,
+  "page": 1,
+  "limit": 50,
+  "usuarios": [
+    {
+      "id_usuario": 3,
+      "nombre": "Juan",
+      "apellido": "Pérez",
+      "dni": "12345678",
+      "email": "juan@example.com",
+      "telefono": "+5491112345678",
+      "rol": "CLIENTE",
+      "fecha_registro": "2026-05-09T12:00:00.000Z",
+      "cliente": {
+        "id_cliente": 3,
+        "id_usuario": 3,
+        "cuit": null,
+        "nombre_empresa": null,
+        "direccion_principal": null
+      },
+      "conductor": null,
+      "empresas_gerente": []
+    }
+  ]
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "mensaje de validación" }` | `rol`, `page` o `limit` inválidos |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol ADMIN |
+
+---
+
+### GET /api/admin/usuarios/:id
+
+Detalle de un usuario, con include **condicional según su rol**:
+- `CLIENTE`: datos personales + `cliente` con su historial de viajes creados.
+- `CONDUCTOR`: datos personales + `conductor` con `nro_licencia`,
+  `licencia_vencimiento`, `calificacion_promedio`, `vehiculos` (propios + asignados vía
+  empresa, en un array plano) y su historial de viajes aceptados.
+- `GERENTE`: datos personales + `empresas` (empresa(s) asociada(s), sus conductores y
+  vehículos). Puede venir vacío en el MVP.
+- `ADMIN`: solo datos personales.
+
+**Rol requerido:** `ADMIN`
+
+**Respuesta exitosa — 200 (conductor):**
+```json
+{
+  "id_usuario": 7,
+  "nombre": "Carlos",
+  "apellido": "López",
+  "dni": "23456789",
+  "email": "carlos@example.com",
+  "telefono": "+5491187654321",
+  "rol": "CONDUCTOR",
+  "fecha_registro": "2026-05-01T00:00:00.000Z",
+  "conductor": {
+    "id_conductor": 4,
+    "id_usuario": 7,
+    "nro_licencia": "LIC001",
+    "licencia_vencimiento": "2028-01-01T00:00:00.000Z",
+    "calificacion_promedio": 4.8,
+    "vehiculos": [
+      {
+        "id_vehiculo": 10,
+        "patente": "FLT001",
+        "marca": "Ford",
+        "modelo": "Transit",
+        "anio": 2020,
+        "color": "Blanco",
+        "tipo_vehiculo": "furgon",
+        "condiciones": []
+      }
+    ],
+    "vehiculos_propios": [ "..." ],
+    "conductor_vehiculos": [ "..." ],
+    "viajes": [
+      { "id_viaje": 42, "estado": "FINALIZADO", "precio_real": 1750, "creado_en": "2026-05-09T12:00:00.000Z" }
+    ]
+  }
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol ADMIN |
+| 404 | `{ "error": "Usuario no encontrado" }` | No existe usuario con ese id |
+
+---
+
+### GET /api/admin/viajes
+
+Lista paginada de viajes con filtros. Cada viaje trae sus datos básicos + `cliente`,
++ `conductor` (si está asignado) + `_count.paradas`.
+
+**Rol requerido:** `ADMIN`
+
+**Query params (opcionales):**
+- `estado`: cualquier `EstadoViaje` (`BUSCANDO_CONDUCTOR` … `CANCELADO`).
+- `cantidad_paradas`: número exacto de paradas del viaje.
+- `zona`: `CABA` | `PROVINCIA` | `MIXTO`.
+- `desde`: fecha ISO (inclusive), filtra por `creado_en`.
+- `hasta`: fecha ISO (inclusive), filtra por `creado_en`.
+- `page` (default `1`), `limit` (default `50`, máx `200`).
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "total": 74,
+  "page": 1,
+  "limit": 50,
+  "viajes": [
+    {
+      "id_viaje": 42,
+      "zona": "CABA",
+      "estado": "BUSCANDO_CONDUCTOR",
+      "precio_estimado": 2500,
+      "precio_real": null,
+      "fecha_programada": "2026-07-01T10:00:00.000Z",
+      "creado_en": "2026-05-09T12:00:00.000Z",
+      "cliente": {
+        "usuario": { "nombre": "Juan", "apellido": "Pérez", "email": "juan@example.com" }
+      },
+      "conductor": null,
+      "_count": { "paradas": 2 }
+    }
+  ]
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "mensaje de validación" }` | Algún filtro inválido (`estado`, `zona`, `cantidad_paradas`, `desde`, `hasta`, `page`, `limit`) |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol ADMIN |
+
+---
+
+### GET /api/admin/viajes/:id
+
+Detalle completo de un viaje: paradas, cliente completo, conductor completo (si existe),
+vehículo, precios (`precio_estimado` / `precio_real`), `fee` calculado sobre el precio
+real (`precio_real * FEE_PORCENTAJE / 100`, `null` si aún no hay precio), `remito_url`
+(solo si el viaje está `FINALIZADO`, si no `null`), `calificacion` (si existe),
+`motivo_cancelacion` y `cancelado_por_admin` (si fue cancelado por un admin).
+
+**Rol requerido:** `ADMIN`
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "id_viaje": 42,
+  "zona": "CABA",
+  "estado": "FINALIZADO",
+  "precio_estimado": 2500,
+  "precio_real": 1750,
+  "fee": 175,
+  "remito_url": "https://pub.r2.example.com/remitos/42.pdf",
+  "motivo_cancelacion": null,
+  "cancelado_por_admin_id": null,
+  "cancelado_por_admin": null,
+  "fecha_programada": "2026-07-01T10:00:00.000Z",
+  "creado_en": "2026-05-09T12:00:00.000Z",
+  "paradas": [
+    { "orden": 1, "direccion": "Plaza de Mayo, CABA", "estado": "ENTREGADO", "fecha_entrega": "2026-05-09T13:00:00.000Z" }
+  ],
+  "condiciones_req": [],
+  "cliente": { "id_cliente": 3, "usuario": { "nombre": "Juan", "apellido": "Pérez", "email": "juan@example.com" } },
+  "conductor": { "id_conductor": 4, "calificacion_promedio": 4.8, "usuario": { "nombre": "Carlos", "apellido": "López" } },
+  "vehiculo": { "id_vehiculo": 10, "patente": "FLT001", "marca": "Ford", "modelo": "Transit" },
+  "calificacion": { "puntaje": 5, "comentario": "Excelente", "fecha_hora": "2026-05-09T13:05:00.000Z" }
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol ADMIN |
+| 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
+
+---
+
+### GET /api/admin/estadisticas
+
+Devuelve, en un solo request, todas las métricas agregadas (calculadas con queries
+agregadas en la DB, no en memoria). Los montos de `plata` cuentan **solo viajes
+`FINALIZADO`** — los `CANCELADO` no suman plata para nadie. El fee usa la variable de
+entorno `FEE_PORCENTAJE` (entero, default `10`).
+
+**Rol requerido:** `ADMIN`
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "usuarios": {
+    "total": 14,
+    "por_rol": { "CLIENTE": 6, "CONDUCTOR": 6, "GERENTE": 1, "ADMIN": 1 },
+    "registrados_ultimo_mes": 14,
+    "registrados_por_dia_ultimos_30_dias": [
+      { "fecha": "2026-06-28", "cantidad": 9 },
+      { "fecha": "2026-06-29", "cantidad": 5 }
+    ]
+  },
+  "viajes": {
+    "total": 74,
+    "por_estado": {
+      "BUSCANDO_CONDUCTOR": 32, "CONDUCTOR_ASIGNADO": 0, "EN_CAMINO_A_ORIGEN": 1,
+      "CARGANDO": 0, "EN_RUTA": 0, "DESCARGANDO": 0, "FINALIZADO": 5, "CANCELADO": 36
+    },
+    "por_dia_ultimos_30_dias": [
+      { "fecha": "2026-06-29", "cantidad_creados": 74, "cantidad_finalizados": 5 }
+    ]
+  },
+  "plata": {
+    "total_precio_real_finalizados": 63.33,
+    "total_fee_app": 6.333,
+    "total_neto_conductores": 56.997,
+    "top_conductores_por_ganancia": [
+      { "id_conductor": 4, "nombre": "Carlos", "apellido": "López", "total_ganado": 63.33, "cantidad_viajes": 5 }
+    ],
+    "top_clientes_por_gasto": [
+      { "id_cliente": 3, "nombre": "Juan", "apellido": "Pérez", "total_gastado": 63.33, "cantidad_viajes": 5 }
+    ]
+  }
+}
+```
+
+- `total_fee_app` = `total_precio_real_finalizados * FEE_PORCENTAJE / 100`.
+- `total_neto_conductores` = `total_precio_real_finalizados - total_fee_app`.
+  (Se cumple `total_fee_app + total_neto_conductores == total_precio_real_finalizados`.)
+- `top_conductores_por_ganancia` / `top_clientes_por_gasto`: top 10 por suma de
+  `precio_real` sobre viajes finalizados, orden descendente.
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol ADMIN |
+
+---
+
+### POST /api/admin/viajes/:id/cancelar
+
+Cancela un viaje en cualquier estado **excepto** `FINALIZADO` y `CANCELADO`. El viaje pasa
+a `CANCELADO` (terminal), se guarda el `motivo_cancelacion` y el admin que lo canceló
+(`cancelado_por_admin_id`). Se **preservan** `id_conductor`/`id_vehiculo` y las paradas
+ya `ENTREGADO` (historial). Si el viaje tenía (o tuvo) tracking activo —
+`CONDUCTOR_ASIGNADO` en adelante— se detiene el emisor de ETA y se limpian todas las keys
+`gps:{id_viaje}:*` de Redis (helper `limpiarViajeActivo`).
+
+**Rol requerido:** `ADMIN`
+
+**Body (opcional):**
+```json
+{ "motivo": "Cancelado por soporte: cliente reportó problema" }
+```
+- `motivo`: string opcional. Si se omite, se guarda `null`.
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "mensaje": "Viaje cancelado por admin",
+  "id_viaje": 42,
+  "estado": "CANCELADO",
+  "motivo": "Cancelado por soporte: cliente reportó problema"
+}
+```
+
+**Comportamiento adicional:** emite el evento `viaje:cancelado_por_admin` al room del
+viaje y al room personal del cliente (ver más abajo).
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "No se puede cancelar un viaje en estado FINALIZADO" }` | El viaje ya está finalizado |
+| 400 | `{ "error": "No se puede cancelar un viaje en estado CANCELADO" }` | El viaje ya está cancelado |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol ADMIN |
+| 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
+
+---
+
+### WebSocket — Evento: viaje:cancelado_por_admin
+
+**Dirección:** servidor → room del viaje **y** room personal del cliente
+**Quién lo recibe:** el conductor asignado y el cliente conectados al room
+`viaje:{id_viaje}`, y el cliente en su room personal `usuario:{id_usuario_cliente}`
+**Cuándo:** cuando un admin ejecuta `POST /api/admin/viajes/:id/cancelar`
+
+**Payload:**
+```json
+{
+  "id_viaje": 42,
+  "motivo": "Cancelado por soporte: cliente reportó problema",
+  "estado": "CANCELADO"
+}
+```
+
+`motivo` es `null` si el admin no envió uno.
+
+**Cómo escucharlo:**
+```js
+socket.on('viaje:cancelado_por_admin', (data) => {
+  // mostrar aviso: el viaje fue cancelado por un administrador
+  console.log(`Viaje ${data.id_viaje} cancelado por admin. Motivo: ${data.motivo ?? '—'}`);
+});
+```
+
+Es la única cancelación de viaje que emite evento por ahora (las cancelaciones por
+conductor y por cliente no notifican por WebSocket — pendiente para el futuro).
+
+---
+
 ## Convenciones generales
 
 - Todos los errores devuelven `{ "error": "mensaje legible" }`

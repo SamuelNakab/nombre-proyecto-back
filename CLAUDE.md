@@ -8,13 +8,14 @@ MVP: CABA + Gran Buenos Aires.
 
 ## Estado actual del proyecto
 - Fases 0-5 COMPLETAS
-- Gestion de vehiculos, campo descripcion, ETA + recalculo de ruta, ruta_planeada al front COMPLETO
+- Gestion de vehiculos, descripcion, ETA/recalculo/ruta_planeada COMPLETO
 - Pipeline CI/CD + deploy a Railway por environment COMPLETO
 - Cancelacion de viaje por conductor COMPLETO
-- **En curso: cancelacion de viaje por parte del cliente**
+- Cancelacion de viaje por cliente COMPLETO
+- Panel de administracion (rol ADMIN) COMPLETO
 
 ## Stack
-- Node.js 22 con ES Modules (import/export — NUNCA require)
+- Node.js 22 con ES Modules
 - Express
 - PostgreSQL en Neon — Prisma 6
 - Firebase Admin SDK
@@ -39,75 +40,166 @@ MVP: CABA + Gran Buenos Aires.
 - Hay drift en el historial. Usar npx prisma db push para cambios de schema.
 - No usar prisma migrate reset sin autorizacion explicita de Samuel.
 
-## Estados del viaje
+## Roles
+- CLIENTE, CONDUCTOR, GERENTE (para el futuro) y ADMIN.
+- ADMIN existe en el enum pero hasta ahora no tenia endpoints. Esta tarea
+  agrega los endpoints admin y un script para crear cuentas admin.
 
-| Transicion                              | Trigger                                        |
-|-----------------------------------------|------------------------------------------------|
-| BUSCANDO_CONDUCTOR → CONDUCTOR_ASIGNADO | Conductor acepta                               |
-| BUSCANDO_CONDUCTOR → CANCELADO          | **NUEVO: cliente cancela (esta tarea)**        |
-| CONDUCTOR_ASIGNADO → BUSCANDO_CONDUCTOR | Conductor cancela (ya implementado)            |
-| CONDUCTOR_ASIGNADO → CANCELADO          | **NUEVO: cliente cancela (esta tarea)**        |
-| CONDUCTOR_ASIGNADO → EN_CAMINO_A_ORIGEN | Automatico, primer ping GPS                    |
-| EN_CAMINO_A_ORIGEN → CARGANDO           | Manual via PATCH /viajes/:id/estado            |
-| CARGANDO → EN_RUTA                      | Manual via PATCH /viajes/:id/estado            |
-| EN_RUTA → DESCARGANDO                   | Manual via PATCH /viajes/:id/estado            |
-| DESCARGANDO → FINALIZADO                | QR de ultima parada confirmado                 |
+## Panel de administracion (esta tarea)
 
-CANCELADO es un estado terminal — no hay transiciones desde CANCELADO a nada.
+### Objetivo
+Un rol ADMIN puede leer datos generales de la app, ver detalles de
+usuarios y viajes, ver estadisticas agregadas, y cancelar viajes en
+cualquier estado excepto FINALIZADO y CANCELADO. Todos los endpoints
+protegidos con rol ADMIN.
 
-## Cancelacion de viaje por cliente (esta tarea)
-- Solo en estados BUSCANDO_CONDUCTOR o CONDUCTOR_ASIGNADO. Cualquier otro
-  estado (EN_CAMINO_A_ORIGEN, CARGANDO, EN_RUTA, DESCARGANDO, FINALIZADO,
-  CANCELADO): 400 con error claro.
-- El viaje pasa a estado CANCELADO. Se guarda id_conductor e id_vehiculo
-  tal como estaban al momento de cancelar (para historial). No se limpian
-  esos campos — el viaje CANCELADO retiene la informacion de con quien
-  estaba asociado, si estaba.
-- Si el estado era CONDUCTOR_ASIGNADO al momento de cancelar:
-  * Detener el emisor de ETA (detenerEmisorEta).
-  * Limpiar TODAS las keys gps:{id_viaje}:* en Redis (limpiarGPS).
-- Si el estado era BUSCANDO_CONDUCTOR:
-  * No hay Redis ni ETA que limpiar (ruta_planeada esta en Redis pero
-    limpiarGPS es idempotente y no falla si no encuentra keys, asi que
-    llamarla igual es seguro).
-- No se envia notificacion WebSocket a nadie por ahora (queda pendiente:
-  eventualmente notificar al conductor asignado si lo habia).
+### Autenticacion
+Un admin es un usuario mas, con firebase_uid, email/contrasena y rol ADMIN.
+No hay endpoint publico de registro. Se crea via script/seed que crea el
+usuario en Firebase Y en la DB en una sola operacion (con rollback si
+falla la DB, igual que el flujo de registro cliente/conductor existente).
 
-## Cancelacion de viaje por conductor (ya implementado)
-- Solo en estado CONDUCTOR_ASIGNADO.
-- El viaje vuelve a BUSCANDO_CONDUCTOR con id_conductor y id_vehiculo en null.
-- Se detiene el emisor de ETA y se limpia Redis.
-- El viaje se republica emitiendo viaje:disponible a los conductores elegibles.
-- El conductor que cancelo sigue siendo elegible.
+Script: scripts/crear-admin.js
+- Lee ADMIN_EMAIL, ADMIN_PASSWORD, ADMIN_NOMBRE, ADMIN_APELLIDO, ADMIN_DNI
+  del entorno. Son variables OPCIONALES: solo hacen falta al correr este
+  script para crear un admin, no en el runtime normal ni en el pipeline CI/CD.
+- Idempotente: si el email ya existe (en Firebase o DB), lo informa y no
+  duplica. Si existe en Firebase pero no en la DB, reutiliza el uid y
+  completa el registro en la DB.
+- Se corre manualmente contra la DB target (production o staging), p. ej.:
+  ADMIN_EMAIL=... ADMIN_PASSWORD=... ADMIN_NOMBRE=... ADMIN_APELLIDO=... \
+  ADMIN_DNI=... node scripts/crear-admin.js
 
-## Refactor esperado (esta tarea)
-La logica de "poner CANCELADO/limpiar Redis/detener ETA" se comparte entre
-cancelar-conductor y cancelar-cliente. Extraer esa parte a un helper reusable
-(por ejemplo en src/services/cancelacion.service.js con una funcion tipo
-limpiarViajeActivo(id_viaje) que detiene ETA y limpia Redis, para reusar
-desde ambos endpoints). Refactorizar cancelar-conductor para que use el
-helper — no debe cambiar su comportamiento externo, sus tests actuales deben
-seguir pasando.
+### Endpoints
 
-## WebSockets — Rooms y eventos
-- Room por viaje: viaje:{id_viaje}
-- Room personal por usuario: usuario:{id_usuario}
+Todos bajo /api/admin/*, todos requieren rol ADMIN (403 si no lo es).
 
-Eventos relevantes al modelo actual: viaje:disponible, viaje:conductor_asignado,
-viaje:no_disponible, viaje:ya_asignado, mapa:actualizar, eta:actualizar,
-ruta:recalculada, viaje:finalizado, alerta:desvio, alerta:parada.
+1. GET /api/admin/usuarios
+   - Query params opcionales: rol (CLIENTE|CONDUCTOR|GERENTE|ADMIN),
+     page (default 1), limit (default 50, max 200)
+   - Respuesta: { total, page, limit, usuarios: [...] }
+   - Cada usuario incluye: campos publicos del usuario + su rol especifico
+     con los datos asociados (cliente/conductor/gerente/admin)
 
-## Redis — Keys de GPS
-gps:{id_viaje}:ultima
-gps:{id_viaje}:historial
-gps:{id_viaje}:ruta
-gps:{id_viaje}:acumulado
-gps:{id_viaje}:pings_detenido
-gps:{id_viaje}:eta
-gps:{id_viaje}:ultimo_recalculo
-gps:{id_viaje}:pings_desviado
+2. GET /api/admin/usuarios/:id
+   - Detalle completo de un usuario segun su rol:
+     * CLIENTE: datos personales + historial de viajes creados
+     * CONDUCTOR: datos personales + licencia + vehiculos + calificacion
+       promedio + historial de viajes aceptados
+     * GERENTE: datos personales + empresa asociada + conductores de la
+       empresa + vehiculos de la empresa (si el modelo lo tiene disponible;
+       en el MVP actual puede que este vacio)
+     * ADMIN: solo datos personales
+   - 404 si no existe
 
-limpiarGPS (en gps.service.js) borra TODAS las keys gps:{id_viaje}:* de una vez.
+3. GET /api/admin/viajes
+   - Query params opcionales:
+     * estado (cualquier EstadoViaje)
+     * cantidad_paradas (numero exacto)
+     * zona (CABA|PROVINCIA|MIXTO)
+     * desde (fecha ISO, inclusive, filtra por creado_en)
+     * hasta (fecha ISO, inclusive)
+     * page (default 1), limit (default 50, max 200)
+   - Respuesta: { total, page, limit, viajes: [...] }
+   - Cada viaje incluye datos basicos + cliente + conductor si asignado
+
+4. GET /api/admin/viajes/:id
+   - Detalle completo del viaje: paradas, cliente completo, conductor
+     completo si existe, vehiculo, precios (estimado/real), fee, remito_url
+     si existe, calificacion si existe, motivo_cancelacion si existe.
+   - 404 si no existe
+
+5. GET /api/admin/estadisticas
+   - Un solo request, devuelve un objeto con todas las metricas:
+     {
+       usuarios: {
+         total,
+         por_rol: { CLIENTE, CONDUCTOR, GERENTE, ADMIN },
+         registrados_ultimo_mes,
+         registrados_por_dia_ultimos_30_dias: [{ fecha, cantidad }]
+       },
+       viajes: {
+         total,
+         por_estado: { BUSCANDO_CONDUCTOR, CONDUCTOR_ASIGNADO, ... },
+         por_dia_ultimos_30_dias: [{ fecha, cantidad_creados,
+                                      cantidad_finalizados }]
+       },
+       plata: {
+         total_precio_real_finalizados,     // suma de precio_real de
+                                             // viajes FINALIZADO
+         total_fee_app,                     // suma de fee sobre esos
+         total_neto_conductores,            // suma de precio_neto
+                                             // (precio_real - fee)
+         top_conductores_por_ganancia: [    // top 10, cada uno con
+           { id_conductor, nombre, apellido, // sus datos + total ganado
+             total_ganado, cantidad_viajes }
+         ],
+         top_clientes_por_gasto: [          // top 10
+           { id_cliente, nombre, apellido,
+             total_gastado, cantidad_viajes }
+         ]
+       }
+     }
+
+6. POST /api/admin/viajes/:id/cancelar
+   - Rol ADMIN
+   - Body: { motivo: string opcional }
+   - Validaciones:
+     * Viaje existe (404 si no)
+     * Estado del viaje NO es FINALIZADO ni CANCELADO (400 si lo es, con
+       mensaje claro)
+   - Logica (selectiva por estado — enfoque 1):
+     * Si el estado era CONDUCTOR_ASIGNADO en adelante (o sea, hay o hubo
+       tracking activo): llamar a limpiarViajeActivo(id_viaje) — el helper
+       que ya existe y detiene ETA emisor + limpia keys Redis.
+     * En cualquier caso: cambiar viaje.estado a CANCELADO. Guardar el
+       motivo en un campo motivo_cancelacion (nuevo, se agrega al schema).
+       Guardar quien lo cancelo en cancelado_por_admin_id (nuevo,
+       referencia al id_usuario del admin).
+     * Las paradas que ya estaban ENTREGADO mantienen su estado (historial).
+     * Emitir viaje:cancelado_por_admin al room viaje:{id_viaje} Y al
+       room personal usuario:{id_usuario_cliente} (si el cliente existe),
+       con payload { id_viaje, motivo }.
+   - Respuesta 200: { mensaje: "Viaje cancelado por admin", id_viaje,
+     estado: "CANCELADO", motivo }
+
+### Cambios de schema requeridos
+Agregar en modelo Viaje:
+- motivo_cancelacion  String?
+- cancelado_por_admin_id  Int?  (referencia opcional a usuarios.id_usuario)
+
+Aplicar con: npx prisma db push (no crear migracion — sigue la regla de
+drift ya documentada).
+
+### FEE_PORCENTAJE
+Variable de entorno nueva, default 10 (porcentaje entero). Se usa en las
+estadisticas para calcular total_fee_app y total_neto_conductores.
+
+## Cancelaciones de viaje — resumen unificado
+- Por CONDUCTOR: solo CONDUCTOR_ASIGNADO → viaje vuelve a BUSCANDO_CONDUCTOR
+  y se republica.
+- Por CLIENTE: BUSCANDO_CONDUCTOR o CONDUCTOR_ASIGNADO → viaje termina en
+  CANCELADO.
+- Por ADMIN: cualquier estado excepto FINALIZADO y CANCELADO → viaje
+  termina en CANCELADO. Es la unica cancelacion que puede interrumpir un
+  viaje en marcha (EN_CAMINO_A_ORIGEN, CARGANDO, EN_RUTA, DESCARGANDO).
+
+Las tres reutilizan el helper limpiarViajeActivo(id_viaje) que detiene ETA
+y limpia Redis.
+
+## WebSockets — eventos nuevos (esta tarea)
+
+| Evento                     | Direccion            | Destinatario                          |
+|----------------------------|----------------------|---------------------------------------|
+| viaje:cancelado_por_admin  | servidor → room      | Room viaje:{id_viaje}                 |
+| viaje:cancelado_por_admin  | servidor → cliente   | Room personal usuario:{id_cliente}    |
+
+Payload: { id_viaje, motivo, estado: "CANCELADO" }
+
+## Redis — Keys de GPS (sin cambios)
+gps:{id_viaje}:ultima, :historial, :ruta, :acumulado, :pings_detenido,
+:eta, :ultimo_recalculo, :pings_desviado
+limpiarGPS (en gps.service.js) borra todas de una vez.
 
 ## Deploy
 - Backend: Railway (production: branch main, staging: branch develop)
@@ -122,3 +214,5 @@ npm run test
 node scripts/test-fase5.js
 node scripts/test-cancelacion-conductor.js
 node scripts/test-cancelacion-cliente.js
+node scripts/test-admin.js
+node scripts/crear-admin.js

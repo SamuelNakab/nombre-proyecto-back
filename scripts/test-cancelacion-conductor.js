@@ -1,5 +1,6 @@
 import { io } from 'socket.io-client';
 import redis from '../src/config/redis.js';
+import prisma from '../src/config/prisma.js';
 
 const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
 const BASE = 'http://localhost:3000';
@@ -99,6 +100,7 @@ async function cleanup(sockets) {
   for (const s of sockets) {
     try { s?.disconnect(); } catch { /* noop */ }
   }
+  try { await prisma.$disconnect(); } catch { /* noop */ }
   try { await redis.quit(); } catch { /* noop */ }
 }
 
@@ -217,7 +219,13 @@ async function main() {
     v1Reasig.estado === 'CONDUCTOR_ASIGNADO' && v1Reasig.id_conductor !== null,
     `estado=${v1Reasig.estado} id_conductor=${v1Reasig.id_conductor}`);
 
-  // Primer ping tras reaceptar → EN_CAMINO_A_ORIGEN, GPS/ruta arrancan desde cero
+  // El viaje se inicia con el boton (POST /:id/iniciar) — el inicio automatico por
+  // primer ping GPS ya no existe. Traemos fecha_programada a "ahora" (via Prisma)
+  // para pasar la ventana de inicio, iniciamos y recien ahi mandamos el ping:
+  // GPS/ruta arrancan desde cero tras la reaceptacion.
+  await prisma.viaje.update({ where: { id_viaje: v1 }, data: { fecha_programada: new Date() } });
+  await api('POST', `/api/viajes/${v1}/iniciar`, null, conductorAToken);
+
   sA.emit('conductor:ubicacion', {
     id_viaje: v1, lat: PARADA_1.lat, lng: PARADA_1.lng, timestamp: Date.now(),
   });

@@ -1,6 +1,7 @@
 import { io } from 'socket.io-client';
 import { execFileSync } from 'child_process';
 import redis from '../src/config/redis.js';
+import prisma from '../src/config/prisma.js';
 
 const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
 const BASE = 'http://localhost:3000';
@@ -98,6 +99,10 @@ async function finalizarViaje(clienteToken, conductorToken, sConductor) {
   await esperar(1200);
   sConductor.emit('viaje:aceptar', { id_viaje });
   await esperar(2000);
+  // El viaje arranca con el boton (POST /:id/iniciar); el inicio automatico por
+  // primer ping GPS ya no existe. Fecha a "ahora" para pasar la ventana de inicio.
+  await prisma.viaje.update({ where: { id_viaje }, data: { fecha_programada: new Date() } });
+  await api('POST', `/api/viajes/${id_viaje}/iniciar`, null, conductorToken);
   sConductor.emit('conductor:ubicacion', { id_viaje, lat: PARADA_1.lat, lng: PARADA_1.lng, timestamp: Date.now() });
   await esperar(1000);
   await api('PATCH', `/api/viajes/${id_viaje}/estado`, { estado: 'EN_RUTA' }, conductorToken);
@@ -113,6 +118,7 @@ async function finalizarViaje(clienteToken, conductorToken, sConductor) {
 
 async function cleanup(sockets) {
   for (const s of sockets) { try { s?.disconnect(); } catch { /* noop */ } }
+  try { await prisma.$disconnect(); } catch { /* noop */ }
   try { await redis.quit(); } catch { /* noop */ }
 }
 
@@ -291,6 +297,10 @@ async function main() {
   await esperar(1200);
   sConductor.emit('viaje:aceptar', { id_viaje: vRuta });
   await esperar(2000);
+  // Iniciar con el boton antes de los pings: sin iniciar, el GPS se rechaza y no
+  // habria keys gps:{id}:* que verificar al cancelar.
+  await prisma.viaje.update({ where: { id_viaje: vRuta }, data: { fecha_programada: new Date() } });
+  await api('POST', `/api/viajes/${vRuta}/iniciar`, null, conductorToken);
   sConductor.emit('conductor:ubicacion', { id_viaje: vRuta, lat: PARADA_1.lat, lng: PARADA_1.lng, timestamp: Date.now() });
   await esperar(1000);
   await api('PATCH', `/api/viajes/${vRuta}/estado`, { estado: 'EN_RUTA' }, conductorToken);

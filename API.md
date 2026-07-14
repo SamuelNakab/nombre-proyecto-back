@@ -365,6 +365,8 @@ Las tarifas se calculan automáticamente según la zona y si la `fecha_programad
   "fecha_programada": "2026-07-01T10:00:00.000Z",
   "descripcion": "Carga frágil, llamar al llegar, portón azul",
   "estado": "BUSCANDO_CONDUCTOR",
+  "fecha_inicio": null,
+  "puntualidad_inicio": null,
   "precio_estimado": 4500,
   "precio_real": null,
   "creado_en": "2026-05-09T12:00:00.000Z",
@@ -399,7 +401,8 @@ Las tarifas se calculan automáticamente según la zona y si la `fecha_programad
 
 - `ruta_planeada`: array de puntos `[lng, lat]` (ver [Formato de ruta](#formato-de-ruta)). La
   ruta se calcula al crear el viaje. Es **`null`** si Google Maps falla en ese momento; en ese
-  caso se reintenta automáticamente en el primer ping GPS y el viaje se crea igual (201).
+  caso se reintenta automáticamente en el primer ping GPS —es decir, una vez que el conductor
+  inició el viaje— y el viaje se crea igual (201).
 
 **Comportamiento adicional:** después de crear el viaje, el servidor emite el evento
 `viaje:disponible` via WebSocket a todos los conductores elegibles conectados.
@@ -485,6 +488,8 @@ Devuelve todos los viajes del cliente autenticado, del más reciente al más ant
     "precio_real": null,
     "estado": "BUSCANDO_CONDUCTOR",
     "fecha_programada": "2026-07-01T10:00:00.000Z",
+    "fecha_inicio": null,
+    "puntualidad_inicio": null,
     "creado_en": "2026-05-09T12:00:00.000Z",
     "paradas": [
       { "orden": 1, "direccion": "Plaza de Mayo, CABA" }
@@ -570,6 +575,8 @@ Detalle de un viaje. Solo puede acceder el cliente que lo creó o el conductor a
   "descripcion": "Carga frágil, llamar al llegar, portón azul",
   "estado": "CONDUCTOR_ASIGNADO",
   "fecha_programada": "2026-07-01T10:00:00.000Z",
+  "fecha_inicio": null,
+  "puntualidad_inicio": null,
   "creado_en": "2026-05-09T12:00:00.000Z",
   "paradas": [
     {
@@ -608,6 +615,10 @@ Detalle de un viaje. Solo puede acceder el cliente que lo creó o el conductor a
 - `ruta_planeada`: array de puntos `[lng, lat]` (ver [Formato de ruta](#formato-de-ruta)). Es
   **`null`** si el viaje ya terminó (`FINALIZADO`/`CANCELADO`, con el cache de Redis ya limpio)
   o si la ruta nunca llegó a calcularse.
+- `fecha_inicio`: momento real en que el conductor pulsó **Iniciar viaje** (ISO 8601). Es
+  **`null`** mientras el viaje no se haya iniciado (`BUSCANDO_CONDUCTOR`/`CONDUCTOR_ASIGNADO`).
+- `puntualidad_inicio`: `"A_TIEMPO"` | `"TARDE"` | `"MUY_TARDE"`, calculado al iniciar contra la
+  `fecha_programada` (umbrales en `POST /api/viajes/:id/iniciar`). **`null`** si aún no se inició.
 
 **Errores posibles:**
 | Status | Body | Causa |
@@ -829,6 +840,35 @@ socket.on('viaje:cancelado_sin_conductor', (data) => {
 
 ---
 
+### Evento: viaje:iniciado
+
+**Dirección:** servidor → cliente  
+**Quién lo recibe:** el cliente dueño del viaje, en su **room personal** `usuario:{id_usuario_cliente}`  
+**Cuándo:** el conductor asignado pulsa **Iniciar viaje** (cuando `POST /api/viajes/:id/iniciar` responde `200`)
+
+**Payload:**
+```json
+{
+  "id_viaje": 42,
+  "fecha_inicio": "2026-07-14T21:51:39.023Z",
+  "puntualidad_inicio": "A_TIEMPO"
+}
+```
+
+- `fecha_inicio`: momento real del inicio (ISO 8601).
+- `puntualidad_inicio`: `"A_TIEMPO"` | `"TARDE"` | `"MUY_TARDE"` — umbrales documentados en
+  `POST /api/viajes/:id/iniciar`.
+
+**Cómo escucharlo:**
+```js
+socket.on('viaje:iniciado', (data) => {
+  console.log(`El viaje ${data.id_viaje} arrancó (${data.puntualidad_inicio})`);
+});
+```
+
+> Se emite al room **personal** del cliente (no al room del viaje): le llega aunque no esté
+> siguiendo el mapa en ese momento.
+
 ---
 
 ### PATCH /api/viajes/:id/estado
@@ -870,14 +910,78 @@ Estados válidos para este endpoint: `CARGANDO`, `DESCARGANDO`.
 
 ---
 
+### POST /api/viajes/:id/iniciar
+
+El conductor asignado inicia el viaje (**botón "Iniciar viaje"**). Es la **única** forma de pasar
+de `CONDUCTOR_ASIGNADO` a `EN_CAMINO_A_ORIGEN`: el inicio automático por primer ping GPS **ya no
+existe**. Registra el momento real del inicio (`fecha_inicio`) y califica la puntualidad
+(`puntualidad_inicio`) contra la `fecha_programada`.
+
+> **Flujo correcto del mobile:** botón → `200` → **recién ahí** arrancar el GPS. Los pings
+> enviados antes de iniciar se rechazan (ver el evento `conductor:ubicacion`).
+
+**Rol requerido:** `CONDUCTOR` (debe ser el conductor asignado al viaje)
+
+**Body:** Ninguno (vacío)
+
+**Validaciones en orden:**
+1. El viaje existe. Si no → `404`.
+2. El usuario autenticado es el conductor asignado al viaje. Si no → `403`.
+3. El viaje está en estado `CONDUCTOR_ASIGNADO`. Cualquier otro estado → `400`.
+4. Ventana de tiempo (ver abajo). Demasiado temprano → `400`.
+
+**Ventana de tiempo:**
+El viaje puede iniciarse a partir de `fecha_programada - VENTANA_INICIO_MINUTOS` (variable de
+entorno, default `30`). **No hay límite superior**: el conductor puede iniciar aunque la hora
+programada ya haya pasado, sin importar cuánto. Si intenta iniciar antes de que abra la ventana
+→ `400`, con la hora de apertura en hora local de Argentina (`America/Argentina/Buenos_Aires`),
+formato `HH:MM`.
+
+**Puntualidad (`puntualidad_inicio`):**
+Se calcula con el retraso en minutos entre el momento del inicio y la `fecha_programada`.
+
+| Valor | Condición (retraso respecto de `fecha_programada`) |
+|-------|----------------------------------------------------|
+| `A_TIEMPO` | retraso ≤ `PUNTUALIDAD_TARDE_MINUTOS` (default `30`). Incluye iniciar **antes** de hora (retraso negativo). |
+| `TARDE` | `PUNTUALIDAD_TARDE_MINUTOS` < retraso ≤ `PUNTUALIDAD_MUY_TARDE_MINUTOS` (default `120`) |
+| `MUY_TARDE` | retraso > `PUNTUALIDAD_MUY_TARDE_MINUTOS` (default `120`) |
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "mensaje": "Viaje iniciado",
+  "id_viaje": 42,
+  "estado": "EN_CAMINO_A_ORIGEN",
+  "fecha_inicio": "2026-07-14T21:51:39.023Z",
+  "puntualidad_inicio": "A_TIEMPO"
+}
+```
+
+**Efectos secundarios:**
+- El viaje pasa a `EN_CAMINO_A_ORIGEN` y se persisten `fecha_inicio` y `puntualidad_inicio`.
+- Se emite `viaje:iniciado` al room personal del cliente (`usuario:{id_usuario_cliente}`).
+- A partir de este momento se aceptan los pings `conductor:ubicacion` de este viaje.
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "Solo se puede iniciar un viaje en estado CONDUCTOR_ASIGNADO, el viaje actual esta en estado <ESTADO>" }` | El viaje no está en `CONDUCTOR_ASIGNADO`. Incluye el **doble inicio** (ya está en `EN_CAMINO_A_ORIGEN`) |
+| 400 | `{ "error": "El viaje solo puede iniciarse a partir de las <HH:MM>" }` | Todavía no abrió la ventana de inicio |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
+| 403 | `{ "error": "No autorizado para iniciar este viaje" }` | El viaje está asignado a otro conductor |
+| 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
+
+---
+
 ### POST /api/viajes/:id/cancelar-conductor
 
 El conductor asignado cancela el viaje y lo devuelve al pool de búsqueda. El viaje
 **mantiene su `id_viaje`**, vuelve a estado `BUSCANDO_CONDUCTOR` con `id_conductor` e
 `id_vehiculo` en `null`, y se vuelve a publicar a los conductores elegibles reutilizando
 el mismo flujo que la creación (`POST /api/viajes`). Solo se permite mientras el viaje está
-en estado `CONDUCTOR_ASIGNADO` (es decir, antes del primer ping GPS, que ya lo lleva a
-`EN_CAMINO_A_ORIGEN`).
+en estado `CONDUCTOR_ASIGNADO` (es decir, hasta el instante en que el conductor pulsa
+**Iniciar viaje** con `POST /api/viajes/:id/iniciar`, que ya lo lleva a `EN_CAMINO_A_ORIGEN`).
 
 **Rol requerido:** `CONDUCTOR` (debe ser el conductor asignado al viaje)
 
@@ -905,8 +1009,8 @@ en estado `CONDUCTOR_ASIGNADO` (es decir, antes del primer ping GPS, que ya lo l
 - Se eliminan **todas** las keys `gps:{id_viaje}:*` de Redis (mismo cleanup que al finalizar).
 - Se vuelve a emitir el evento `viaje:disponible` a los conductores elegibles conectados,
   reutilizando el flujo de la creación del viaje. El recálculo de `ruta_planeada` con Google
-  Maps ocurre cuando el siguiente conductor acepte y se haga el primer ping, igual que en un
-  viaje nuevo.
+  Maps ocurre cuando el siguiente conductor acepte, inicie el viaje y se haga el primer ping,
+  igual que en un viaje nuevo.
 
 **Errores posibles:**
 | Status | Body | Causa |
@@ -932,7 +1036,7 @@ en estado `CONDUCTOR_ASIGNADO` (es decir, antes del primer ping GPS, que ya lo l
 
 El cliente dueño del viaje lo cancela. Solo se permite **antes de que el viaje comience**, es
 decir mientras está en `BUSCANDO_CONDUCTOR` (todavía nadie lo aceptó) o `CONDUCTOR_ASIGNADO`
-(un conductor lo aceptó pero aún no se movió — antes del primer ping GPS, que lo llevaría a
+(un conductor lo aceptó pero todavía no pulsó **Iniciar viaje**, que lo llevaría a
 `EN_CAMINO_A_ORIGEN`). El viaje pasa a `CANCELADO`, que es un estado **terminal**.
 
 **Rol requerido:** `CLIENTE` (debe ser el dueño del viaje)
@@ -1061,6 +1165,14 @@ socket.emit('conductor:ubicacion', {
 4. **Solo el conductor asignado al viaje puede enviar pings de ese viaje.** Un conductor
    autenticado distinto al asignado no puede falsificar posición/distancia ni disparar alertas
    en un viaje ajeno. Lo mismo aplica si el viaje no existe.
+5. **El viaje tiene que estar iniciado.** Los pings solo se aceptan desde `EN_CAMINO_A_ORIGEN`
+   en adelante (`EN_CAMINO_A_ORIGEN`, `CARGANDO`, `EN_RUTA`, `DESCARGANDO`). Un ping de un viaje
+   en `CONDUCTOR_ASIGNADO` o `BUSCANDO_CONDUCTOR` se rechaza con el error
+   `"El viaje no fue iniciado"` y **no tiene ningún efecto secundario**: no toca Redis
+   (`ultima`/`acumulado`/`historial`), no emite `mapa:actualizar` y no arranca el emisor de ETA.
+
+> El viaje se inicia con el botón **Iniciar viaje** (`POST /api/viajes/:id/iniciar`). El flujo
+> correcto del mobile es: botón → `200` → recién ahí arrancar el GPS.
 
 Si el viaje ya está `FINALIZADO` o `CANCELADO`, el ping se ignora silenciosamente (sin error).
 
@@ -1075,12 +1187,12 @@ emiten con la forma `{ "error": "..." }` (no `{ "mensaje": "..." }`):
 | `{ "error": "Datos GPS invalidos" }` | Falta un campo o `lat`/`lng`/`timestamp` no es numérico |
 | `{ "error": "Coordenadas fuera de rango" }` | `lat`/`lng` fuera del rango geográfico válido |
 | `{ "error": "No autorizado para este viaje" }` | El conductor no es el asignado al viaje, o el viaje no existe |
+| `{ "error": "El viaje no fue iniciado" }` | El viaje está en `CONDUCTOR_ASIGNADO` o `BUSCANDO_CONDUCTOR`: falta pulsar **Iniciar viaje** (`POST /api/viajes/:id/iniciar`). El ping se descarta sin efectos |
 | `{ "error": "Error interno al procesar ubicacion" }` | Error inesperado del servidor |
 
-**Efectos secundarios en el servidor:**
+**Efectos secundarios en el servidor** (solo con el viaje ya iniciado):
 - Guarda coordenada en Redis (historial de últimas 20)
 - Acumula distancia y tiempo
-- Si el viaje estaba en `CONDUCTOR_ASIGNADO` y es el primer ping: cambia automáticamente a `EN_CAMINO_A_ORIGEN`
 - Arranca (si no estaba activo) el emisor periódico de ETA del viaje, que emite `eta:actualizar` cada 30 s al room
 - Emite `mapa:actualizar`, y cada ~60 s emite `costo:actualizar`
 - Si el viaje está en `EN_RUTA`: verifica desvíos (y recalcula la ruta si corresponde) y paradas sospechosas
@@ -1203,8 +1315,8 @@ socket.on('alerta:parada', (data) => {
 **Dirección:** servidor → room del viaje  
 **Quién lo recibe:** cliente y conductor  
 **Cuándo:** cada `ETA_EMISION_SEGUNDOS` (default 30 s) mientras el viaje tiene GPS activo
-(estados `EN_CAMINO_A_ORIGEN` … `EN_RUTA`). El emisor arranca con el primer ping GPS y se
-detiene al finalizar o cancelar el viaje.
+(estados `EN_CAMINO_A_ORIGEN` … `EN_RUTA`). El emisor arranca con el primer ping GPS —que solo
+se acepta con el viaje ya iniciado— y se detiene al finalizar o cancelar el viaje.
 
 Además, el emisor tiene un **watchdog de inactividad**: si el viaje deja de recibir pings GPS
 durante más de `ETA_EMISOR_IDLE_SEGUNDOS` (default 300 s), el emisor se auto-detiene y dejan de
@@ -1294,14 +1406,18 @@ socket.on('ruta:recalculada', (data) => {
 
 **Dirección:** servidor → room del viaje  
 **Quién lo recibe:** cliente y conductor  
-**Cuándo:** cambio automático de estado por GPS (primer ping) o cambio manual via `PATCH /:id/estado`
+**Cuándo:** cambio manual de estado via `PATCH /:id/estado`
+
+> El paso `CONDUCTOR_ASIGNADO → EN_CAMINO_A_ORIGEN` **no** emite este evento: lo dispara el
+> botón **Iniciar viaje** (`POST /api/viajes/:id/iniciar`), que emite `viaje:iniciado` al room
+> personal del cliente.
 
 **Payload:**
 ```json
 {
   "id_viaje": 42,
-  "estado_anterior": "CONDUCTOR_ASIGNADO",
-  "estado_nuevo": "EN_CAMINO_A_ORIGEN"
+  "estado_anterior": "EN_CAMINO_A_ORIGEN",
+  "estado_nuevo": "CARGANDO"
 }
 ```
 
@@ -1311,7 +1427,7 @@ Estados posibles del viaje (flujo completo):
 |--------|-------------|
 | `BUSCANDO_CONDUCTOR` | Viaje creado, esperando que un conductor acepte |
 | `CONDUCTOR_ASIGNADO` | Conductor aceptó, aún no se movió |
-| `EN_CAMINO_A_ORIGEN` | Primer ping GPS recibido (automático) |
+| `EN_CAMINO_A_ORIGEN` | El conductor pulsó **Iniciar viaje** (`POST /api/viajes/:id/iniciar`) |
 | `EN_RUTA` | En curso — activar algoritmos de desvío y parada |
 | `CARGANDO` | Detenido cargando mercadería (manual via endpoint) |
 | `DESCARGANDO` | Detenido descargando mercadería (manual via endpoint) |
@@ -2256,5 +2372,5 @@ Este mismo formato se usa en los cuatro lugares donde la ruta viaja al front:
 - `nueva_ruta` en el payload del evento `ruta:recalculada`
 
 La ruta se calcula y cachea al **crear** el viaje. `ruta_planeada` puede ser `null` si Google
-Maps falló en la creación (se reintenta en el primer ping GPS) o si el viaje ya terminó y se
-limpió el cache. El evento `ruta:recalculada` reemplaza esta ruta cuando el conductor se desvía.
+Maps falló en la creación (se reintenta en el primer ping GPS, ya con el viaje iniciado) o si el
+viaje ya terminó y se limpió el cache. El evento `ruta:recalculada` reemplaza esta ruta cuando el conductor se desvía.

@@ -61,6 +61,16 @@ export function registrarHandlersGPS(socket, io) {
         return;
       }
 
+      // El viaje debe estar iniciado con el boton "Iniciar viaje" (POST
+      // /api/viajes/:id/iniciar). Un ping de un viaje aun en BUSCANDO_CONDUCTOR o
+      // CONDUCTOR_ASIGNADO se rechaza SIN ningun efecto secundario: no toca Redis
+      // (ultima/acumulado/historial), no emite mapa:actualizar, no arranca el ETA.
+      // El flujo correcto del mobile es: boton → 200 → recien ahi arrancar el GPS.
+      if (viaje.estado === 'BUSCANDO_CONDUCTOR' || viaje.estado === 'CONDUCTOR_ASIGNADO') {
+        socket.emit('error', { error: 'El viaje no fue iniciado' });
+        return;
+      }
+
       if (viaje.estado === 'FINALIZADO' || viaje.estado === 'CANCELADO') return;
 
       const anterior = await obtenerUltimaCoordenada(id_viaje);
@@ -70,18 +80,6 @@ export function registrarHandlersGPS(socket, io) {
       const velocidad_kmh = anterior
         ? calcularVelocidad(anterior.lat, anterior.lng, anterior.timestamp, lat, lng, timestamp)
         : 0;
-
-      if (viaje.estado === 'CONDUCTOR_ASIGNADO' && acumulado.es_primer_ping === true) {
-        await prisma.viaje.update({
-          where: { id_viaje },
-          data: { estado: 'EN_CAMINO_A_ORIGEN' },
-        });
-        io.to(`viaje:${id_viaje}`).emit('viaje:estado_cambiado', {
-          id_viaje,
-          estado_anterior: 'CONDUCTOR_ASIGNADO',
-          estado_nuevo: 'EN_CAMINO_A_ORIGEN',
-        });
-      }
 
       // El viaje tiene GPS activo: arrancamos el emisor periodico de ETA
       // (idempotente — si ya corre, no hace nada). Se detiene al cerrar/cancelar.

@@ -1,5 +1,6 @@
 import { io } from 'socket.io-client';
 import redis from '../src/config/redis.js';
+import prisma from '../src/config/prisma.js';
 
 const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
 const BASE = 'http://localhost:3000';
@@ -85,6 +86,7 @@ async function crearVehiculoSiNoExiste(token, patente) {
 async function cleanup(sConductor, sCliente) {
   try { sConductor?.disconnect(); } catch {}
   try { sCliente?.disconnect(); } catch {}
+  try { await prisma.$disconnect(); } catch {}
   try { await redis.quit(); } catch {}
 }
 
@@ -176,6 +178,14 @@ async function main() {
   if (viajeAsig.estado !== 'CONDUCTOR_ASIGNADO') {
     await cleanup(sConductor, sCliente); process.exit(1);
   }
+
+  // Inicio MANUAL del viaje (boton). Reemplaza al viejo inicio automatico por
+  // primer ping GPS: ahora los pings solo se procesan con el viaje ya iniciado.
+  // Traemos fecha_programada a "ahora" (via Prisma) para pasar la ventana de inicio.
+  await prisma.viaje.update({ where: { id_viaje }, data: { fecha_programada: new Date() } });
+  const { status: siniciar } = await api('POST', `/api/viajes/${id_viaje}/iniciar`, null, conductorToken);
+  paso('POST /api/viajes/:id/iniciar → 200 (EN_CAMINO_A_ORIGEN)', siniciar === 200, `status ${siniciar}`);
+  if (siniciar !== 200) { await cleanup(sConductor, sCliente); process.exit(1); }
 
   // ──────────────────────────────────────────────────────────────────────────
   // PASO 4: GPS pings (5 pings)

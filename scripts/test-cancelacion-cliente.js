@@ -1,5 +1,6 @@
 import { io } from 'socket.io-client';
 import redis from '../src/config/redis.js';
+import prisma from '../src/config/prisma.js';
 
 const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
 const BASE = 'http://localhost:3000';
@@ -93,6 +94,7 @@ async function cleanup(sockets) {
   for (const s of sockets) {
     try { s?.disconnect(); } catch { /* noop */ }
   }
+  try { await prisma.$disconnect(); } catch { /* noop */ }
   try { await redis.quit(); } catch { /* noop */ }
 }
 
@@ -200,6 +202,13 @@ async function main() {
   const v4 = await crearViaje(clienteAToken);
   await esperar(1200);
   await aceptarConConductor(sConductor, v4);
+
+  // El viaje pasa a EN_CAMINO_A_ORIGEN con el boton (POST /:id/iniciar), no por el
+  // primer ping. Traemos fecha_programada a "ahora" (via Prisma) para pasar la
+  // ventana de inicio; el ping posterior ya se procesa normal.
+  await prisma.viaje.update({ where: { id_viaje: v4 }, data: { fecha_programada: new Date() } });
+  await api('POST', `/api/viajes/${v4}/iniciar`, null, conductorToken);
+
   sConductor.emit('conductor:ubicacion', { id_viaje: v4, lat: PARADA_1.lat, lng: PARADA_1.lng, timestamp: Date.now() });
   await esperar(1500);
 

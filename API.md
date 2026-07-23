@@ -342,7 +342,10 @@ instantáneamente a los conductores elegibles conectados via WebSocket.
 }
 ```
 
-- `fecha_programada`: fecha ISO futura, mínimo 1 hora desde el momento del request
+- `fecha_programada`: fecha ISO 8601 y **estrictamente mayor** a 1 hora (60 minutos) desde el
+  momento del request. Solo se valida ese **mínimo**: no hay tope máximo de anticipación. Si el
+  valor no es una fecha válida o no supera ese mínimo → `400` con
+  `{ "error": "fecha_programada debe ser una fecha ISO futura (al menos 1 hora desde ahora)" }`
 - `condiciones_requeridas`: opcional. Valores posibles: `FRAGIL`, `REFRIGERADO`,
   `CARGA_PESADA`, `PELIGROSO`, `VOLUMINOSO`
 - `descripcion`: opcional. Texto libre visible para el conductor antes de aceptar y en el
@@ -411,6 +414,7 @@ Las tarifas se calculan automáticamente según la zona y si la `fecha_programad
 | Status | Body | Causa |
 |--------|------|-------|
 | 400 | `{ "error": "mensaje de validación" }` | Campo faltante o inválido |
+| 400 | `{ "error": "fecha_programada debe ser una fecha ISO futura (al menos 1 hora desde ahora)" }` | `fecha_programada` ausente, no es ISO válida, o no supera el mínimo de 1 hora desde el request |
 | 400 | `{ "error": "El usuario no tiene perfil de cliente" }` | El usuario no tiene registro de cliente |
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
 | 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CLIENTE |
@@ -874,7 +878,7 @@ socket.on('viaje:iniciado', (data) => {
 ### PATCH /api/viajes/:id/estado
 
 Cambia el estado del viaje manualmente. Solo puede ejecutarlo el conductor asignado al viaje.
-Estados válidos para este endpoint: `CARGANDO`, `DESCARGANDO`.
+Estados válidos para este endpoint: `CARGANDO`, `EN_RUTA`, `DESCARGANDO`.
 
 **Rol requerido:** `CONDUCTOR`
 
@@ -885,7 +889,7 @@ Estados válidos para este endpoint: `CARGANDO`, `DESCARGANDO`.
 }
 ```
 
-- `estado`: `"CARGANDO"` | `"DESCARGANDO"`
+- `estado`: `"CARGANDO"` | `"EN_RUTA"` | `"DESCARGANDO"`
 
 **Respuesta exitosa — 200:**
 ```json

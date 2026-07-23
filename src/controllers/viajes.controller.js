@@ -282,6 +282,95 @@ export async function cambiarEstado(req, res) {
   return res.status(200).json({ id_viaje, estado_anterior, estado_nuevo: estado });
 }
 
+// Inicio MANUAL del viaje (boton "Iniciar viaje" del conductor). Reemplaza al
+// viejo inicio automatico por primer ping GPS: es la unica forma de pasar de
+// CONDUCTOR_ASIGNADO a EN_CAMINO_A_ORIGEN. Recien despues de este 200 el mobile
+// debe arrancar el GPS — los pings previos se rechazan (ver gps.socket.js).
+export async function iniciarViaje(req, res) {
+  const id_viaje = Number(req.params.id);
+
+  const viaje = await prisma.viaje.findUnique({
+    where: { id_viaje },
+    include: { conductor: true, cliente: true },
+  });
+
+  // 1. El viaje existe.
+  if (!viaje) {
+    return res.status(404).json({ error: 'Viaje no encontrado' });
+  }
+
+  // 2. El conductor autenticado es el asignado.
+  if (!viaje.conductor || viaje.conductor.id_usuario !== req.usuario.id_usuario) {
+    return res.status(403).json({ error: 'No autorizado para iniciar este viaje' });
+  }
+
+  // 3. Solo se puede iniciar desde CONDUCTOR_ASIGNADO.
+  if (viaje.estado !== 'CONDUCTOR_ASIGNADO') {
+    return res.status(400).json({
+      error: `Solo se puede iniciar un viaje en estado CONDUCTOR_ASIGNADO, el viaje actual esta en estado ${viaje.estado}`,
+    });
+  }
+
+  // 4. Ventana de tiempo: se puede iniciar desde VENTANA_INICIO_MINUTOS antes de
+  //    la fecha programada. NO hay limite superior — iniciar tarde siempre se puede.
+  const VENTANA_INICIO_MINUTOS = Number(process.env.VENTANA_INICIO_MINUTOS ?? 30);
+  const ahora = new Date();
+  const aperturaVentana = new Date(
+    viaje.fecha_programada.getTime() - VENTANA_INICIO_MINUTOS * 60000
+  );
+  if (ahora < aperturaVentana) {
+    const horaLocal = aperturaVentana.toLocaleTimeString('es-AR', {
+      timeZone: 'America/Argentina/Buenos_Aires',
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    });
+    return res.status(400).json({
+      error: `El viaje solo puede iniciarse a partir de las ${horaLocal}`,
+    });
+  }
+
+  // Puntualidad: retraso (en minutos) del inicio real vs la fecha programada.
+  // Iniciar antes de hora da retraso negativo → A_TIEMPO.
+  const PUNTUALIDAD_TARDE_MINUTOS = Number(process.env.PUNTUALIDAD_TARDE_MINUTOS ?? 30);
+  const PUNTUALIDAD_MUY_TARDE_MINUTOS = Number(process.env.PUNTUALIDAD_MUY_TARDE_MINUTOS ?? 120);
+  const retrasoMinutos = (ahora.getTime() - viaje.fecha_programada.getTime()) / 60000;
+
+  let puntualidad_inicio;
+  if (retrasoMinutos <= PUNTUALIDAD_TARDE_MINUTOS) {
+    puntualidad_inicio = 'A_TIEMPO';
+  } else if (retrasoMinutos <= PUNTUALIDAD_MUY_TARDE_MINUTOS) {
+    puntualidad_inicio = 'TARDE';
+  } else {
+    puntualidad_inicio = 'MUY_TARDE';
+  }
+
+  const actualizado = await prisma.viaje.update({
+    where: { id_viaje },
+    data: {
+      estado: 'EN_CAMINO_A_ORIGEN',
+      fecha_inicio: ahora,
+      puntualidad_inicio,
+    },
+  });
+
+  if (io) {
+    io.to('usuario:' + viaje.cliente.id_usuario).emit('viaje:iniciado', {
+      id_viaje,
+      fecha_inicio: actualizado.fecha_inicio,
+      puntualidad_inicio,
+    });
+  }
+
+  return res.status(200).json({
+    mensaje: 'Viaje iniciado',
+    id_viaje,
+    estado: 'EN_CAMINO_A_ORIGEN',
+    fecha_inicio: actualizado.fecha_inicio,
+    puntualidad_inicio,
+  });
+}
+
 export async function cancelarViajeConductor(req, res) {
   const id_viaje = Number(req.params.id);
 

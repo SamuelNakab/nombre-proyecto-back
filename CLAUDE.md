@@ -132,3 +132,20 @@ node scripts/test-cancelacion-conductor.js
 node scripts/test-cancelacion-cliente.js
 node scripts/test-admin.js
 node scripts/test-iniciar-viaje.js (nuevo, esta tarea)
+node scripts/consola-manual.js (herramienta de prueba manual, interactiva —
+  requiere CLIENTE_EMAIL/PASSWORD, CONDUCTOR_EMAIL/PASSWORD,
+  FIREBASE_WEB_API_KEY, API_URL en .env)
+
+## Herramienta de prueba manual (consola-manual.js)
+
+No depende de mobile ni de web. Loguea un cliente y un conductor de
+prueba, conecta dos sockets, y expone un menu (crear / aceptar / iniciar
+/ ping GPS / cambiar estado / confirmar parada / cancelar conductor /
+cancelar cliente / ver estado) para probar el flujo completo de un viaje
+a mano contra staging.
+
+No corre en CI — es interactivo, uso manual, local. Vive en scripts/,
+fuera de los globs de lint y test.
+
+Requiere socket.io-client como devDependency (unica excepcion a "no
+instalar dependencias" para archivos en scripts/).

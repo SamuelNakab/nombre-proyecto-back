@@ -6,6 +6,8 @@ import helmet from 'helmet';
 import authRoutes from './routes/auth.routes.js';
 import viajesRoutes from './routes/viajes.routes.js';
 import conductoresRoutes from './routes/conductores.routes.js';
+import empresasRoutes from './routes/empresas.routes.js';
+import afiliacionesRoutes from './routes/afiliaciones.routes.js';
 import adminRoutes from './routes/admin.routes.js';
 import { inicializarSockets } from './sockets/index.js';
 
@@ -22,6 +24,8 @@ app.get('/health', (_req, res) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/viajes', viajesRoutes);
 app.use('/api/conductores', conductoresRoutes);
+app.use('/api/empresas', empresasRoutes);
+app.use('/api/afiliaciones', afiliacionesRoutes);
 app.use('/api/admin', adminRoutes);
 
 const httpServer = createServer(app);

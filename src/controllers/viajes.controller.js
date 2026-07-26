@@ -10,6 +10,7 @@ import { cerrarViaje } from '../services/cierre.service.js';
 import { recalcularEtaInmediato } from '../services/eta-emisor.js';
 import { limpiarViajeActivo } from '../services/cancelacion.service.js';
 import { calcularYGuardarRuta, obtenerRutaPlaneada } from '../services/ruta.service.js';
+import { validarTransicion } from '../services/estado-viaje.service.js';
 import { io } from '../sockets/index.js';
 
 // ─── QR helpers ──────────────────────────────────────────────────────────────
@@ -264,8 +265,14 @@ export async function cambiarEstado(req, res) {
   if (!viaje.conductor || viaje.conductor.id_usuario !== req.usuario.id_usuario) {
     return res.status(403).json({ error: 'No sos el conductor de este viaje' });
   }
-  if (viaje.estado === 'FINALIZADO' || viaje.estado === 'CANCELADO') {
-    return res.status(400).json({ error: 'El viaje ya esta finalizado o cancelado' });
+
+  // La maquina de estados es la unica fuente de verdad de que transiciones son
+  // validas. Reemplaza el viejo chequeo ad-hoc de FINALIZADO/CANCELADO y ademas
+  // rechaza retrocesos (p. ej. EN_RUTA -> CARGANDO).
+  try {
+    validarTransicion(viaje.estado, estado);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
   }
 
   const estado_anterior = viaje.estado;

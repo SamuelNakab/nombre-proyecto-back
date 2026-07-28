@@ -106,7 +106,13 @@ Transiciones validas:
 - Puede reasignar conductor/vehiculo mientras el viaje no arranco.
 - Si tarda mas de RESERVA_TIMEOUT_MINUTOS sin asignar → se cancela la
   reserva automaticamente y vuelve a BUSCANDO_CONDUCTOR. Tambien puede
-  soltarlo el gerente a mano.
+  soltarlo el gerente a mano (cancelar-reserva).
+- IMPORTANTE: cancelar-reserva y el job de timeout NO alcanzan con emitir al
+  room viejo: republican el viaje DE CERO — re-corren la elegibilidad de
+  conductores independientes + obtenerGerentesElegibles y suman a esa gente al
+  room, reusando publicarViajeAConductoresElegibles (la MISMA funcion que la
+  cancelacion de un conductor independiente). Asi, alguien que se conecto
+  DESPUES de la reserva original tambien recibe viaje:disponible.
 
 ### Ejecucion
 - El conductor asignado NO confirma la asignacion (por ahora): la ve en su
@@ -119,6 +125,11 @@ Transiciones validas:
 - Se califica al conductor, como hoy.
 - La calificacion de una empresa es el promedio de las de sus conductores
   ACTIVOS. Calcular en el read (GET empresa), no denormalizar.
+- SOLO se promedian los conductores ACTIVOS que YA tienen al menos una
+  calificacion propia. Los que no tienen NO cuentan (no se los toma como 0).
+  Si ninguno tiene, calificacion_promedio de la empresa = null. Como
+  Conductor.calificacion_promedio es Float @default(0) (nunca null), "tiene
+  calificaciones" se detecta contando sus filas Calificacion (_count).
 
 ### Tracking del gerente
 - Al gerente se lo suma al room viaje:{id} de los viajes de su empresa,
@@ -130,13 +141,30 @@ Transiciones validas:
 | viaje:reservado | Room viaje:{id} (sacar del pool a los demas)   |
 | viaje:asignado  | Room personal del conductor (usuario:{id})     |
 | viaje:reserva_cancelada | Room viaje:{id} (vuelve al mercado)    |
+| viaje:requiere_reasignacion | Room personal del gerente (usuario:{id_gerente}) |
 
 Nota: viaje:asignado le puede llegar al mismo conductor desde varias
 empresas donde trabaje — no asumir una sola empresa por conductor.
 
+viaje:requiere_reasignacion avisa al gerente que un viaje YA asignado volvio
+a RESERVADO_POR_EMPRESA y necesita reasignarse. Es distinto de
+viaje:reserva_cancelada (ese es "vuelve al mercado abierto"). Payload
+{ id_viaje, id_empresa, motivo }. Se emite en dos casos:
+- Desafiliacion de un conductor con viajes CONDUCTOR_ASIGNADO de esa empresa
+  (motivo: "conductor_desafiliado").
+- Cancelacion del conductor de un viaje de empresa (motivo: "conductor_cancelo").
+
 ## Variables de entorno de esta tarea
-RESERVA_TIMEOUT_MINUTOS=10   (nueva)
-Eliminar MATCHING_TIMEOUT_MINUTOS (variable muerta, sin efecto).
+RESERVA_TIMEOUT_MINUTOS=10   (nueva, con default en codigo si no esta en .env)
+
+MATCHING_TIMEOUT eliminado POR COMPLETO — no queda ningun rastro:
+- La env var MATCHING_TIMEOUT_MINUTOS se saco de .env.example y del codigo.
+- Se elimino todo el mecanismo en matching.service (el setTimeout, el Map de
+  timers, cancelarPorTimeout y cancelarTimer) y su llamada en matching.socket.
+- Consecuencia: un viaje en BUSCANDO_CONDUCTOR ya NO se auto-cancela por
+  timeout. Queda disponible hasta que un conductor lo acepte, un gerente lo
+  reserve, o el cliente/admin lo cancele. El evento viaje:cancelado_sin_conductor
+  ya no se emite.
 
 ## Deploy
 - Railway: production (main) / staging (develop).

@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import admin from '../config/firebase.js';
 import prisma from '../config/prisma.js';
+import { generarCodigoUnico } from '../services/afiliacion.service.js';
 
 // ─── Schemas de validacion ───────────────────────────────────────────────────
 
@@ -154,6 +155,10 @@ export async function registrarGerente(req, res) {
     return res.status(409).json({ error: 'El email ya esta registrado' });
   }
 
+  // La empresa necesita un codigo_afiliacion unico (columna NOT NULL) para que
+  // los conductores puedan afiliarse. Se genera igual que en POST /api/empresas.
+  const codigo_afiliacion = await generarCodigoUnico();
+
   try {
     const usuario = await prisma.usuario.create({
       data: {
@@ -165,7 +170,7 @@ export async function registrarGerente(req, res) {
         telefono,
         rol: 'GERENTE',
         empresas_gerente: {
-          create: { cuit: cuit_empresa, nombre: nombre_empresa },
+          create: { cuit: cuit_empresa, nombre: nombre_empresa, codigo_afiliacion },
         },
       },
     });

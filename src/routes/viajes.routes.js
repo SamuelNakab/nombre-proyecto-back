@@ -6,6 +6,7 @@ import {
   listarViajesDisponibles,
   listarMisViajes,
   listarMisViajesConductor,
+  listarViajesAsignados,
   obtenerViaje,
   cambiarEstado,
   iniciarViaje,
@@ -31,8 +32,10 @@ router.post('/', verificarToken, requireRol('CLIENTE'), crearViaje);
 router.get('/disponibles', verificarToken, requireRol('CONDUCTOR'), listarViajesDisponibles);
 router.get('/mis-viajes', verificarToken, requireRol('CLIENTE'), listarMisViajes);
 router.get('/mis-viajes-conductor', verificarToken, requireRol('CONDUCTOR'), listarMisViajesConductor);
+router.get('/asignados', verificarToken, requireRol('CONDUCTOR'), listarViajesAsignados);
 router.patch('/:id/estado', verificarToken, requireRol('CONDUCTOR'), cambiarEstado);
-router.post('/:id/iniciar', verificarToken, requireRol('CONDUCTOR'), iniciarViaje);
+// Iniciar lo puede disparar el conductor asignado O el gerente de la empresa.
+router.post('/:id/iniciar', verificarToken, requireRol('CONDUCTOR', 'GERENTE'), iniciarViaje);
 router.post('/:id/cancelar-conductor', verificarToken, requireRol('CONDUCTOR'), cancelarViajeConductor);
 router.post('/:id/cancelar-cliente', verificarToken, requireRol('CLIENTE'), cancelarViajeCliente);
 // Reserva y asignacion por parte del gerente de una empresa.

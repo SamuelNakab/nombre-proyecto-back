@@ -1,6 +1,7 @@
 import prisma from '../config/prisma.js';
 import { validarTransicion } from './estado-viaje.service.js';
 import { limpiarViajeActivo } from './cancelacion.service.js';
+import { publicarViajeAConductoresElegibles } from './matching.service.js';
 
 // Minutos que una reserva puede quedar sin conductor asignado antes de volver
 // sola al mercado. Default 10 si no esta en .env (mismo patron que el resto).
@@ -55,9 +56,9 @@ export async function validarConductorYVehiculo(viaje, id_conductor, id_vehiculo
 // ─── Liberar reserva ─────────────────────────────────────────────────────────
 
 // Devuelve un viaje reservado al mercado abierto: RESERVADO_POR_EMPRESA ->
-// BUSCANDO_CONDUCTOR, limpiando empresa/reserva/conductor/vehiculo y cortando
-// tracking (ETA/GPS). Compartido por el endpoint cancelar-reserva y por el job
-// de timeout.
+// BUSCANDO_CONDUCTOR, limpiando empresa/reserva/conductor/vehiculo, cortando
+// tracking (ETA/GPS) y REPUBLICANDO el viaje de cero. Compartido por el endpoint
+// cancelar-reserva y por el job de timeout.
 export async function liberarReserva(io, id_viaje, estadoActual) {
   validarTransicion(estadoActual, 'BUSCANDO_CONDUCTOR');
 
@@ -77,7 +78,27 @@ export async function liberarReserva(io, id_viaje, estadoActual) {
   await limpiarViajeActivo(id_viaje);
 
   if (io) {
+    // Avisar a quienes ya estan en el room que la reserva se cancelo.
     io.to(`viaje:${id_viaje}`).emit('viaje:reserva_cancelada', { id_viaje });
+
+    // Republicar de cero reusando el MISMO flujo que la cancelacion de un
+    // conductor independiente: re-corre la elegibilidad (conductores propios +
+    // obtenerGerentesElegibles), suma a esa gente al room y emite
+    // viaje:disponible. Asi, alguien que se conecto DESPUES de la reserva
+    // original tambien recibe el viaje (no alcanza con cambiar el estado en DB).
+    const viajeRepublicar = await prisma.viaje.findUnique({
+      where: { id_viaje },
+      include: {
+        paradas: true,
+        condiciones_req: true,
+        cliente: { include: { usuario: { select: { id_usuario: true } } } },
+      },
+    });
+    await publicarViajeAConductoresElegibles(
+      io,
+      viajeRepublicar,
+      viajeRepublicar.cliente.usuario.id_usuario
+    );
   }
 }
 

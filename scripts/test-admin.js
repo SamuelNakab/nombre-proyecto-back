@@ -105,6 +105,8 @@ async function finalizarViaje(clienteToken, conductorToken, sConductor) {
   await api('POST', `/api/viajes/${id_viaje}/iniciar`, null, conductorToken);
   sConductor.emit('conductor:ubicacion', { id_viaje, lat: PARADA_1.lat, lng: PARADA_1.lng, timestamp: Date.now() });
   await esperar(1000);
+  // La maquina de estados no permite saltear CARGANDO (EN_CAMINO_A_ORIGEN -> EN_RUTA).
+  await api('PATCH', `/api/viajes/${id_viaje}/estado`, { estado: 'CARGANDO' }, conductorToken);
   await api('PATCH', `/api/viajes/${id_viaje}/estado`, { estado: 'EN_RUTA' }, conductorToken);
   const { data: qrs } = await api('GET', `/api/viajes/${id_viaje}/qr-paradas`, null, clienteToken);
   const ordenadas = qrs.sort((a, b) => a.orden - b.orden);
@@ -303,6 +305,8 @@ async function main() {
   await api('POST', `/api/viajes/${vRuta}/iniciar`, null, conductorToken);
   sConductor.emit('conductor:ubicacion', { id_viaje: vRuta, lat: PARADA_1.lat, lng: PARADA_1.lng, timestamp: Date.now() });
   await esperar(1000);
+  // La maquina de estados no permite saltear CARGANDO (EN_CAMINO_A_ORIGEN -> EN_RUTA).
+  await api('PATCH', `/api/viajes/${vRuta}/estado`, { estado: 'CARGANDO' }, conductorToken);
   await api('PATCH', `/api/viajes/${vRuta}/estado`, { estado: 'EN_RUTA' }, conductorToken);
   sConductor.emit('conductor:ubicacion', { id_viaje: vRuta, lat: -34.6010, lng: -58.3800, timestamp: Date.now() + 3000 });
   await esperar(1200);

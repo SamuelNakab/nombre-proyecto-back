@@ -104,7 +104,12 @@ export async function liberarReserva(io, id_viaje, estadoActual) {
 
 // ─── Job de timeout de reservas ──────────────────────────────────────────────
 
-const CHECK_INTERVAL_MS = 60 * 1000; // se revisa cada minuto
+// Cada cuanto corre el job. Configurable por env (default 60s) para poder
+// testear el timeout sin esperar un minuto entero.
+function checkIntervalMs() {
+  return parseInt(process.env.RESERVA_CHECK_INTERVAL_MS) || 60 * 1000;
+}
+
 let jobHandle = null;
 
 // Busca reservas vencidas (RESERVADO_POR_EMPRESA, sin arrancar, con
@@ -132,11 +137,12 @@ async function liberarReservasVencidas(io) {
 export function iniciarJobTimeoutReservas(io) {
   if (jobHandle) return;
 
+  const intervalo = checkIntervalMs();
   jobHandle = setInterval(() => {
     liberarReservasVencidas(io).catch((e) => console.error('[reserva-timeout]', e.message));
-  }, CHECK_INTERVAL_MS);
+  }, intervalo);
 
   console.log(
-    `[reserva-timeout] job iniciado (revisa cada ${CHECK_INTERVAL_MS / 1000}s, timeout ${reservaTimeoutMinutos()} min)`
+    `[reserva-timeout] job iniciado (revisa cada ${intervalo / 1000}s, timeout ${reservaTimeoutMinutos()} min)`
   );
 }

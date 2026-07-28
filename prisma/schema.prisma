@@ -22,6 +22,7 @@ enum Rol {
 
 enum EstadoViaje {
   BUSCANDO_CONDUCTOR
+  RESERVADO_POR_EMPRESA
   CONDUCTOR_ASIGNADO
   EN_CAMINO_A_ORIGEN
   CARGANDO
@@ -29,6 +30,11 @@ enum EstadoViaje {
   DESCARGANDO
   FINALIZADO
   CANCELADO
+}
+
+enum EstadoAfiliacion {
+  PENDIENTE
+  ACTIVO
 }
 
 enum TipoZona {
@@ -134,11 +140,15 @@ model Conductor {
 // ─────────────────────────────────────────────
 
 model Empresa {
-  id_empresa     Int      @id @default(autoincrement())
-  id_gerente     Int
-  cuit           String   @unique
-  nombre         String
-  fecha_registro DateTime @default(now())
+  id_empresa        Int      @id @default(autoincrement())
+  id_gerente        Int
+  cuit              String   @unique
+  nombre            String
+  // Codigo que el conductor ingresa para afiliarse a la empresa.
+  codigo_afiliacion String   @unique
+  activa            Boolean  @default(true)
+  fecha_registro    DateTime @default(now())
+  actualizado_en    DateTime @updatedAt
 
   gerente            Usuario            @relation(fields: [id_gerente], references: [id_usuario])
   conductor_empresas ConductorEmpresa[]
@@ -153,11 +163,14 @@ model Empresa {
 // ─────────────────────────────────────────────
 
 model ConductorEmpresa {
-  id_conductor_empresa Int      @id @default(autoincrement())
+  id_conductor_empresa Int              @id @default(autoincrement())
   id_conductor         Int
   id_empresa           Int
-  fecha_ingreso        DateTime @default(now())
-  activo               Boolean  @default(true)
+  // PENDIENTE: el conductor pidio afiliarse; ACTIVO: el gerente lo aprobo.
+  estado               EstadoAfiliacion @default(PENDIENTE)
+  fecha_alta           DateTime         @default(now())
+  // Se setea al cortar el vinculo (desafiliacion por conductor o gerente).
+  fecha_baja           DateTime?
 
   conductor Conductor @relation(fields: [id_conductor], references: [id_conductor])
   empresa   Empresa   @relation(fields: [id_empresa], references: [id_empresa])
@@ -187,8 +200,9 @@ model MetodoPago {
 
 // ─────────────────────────────────────────────
 // VEHICULO
-// Por ahora solo empresas tienen vehiculos.
-// Fleteros individuales se agregan despues con FK nullable a Conductor.
+// Dueño explicito: id_conductor (fletero individual) O id_empresa (flota),
+// exactamente uno de los dos. Ambas FK son nullable; la regla "exactamente
+// uno" se valida en codigo, no en el schema.
 // ─────────────────────────────────────────────
 
 model Vehiculo {
@@ -280,6 +294,10 @@ model Viaje {
   estado              EstadoViaje @default(BUSCANDO_CONDUCTOR)
   fecha_inicio        DateTime?
   puntualidad_inicio  String?
+  // Momento en que el gerente reserva el viaje (RESERVADO_POR_EMPRESA).
+  fecha_reserva       DateTime?
+  // Quien apreto "Iniciar viaje": "CONDUCTOR" | "GERENTE".
+  iniciado_por        String?
   precio_estimado     Float?
   precio_real         Float?
   creado_en           DateTime    @default(now())

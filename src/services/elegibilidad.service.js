@@ -32,3 +32,33 @@ export async function obtenerConductoresElegibles(condicionesRequeridas) {
     conductorEsElegible(conductor.conductor_vehiculos, conductor.vehiculos_propios, condiciones)
   );
 }
+
+// Elegibilidad a nivel EMPRESA (camino nuevo, aparte del filtro conductor-por-
+// conductor): una empresa activa es elegible si tiene al menos un vehiculo de su
+// flota que cumpla TODAS las condiciones requeridas del viaje. Devuelve una fila
+// por gerente elegible (deduplicado por id_usuario, ya que un gerente puede
+// tener varias empresas) para sumarlo al pool del viaje.
+export async function obtenerGerentesElegibles(condicionesRequeridas) {
+  const condiciones = condicionesRequeridas ?? [];
+
+  const empresas = await prisma.empresa.findMany({
+    where: { activa: true },
+    include: {
+      gerente: { select: { id_usuario: true } },
+      vehiculos: { include: { condiciones: true } },
+    },
+  });
+
+  const porUsuario = new Map();
+  for (const empresa of empresas) {
+    const tieneVehiculoElegible = empresa.vehiculos.some((vehiculo) => {
+      const tiene = vehiculo.condiciones.map((c) => c.condicion);
+      return condiciones.every((req) => tiene.includes(req));
+    });
+    if (tieneVehiculoElegible) {
+      porUsuario.set(empresa.gerente.id_usuario, { id_usuario: empresa.gerente.id_usuario });
+    }
+  }
+
+  return [...porUsuario.values()];
+}

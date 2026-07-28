@@ -1,28 +1,34 @@
-import prisma from '../config/prisma.js';
-import { detenerEmisorEta } from './eta-emisor.js';
-import { obtenerConductoresElegibles } from './elegibilidad.service.js';
+import { obtenerConductoresElegibles, obtenerGerentesElegibles } from './elegibilidad.service.js';
 
-const timers = new Map();
-
-// Resuelve los conductores elegibles del viaje (segun sus condiciones_req) y lo
+// Resuelve los destinatarios elegibles del viaje (segun sus condiciones_req) y lo
 // publica con publicarViaje. Es el flujo de publicacion compartido entre la
 // creacion del viaje (POST /api/viajes) y la republicacion tras una cancelacion
-// del conductor, para no duplicar la logica de "buscar elegibles + emitir
-// viaje:disponible". El `viaje` debe venir con paradas y condiciones_req.
+// del conductor o una reserva liberada. El `viaje` debe venir con paradas y
+// condiciones_req.
+//
+// Destinatarios:
+// - Conductores independientes/afiliados elegibles (tienen un vehiculo propio
+//   que cumple las condiciones).
+// - Gerentes cuya empresa activa tiene un vehiculo de flota que cumple las
+//   condiciones (camino de elegibilidad a nivel empresa).
 export async function publicarViajeAConductoresElegibles(io, viaje, clienteIdUsuario) {
   const condiciones = viaje.condiciones_req.map((c) => c.condicion);
   const conductoresElegibles = await obtenerConductoresElegibles(condiciones);
-  await publicarViaje(io, viaje, conductoresElegibles, clienteIdUsuario);
+  const gerentesElegibles = await obtenerGerentesElegibles(condiciones);
+  await publicarViaje(io, viaje, conductoresElegibles, gerentesElegibles, clienteIdUsuario);
 }
 
-export async function publicarViaje(io, viaje, conductoresElegibles, clienteIdUsuario) {
+export async function publicarViaje(io, viaje, conductoresElegibles, gerentesElegibles, clienteIdUsuario) {
   const room = `viaje:${viaje.id_viaje}`;
   const conductoresIds = new Set(conductoresElegibles.map((c) => c.id_usuario));
+  const gerentesIds = new Set(gerentesElegibles.map((g) => g.id_usuario));
 
   const sockets = await io.fetchSockets();
   for (const s of sockets) {
     const { rol, id_usuario } = s.data.usuario;
-    if ((rol === 'CONDUCTOR' && conductoresIds.has(id_usuario)) || id_usuario === clienteIdUsuario) {
+    const esConductorElegible = rol === 'CONDUCTOR' && conductoresIds.has(id_usuario);
+    const esGerenteElegible = rol === 'GERENTE' && gerentesIds.has(id_usuario);
+    if (esConductorElegible || esGerenteElegible || id_usuario === clienteIdUsuario) {
       await s.join(room);
     }
   }
@@ -37,40 +43,5 @@ export async function publicarViaje(io, viaje, conductoresElegibles, clienteIdUs
     condiciones_req: viaje.condiciones_req.map((c) => ({ condicion: c.condicion })),
   });
 
-  const minutos = parseInt(process.env.MATCHING_TIMEOUT_MINUTOS) || 10;
-  const timeoutId = setTimeout(() => cancelarPorTimeout(io, viaje.id_viaje), minutos * 60 * 1000);
-  timers.set(viaje.id_viaje, timeoutId);
-
-  console.log(`[Matching] viaje ${viaje.id_viaje} publicado — timeout en ${minutos} min`);
-}
-
-export async function cancelarPorTimeout(io, id_viaje) {
-  try {
-    await prisma.viaje.update({
-      where: { id_viaje },
-      data: { estado: 'CANCELADO' },
-    });
-  } catch {
-    return;
-  }
-
-  detenerEmisorEta(id_viaje);
-
-  const room = `viaje:${id_viaje}`;
-  io.to(room).emit('viaje:cancelado_sin_conductor', {
-    id_viaje,
-    mensaje: 'No se encontro un conductor disponible',
-  });
-  await io.socketsLeave(room);
-  timers.delete(id_viaje);
-
-  console.log(`[Matching] viaje ${id_viaje} cancelado por timeout`);
-}
-
-export function cancelarTimer(id_viaje) {
-  const timeoutId = timers.get(id_viaje);
-  if (timeoutId) {
-    clearTimeout(timeoutId);
-    timers.delete(id_viaje);
-  }
+  console.log(`[Matching] viaje ${viaje.id_viaje} publicado`);
 }

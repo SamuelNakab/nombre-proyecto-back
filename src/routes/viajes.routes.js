@@ -17,6 +17,12 @@ import {
   calificarViaje,
   obtenerRemito,
 } from '../controllers/viajes.controller.js';
+import {
+  reservarViaje,
+  asignarViaje,
+  reasignarViaje,
+  cancelarReserva,
+} from '../controllers/reserva.controller.js';
 
 const router = Router();
 
@@ -29,6 +35,11 @@ router.patch('/:id/estado', verificarToken, requireRol('CONDUCTOR'), cambiarEsta
 router.post('/:id/iniciar', verificarToken, requireRol('CONDUCTOR'), iniciarViaje);
 router.post('/:id/cancelar-conductor', verificarToken, requireRol('CONDUCTOR'), cancelarViajeConductor);
 router.post('/:id/cancelar-cliente', verificarToken, requireRol('CLIENTE'), cancelarViajeCliente);
+// Reserva y asignacion por parte del gerente de una empresa.
+router.post('/:id/reservar', verificarToken, requireRol('GERENTE'), reservarViaje);
+router.post('/:id/asignar', verificarToken, requireRol('GERENTE'), asignarViaje);
+router.post('/:id/reasignar', verificarToken, requireRol('GERENTE'), reasignarViaje);
+router.post('/:id/cancelar-reserva', verificarToken, requireRol('GERENTE'), cancelarReserva);
 router.get('/:id/costo-acumulado', verificarToken, obtenerCostoAcumulado);
 router.get('/:id/qr-paradas', verificarToken, requireRol('CLIENTE'), obtenerQRParadas);
 router.post('/:id/confirmar-parada', verificarToken, requireRol('CONDUCTOR'), confirmarParada);

@@ -1,5 +1,4 @@
 import prisma from '../config/prisma.js';
-import { cancelarTimer } from '../services/matching.service.js';
 import { obtenerRutaPlaneada } from '../services/ruta.service.js';
 
 export function manejarAceptarViaje(socket, io) {
@@ -150,8 +149,6 @@ export function manejarAceptarViaje(socket, io) {
       }
 
       // count === 1 → este conductor gano. Continua el flujo de asignacion.
-
-      cancelarTimer(id_viaje);
 
       // Ruta planeada (calculada al crear el viaje) para que el front la dibuje
       // apenas se asigna el conductor. Mismo formato [[lng, lat], ...].

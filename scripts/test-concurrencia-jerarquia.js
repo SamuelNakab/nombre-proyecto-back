@@ -1,0 +1,324 @@
+import { io } from 'socket.io-client';
+import redis from '../src/config/redis.js';
+import prisma from '../src/config/prisma.js';
+
+const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
+const BASE = 'http://localhost:3000';
+
+const PARADA_1 = { lat: -34.6037, lng: -58.3816, direccion: 'Plaza de Mayo, CABA' };
+const PARADA_2 = { lat: -34.5895, lng: -58.3974, direccion: 'Recoleta, CABA' };
+
+const HORA = 60 * 60 * 1000;
+
+// ── Helpers (mismo patron que scripts/test-jerarquia.js) ───────────────────
+
+const pasos = [];
+function paso(nombre, ok, detalle = '') {
+  pasos.push({ nombre, ok, detalle });
+  console.log(`  ${ok ? '✅' : '❌'} ${nombre}${detalle ? '  →  ' + detalle : ''}`);
+}
+function esperar(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+async function getToken(email, password) {
+  const res = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password, returnSecureToken: true }),
+    }
+  );
+  const data = await res.json();
+  if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
+  return data.idToken;
+}
+
+async function api(method, path, body, token) {
+  const res = await fetch(`${BASE}${path}`, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: 'Bearer ' + token } : {}),
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  const text = await res.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { error: `Respuesta no-JSON (${res.status}): ${text.slice(0, 500)}` };
+  }
+  return { status: res.status, data };
+}
+
+function conectar(token) {
+  return new Promise((resolve, reject) => {
+    const s = io(BASE, { auth: { token: 'Bearer ' + token } });
+    s.on('connect', () => resolve(s));
+    s.on('connect_error', (e) => reject(new Error(`Socket connect_error: ${e.message}`)));
+    setTimeout(() => reject(new Error('Timeout al conectar socket (8s)')), 8000);
+  });
+}
+
+async function registrar(datos, tipo) {
+  const endpoint =
+    tipo === 'cliente'
+      ? '/api/auth/registro-cliente'
+      : tipo === 'gerente'
+        ? '/api/auth/registro-gerente'
+        : '/api/auth/registro-conductor';
+  const { status, data } = await api('POST', endpoint, datos, null);
+  // 201 = creado; 409 = ya existia. Cualquier otra cosa es un fallo real.
+  if (status !== 201 && status !== 409) {
+    throw new Error(`registro ${tipo} (${datos.email}) fallo: ${status} ${JSON.stringify(data)}`);
+  }
+}
+
+async function crearVehiculoPropioSiNoExiste(token, patente) {
+  await api(
+    'POST',
+    '/api/conductores/mis-vehiculos',
+    { patente, marca: 'Ford', modelo: 'Transit', anio: 2020, color: 'Blanco', tipo_vehiculo: 'furgon' },
+    token
+  );
+}
+
+async function crearViaje(clienteToken, condiciones = []) {
+  const fecha = new Date(Date.now() + 2 * HORA).toISOString();
+  const { status, data } = await api(
+    'POST',
+    '/api/viajes',
+    { zona: 'CABA', fecha_programada: fecha, condiciones_requeridas: condiciones, paradas: [PARADA_1, PARADA_2] },
+    clienteToken
+  );
+  if (status !== 201) throw new Error(`crearViaje fallo (${status}): ${JSON.stringify(data)}`);
+  return data.id_viaje;
+}
+
+async function crearEmpresa(gerenteToken, nombre, cuit) {
+  const { status, data } = await api('POST', '/api/empresas', { nombre, cuit }, gerenteToken);
+  if (status !== 201) throw new Error(`crearEmpresa fallo (${status}): ${JSON.stringify(data)}`);
+  return data;
+}
+
+async function crearVehiculoFlota(gerenteToken, id_empresa, patente) {
+  const { status, data } = await api(
+    'POST',
+    `/api/empresas/${id_empresa}/vehiculos`,
+    { patente, marca: 'Iveco', modelo: 'Daily', anio: 2021, color: 'Gris', tipo_vehiculo: 'camion' },
+    gerenteToken
+  );
+  if (status !== 201) throw new Error(`crearVehiculoFlota fallo (${status}): ${JSON.stringify(data)}`);
+  return data.id_vehiculo;
+}
+
+const reservar = (token, id_viaje, id_empresa) =>
+  api('POST', `/api/viajes/${id_viaje}/reservar`, { id_empresa }, token);
+
+const estadoDe = async (id_viaje) => await prisma.viaje.findUnique({ where: { id_viaje } });
+
+async function cleanup(sockets) {
+  for (const s of sockets) {
+    try {
+      s?.disconnect();
+    } catch {
+      /* noop */
+    }
+  }
+  try {
+    await prisma.$disconnect();
+  } catch {
+    /* noop */
+  }
+  try {
+    await redis.quit();
+  } catch {
+    /* noop */
+  }
+}
+
+// ── Main ─────────────────────────────────────────────────────────────────
+
+async function main() {
+  console.log('\n╔══════════════════════════════════════════════════════════╗');
+  console.log('║   TEST CONCURRENCIA — RESERVA / ASIGNACION (JERARQUIA)     ║');
+  console.log('╚══════════════════════════════════════════════════════════╝\n');
+
+  const stamp = Date.now();
+  let sConductor;
+
+  const pass = 'test123456';
+  const d = String(stamp).slice(-7);
+  const lic = '2028-01-01T00:00:00.000Z';
+
+  const U = {
+    cli: { email: `cli-conc-${stamp}@test.com`, dni: d + '0', nombre: 'Cli', apellido: 'Conc' },
+    conInd: {
+      email: `conind-conc-${stamp}@test.com`,
+      dni: d + '1',
+      nombre: 'ConInd',
+      apellido: 'Conc',
+      nro_licencia: 'LCI' + d,
+      licencia_vencimiento: lic,
+    },
+    ger1: {
+      email: `ger1-conc-${stamp}@test.com`,
+      dni: d + '2',
+      nombre: 'Ger1',
+      apellido: 'Conc',
+      cuit_empresa: '30' + d + '10',
+      nombre_empresa: `Ger1Conc ${stamp}`,
+    },
+    ger2: {
+      email: `ger2-conc-${stamp}@test.com`,
+      dni: d + '3',
+      nombre: 'Ger2',
+      apellido: 'Conc',
+      cuit_empresa: '30' + d + '20',
+      nombre_empresa: `Ger2Conc ${stamp}`,
+    },
+  };
+
+  console.log('── SETUP: cliente, conductor independiente, 2 gerentes con empresa + flota ──\n');
+
+  await registrar({ ...U.cli, contrasena: pass }, 'cliente');
+  await registrar({ ...U.conInd, contrasena: pass }, 'conductor');
+  await registrar({ ...U.ger1, contrasena: pass }, 'gerente');
+  await registrar({ ...U.ger2, contrasena: pass }, 'gerente');
+
+  const clienteToken = await getToken(U.cli.email, pass);
+  const conIndToken = await getToken(U.conInd.email, pass);
+  const ger1Token = await getToken(U.ger1.email, pass);
+  const ger2Token = await getToken(U.ger2.email, pass);
+
+  await crearVehiculoPropioSiNoExiste(conIndToken, `PI${String(stamp).slice(-5)}`);
+
+  const emp1 = await crearEmpresa(ger1Token, `Flota Conc1 ${stamp}`, '31' + String(stamp).slice(-9));
+  const emp2 = await crearEmpresa(ger2Token, `Flota Conc2 ${stamp}`, '32' + String(stamp).slice(-9));
+  await crearVehiculoFlota(ger1Token, emp1.id_empresa, `F1${String(stamp).slice(-5)}`);
+  await crearVehiculoFlota(ger2Token, emp2.id_empresa, `F2${String(stamp).slice(-5)}`);
+
+  console.log(`  empresa1=${emp1.id_empresa} (gerente1)   empresa2=${emp2.id_empresa} (gerente2)`);
+
+  sConductor = await conectar(conIndToken);
+  await esperar(1000);
+
+  // ── CASO A: dos gerentes de dos empresas distintas reservan el MISMO viaje ─
+  console.log('\n── CASO A: gerente1 vs gerente2 — Promise.all sobre POST /reservar ────\n');
+  const vA = await crearViaje(clienteToken);
+  await esperar(500);
+
+  const [resA1, resA2] = await Promise.all([
+    reservar(ger1Token, vA, emp1.id_empresa),
+    reservar(ger2Token, vA, emp2.id_empresa),
+  ]);
+  await esperar(500);
+  const vADb = await estadoDe(vA);
+
+  console.log(`  gerente1 → status=${resA1.status} body=${JSON.stringify(resA1.data)}`);
+  console.log(`  gerente2 → status=${resA2.status} body=${JSON.stringify(resA2.data)}`);
+  console.log(`  DB final → estado=${vADb.estado} id_empresa=${vADb.id_empresa}`);
+
+  const ganadoresA = [resA1, resA2].filter((r) => r.status === 200);
+  const perdedoresA = [resA1, resA2].filter((r) => r.status !== 200);
+  const idEmpresaGanadoraA = resA1.status === 200 ? emp1.id_empresa : resA2.status === 200 ? emp2.id_empresa : null;
+
+  paso('CASO A1: exactamente un gerente gana (200)', ganadoresA.length === 1, `ganadores=${ganadoresA.length}`);
+  paso(
+    'CASO A2: el otro gerente recibe 409 "no disponible"',
+    perdedoresA.length === 1 && perdedoresA[0].status === 409 && typeof perdedoresA[0].data.error === 'string',
+    perdedoresA.length === 1 ? `status=${perdedoresA[0].status} err=${perdedoresA[0].data.error}` : 'no hubo un unico perdedor'
+  );
+  paso(
+    'CASO A3: la DB queda RESERVADO_POR_EMPRESA con la empresa ganadora unicamente',
+    vADb.estado === 'RESERVADO_POR_EMPRESA' && vADb.id_empresa === idEmpresaGanadoraA,
+    `estado=${vADb.estado} id_empresa=${vADb.id_empresa} esperado=${idEmpresaGanadoraA}`
+  );
+
+  // ── CASO B: gerente reserva (REST) vs conductor independiente acepta (socket) ─
+  console.log('\n── CASO B: gerente1 (REST /reservar) vs conductor independiente (socket viaje:aceptar) ──\n');
+  const vB = await crearViaje(clienteToken);
+  await esperar(500);
+
+  const resultadoSocket = new Promise((resolve) => {
+    sConductor.once('viaje:conductor_asignado', (d) => resolve({ tipo: 'ganado', data: d }));
+    sConductor.once('viaje:ya_asignado', (d) => resolve({ tipo: 'perdido', data: d }));
+    setTimeout(() => resolve({ tipo: 'timeout' }), 5000);
+  });
+
+  // Disparados sin await entre medio: el fetch de reservar() arranca en la
+  // misma vuelta de sincrono en la que se emite el evento de socket.
+  const [resB, resSocket] = await Promise.all([
+    reservar(ger1Token, vB, emp1.id_empresa),
+    (() => {
+      sConductor.emit('viaje:aceptar', { id_viaje: vB });
+      return resultadoSocket;
+    })(),
+  ]);
+  await esperar(500);
+  const vBDb = await estadoDe(vB);
+
+  console.log(`  gerente1 (REST reservar) → status=${resB.status} body=${JSON.stringify(resB.data)}`);
+  console.log(`  conductor independiente (socket aceptar) → ${resSocket.tipo} ${JSON.stringify(resSocket.data ?? {})}`);
+  console.log(`  DB final → estado=${vBDb.estado} id_empresa=${vBDb.id_empresa} id_conductor=${vBDb.id_conductor}`);
+
+  const gerenteGanoB = resB.status === 200;
+  const conductorGanoB = resSocket.tipo === 'ganado';
+
+  paso('CASO B1: gana exactamente uno de los dos (gerente XOR conductor)', gerenteGanoB !== conductorGanoB, `gerenteGano=${gerenteGanoB} conductorGano=${conductorGanoB} eventoSocket=${resSocket.tipo}`);
+  paso(
+    'CASO B2: si gano el gerente, el conductor recibe viaje:ya_asignado',
+    !gerenteGanoB || resSocket.tipo === 'perdido',
+    `gerenteGano=${gerenteGanoB} eventoConductor=${resSocket.tipo}`
+  );
+  paso(
+    'CASO B3: si gano el conductor, el gerente recibe 409',
+    !conductorGanoB || resB.status === 409,
+    `conductorGano=${conductorGanoB} statusGerente=${resB.status}`
+  );
+  paso(
+    'CASO B4: la DB queda en un unico estado consistente con el ganador',
+    gerenteGanoB
+      ? vBDb.estado === 'RESERVADO_POR_EMPRESA' && vBDb.id_empresa === emp1.id_empresa && vBDb.id_conductor === null
+      : conductorGanoB
+        ? vBDb.estado === 'CONDUCTOR_ASIGNADO' && vBDb.id_conductor !== null && vBDb.id_empresa === null
+        : false,
+    `estado=${vBDb.estado} id_empresa=${vBDb.id_empresa} id_conductor=${vBDb.id_conductor}`
+  );
+
+  // ── RESUMEN ──────────────────────────────────────────────────────────────
+  await cleanup([sConductor]);
+
+  const ok = pasos.filter((p) => p.ok).length;
+  const fallaron = pasos.filter((p) => !p.ok);
+
+  console.log('\n╔══════════════════════════════════════════════════════════╗');
+  console.log('║                        RESUMEN                              ║');
+  console.log('╚══════════════════════════════════════════════════════════╝\n');
+  pasos.forEach((p) => console.log(`  ${p.ok ? '✅' : '❌'} ${p.nombre}`));
+  console.log(`\n  ${ok}/${pasos.length} checks pasaron`);
+  if (fallaron.length > 0) {
+    console.log('\n  Fallaron:');
+    fallaron.forEach((p) => console.log(`    ❌ ${p.nombre}${p.detalle ? ': ' + p.detalle : ''}`));
+  }
+
+  process.exit(fallaron.length === 0 ? 0 : 1);
+}
+
+main().catch(async (e) => {
+  console.error('\n💥 Error inesperado:', e.message, e.stack);
+  try {
+    await prisma.$disconnect();
+  } catch {
+    /* noop */
+  }
+  try {
+    await redis.quit();
+  } catch {
+    /* noop */
+  }
+  process.exit(1);
+});

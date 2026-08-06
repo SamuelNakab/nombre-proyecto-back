@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import prisma from '../config/prisma.js';
 import { generarCodigoUnico, ejecutarDesafiliacion } from '../services/afiliacion.service.js';
+import { conductorEsElegible } from '../services/elegibilidad.service.js';
 
 const TIPOS_CONDICION = ['FRAGIL', 'REFRIGERADO', 'CARGA_PESADA', 'PELIGROSO', 'VOLUMINOSO'];
 
@@ -320,6 +321,8 @@ export async function listarViajesEmpresa(req, res) {
     where: { id_empresa },
     include: {
       paradas: { orderBy: { orden: 'asc' } },
+      condiciones_req: true,
+      vehiculo: { include: { condiciones: true } },
       cliente: { include: { usuario: { select: { nombre: true, apellido: true, telefono: true } } } },
       conductor: { include: { usuario: { select: { nombre: true, apellido: true, telefono: true } } } },
     },
@@ -327,4 +330,50 @@ export async function listarViajesEmpresa(req, res) {
   });
 
   return res.status(200).json(viajes);
+}
+
+// ─── GET /api/empresas/:id/viajes-disponibles ────────────────────────────────
+
+// Pull REST del mercado abierto para el gerente: el equivalente a
+// GET /api/viajes/disponibles del conductor, pero a nivel empresa. Complementa
+// el push por socket (viaje:disponible) para el que se conecta despues.
+export async function listarViajesDisponiblesEmpresa(req, res) {
+  const id_empresa = idParam(req.params.id);
+  if (!id_empresa) return res.status(400).json({ error: 'id de empresa invalido' });
+
+  const acceso = await empresaDelGerente(id_empresa, req.usuario.id_usuario);
+  if (acceso.error) return res.status(acceso.status).json({ error: acceso.error });
+
+  const flota = await prisma.vehiculo.findMany({
+    where: { id_empresa },
+    include: { condiciones: true },
+  });
+
+  const viajes = await prisma.viaje.findMany({
+    where: {
+      estado: 'BUSCANDO_CONDUCTOR',
+      fecha_programada: { gt: new Date() },
+    },
+    include: {
+      paradas: { orderBy: { orden: 'asc' } },
+      condiciones_req: true,
+      cliente: { include: { usuario: { select: { nombre: true, apellido: true, telefono: true } } } },
+    },
+    orderBy: { fecha_programada: 'asc' },
+  });
+
+  // Mismo helper de matching de condiciones que usa listarViajesDisponibles: la
+  // flota entra por el slot de "vehiculos propios" (a nivel empresa no hay
+  // vehiculos asignados via ConductorVehiculo), de modo que la regla queda
+  // identica a la del push — al menos un vehiculo de flota cumple TODAS las
+  // condiciones del viaje, y una flota vacia no es elegible para nada.
+  const elegibles = viajes.filter((viaje) =>
+    conductorEsElegible(
+      [],
+      flota,
+      viaje.condiciones_req.map((c) => c.condicion)
+    )
+  );
+
+  return res.status(200).json(elegibles);
 }

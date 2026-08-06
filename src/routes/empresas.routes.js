@@ -12,6 +12,7 @@ import {
   listarFlota,
   bajaVehiculoFlota,
   listarViajesEmpresa,
+  listarViajesDisponiblesEmpresa,
 } from '../controllers/empresas.controller.js';
 
 const router = Router();
@@ -31,5 +32,6 @@ router.post('/:id/vehiculos', registrarVehiculoFlota);
 router.get('/:id/vehiculos', listarFlota);
 router.delete('/:id/vehiculos/:idv', bajaVehiculoFlota);
 router.get('/:id/viajes', listarViajesEmpresa);
+router.get('/:id/viajes-disponibles', listarViajesDisponiblesEmpresa);
 
 export default router;

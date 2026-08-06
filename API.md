@@ -565,9 +565,12 @@ ve únicamente sus propios viajes.
 
 ### GET /api/viajes/:id
 
-Detalle de un viaje. Solo puede acceder el cliente que lo creó o el conductor asignado.
+Detalle de un viaje. Pueden acceder tres perfiles: el **cliente** que lo creó, el
+**conductor** asignado, y el **gerente de la empresa dueña** del viaje (es decir,
+`viaje.id_empresa` apunta a una empresa cuyo `id_gerente` sos vos). Cualquier otro
+usuario autenticado recibe `403`.
 
-**Rol requerido:** Autenticado (`CLIENTE` o `CONDUCTOR`)
+**Rol requerido:** Autenticado (`CLIENTE`, `CONDUCTOR` o `GERENTE`)
 
 **Respuesta exitosa — 200:**
 ```json
@@ -612,10 +615,20 @@ Detalle de un viaje. Solo puede acceder el cliente que lo creó o el conductor a
       "telefono": "+5491187654321"
     }
   },
+  "empresa": {
+    "id_empresa": 5,
+    "nombre": "Fletes del Sur",
+    "id_gerente": 12
+  },
   "ruta_planeada": [[-58.38162, -34.60361], [-58.38201, -34.60280], "..."]
 }
 ```
 
+- `empresa`: **`null`** si el viaje no es de ninguna empresa (viaje de un conductor
+  independiente). Si el viaje fue reservado/asignado por una empresa, trae sus datos
+  y es lo que habilita el acceso del gerente a este endpoint.
+- `condiciones_req`: condiciones requeridas del viaje, siempre presente (array vacío
+  si el cliente no pidió ninguna).
 - `ruta_planeada`: array de puntos `[lng, lat]` (ver [Formato de ruta](#formato-de-ruta)). Es
   **`null`** si el viaje ya terminó (`FINALIZADO`/`CANCELADO`, con el cache de Redis ya limpio)
   o si la ruta nunca llegó a calcularse.
@@ -628,7 +641,7 @@ Detalle de un viaje. Solo puede acceder el cliente que lo creó o el conductor a
 | Status | Body | Causa |
 |--------|------|-------|
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
-| 403 | `{ "error": "Sin acceso a este viaje" }` | El usuario no es el cliente ni el conductor del viaje |
+| 403 | `{ "error": "Sin acceso a este viaje" }` | El usuario no es el cliente, ni el conductor asignado, ni el gerente de la empresa dueña del viaje |
 | 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
 
 ---
@@ -2426,7 +2439,72 @@ Body: `{ "nombre": "string", "cuit": "11 dígitos" }`. → `201` con el objeto e
 
 **DELETE /api/empresas/:id/vehiculos/:idv** — da de baja un vehículo de flota. `400` si está en un viaje activo.
 
-**GET /api/empresas/:id/viajes** — viajes de la empresa (activos e históricos), con paradas, cliente y conductor.
+**GET /api/empresas/:id/viajes** — viajes de la empresa (activos e históricos), con paradas, `condiciones_req`, el vehículo asignado (con sus `condiciones`), cliente y conductor.
+
+---
+
+### GET /api/empresas/:id/viajes-disponibles
+
+Pull REST del mercado abierto para el gerente: los viajes en `BUSCANDO_CONDUCTOR`
+con `fecha_programada` futura que **la flota de esa empresa puede cumplir**. Es el
+equivalente a `GET /api/viajes/disponibles` del conductor, a nivel empresa, y
+complementa el push por socket `viaje:disponible` (sirve para el gerente que se
+conecta después de que el viaje se publicó, o que recarga la pantalla).
+
+**Rol requerido:** `GERENTE`, y tenés que ser el gerente dueño de `:id`.
+
+**Filtro de elegibilidad:** una empresa es elegible para un viaje si **al menos un
+vehículo de su flota cumple TODAS las condiciones requeridas** del viaje. Si el
+viaje no requiere condiciones, alcanza con tener al menos un vehículo de flota —
+una empresa sin vehículos no es elegible para ningún viaje. Es la misma regla del
+push (`obtenerGerentesElegibles`), resuelta con el mismo helper de matching de
+condiciones (`conductorEsElegible`), así que el pull y el push no se pueden
+desincronizar.
+
+**Respuesta exitosa — 200:** array ordenado por `fecha_programada` ascendente.
+```json
+[
+  {
+    "id_viaje": 42,
+    "zona": "CABA",
+    "precio_estimado": 2500,
+    "fecha_programada": "2026-07-01T10:00:00.000Z",
+    "descripcion": "Carga frágil, llamar al llegar, portón azul",
+    "estado": "BUSCANDO_CONDUCTOR",
+    "paradas": [
+      {
+        "orden": 1,
+        "direccion": "Plaza de Mayo, CABA",
+        "latitud": -34.6037,
+        "longitud": -58.3816
+      }
+    ],
+    "condiciones_req": [
+      { "condicion": "FRAGIL" }
+    ],
+    "cliente": {
+      "usuario": {
+        "nombre": "Juan",
+        "apellido": "Pérez",
+        "telefono": "+5491112345678"
+      }
+    }
+  }
+]
+```
+
+`condiciones_req` viene en cada viaje para que el front pueda filtrar la flota al
+momento de asignar (`POST /api/viajes/:id/asignar` rechaza un vehículo que no
+cumpla). `descripcion` es `null` si el cliente no escribió una.
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "id de empresa invalido" }` | `:id` no es un entero positivo |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol GERENTE |
+| 403 | `{ "error": "No sos el gerente de esta empresa" }` | La empresa existe pero es de otro gerente |
+| 404 | `{ "error": "Empresa no encontrada" }` | No existe empresa con ese id |
 
 ---
 

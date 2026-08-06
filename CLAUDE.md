@@ -114,6 +114,21 @@ Transiciones validas:
   cancelacion de un conductor independiente). Asi, alguien que se conecto
   DESPUES de la reserva original tambien recibe viaje:disponible.
 
+### Visibilidad del gerente
+- Ademas del push por socket (viaje:disponible), el gerente descubre viajes
+  disponibles por REST via GET /api/empresas/:id/viajes-disponibles: los
+  BUSCANDO_CONDUCTOR con fecha futura que la flota de esa empresa puede
+  cumplir. Sirve para el que se conecta tarde o recarga la pantalla. El
+  filtro de condiciones REUSA conductorEsElegible (el mismo helper de
+  elegibilidad.service.js que usa listarViajesDisponibles), pasando la flota
+  por el slot de "vehiculos propios" — no se reimplementa el matching, asi
+  el pull y el push no se pueden desincronizar.
+- GET /api/empresas/:id/viajes incluye condiciones_req de cada viaje y las
+  condiciones del vehiculo asignado (para filtrar la flota en el front).
+- GET /api/viajes/:id lo puede leer tambien el gerente de la empresa dueña
+  del viaje (viaje.id_empresa → empresa.id_gerente), ademas del cliente
+  dueño y el conductor asignado. Cualquier otro → 403.
+
 ### Ejecucion
 - El conductor asignado NO confirma la asignacion (por ahora): la ve en su
   pestaña "asignados" y puede iniciarla.
@@ -177,4 +192,5 @@ node scripts/test-cancelacion-conductor.js
 node scripts/test-cancelacion-cliente.js
 node scripts/test-admin.js
 node scripts/test-iniciar-viaje.js
-node scripts/test-jerarquia.js   (nuevo, esta tarea)
+node scripts/test-jerarquia.js
+node scripts/test-visibilidad-gerente.js   (nuevo, visibilidad del gerente)

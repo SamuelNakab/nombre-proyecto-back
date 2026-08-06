@@ -225,6 +225,7 @@ export async function obtenerViaje(req, res) {
       condiciones_req: true,
       cliente: { include: { usuario: true } },
       conductor: { include: { usuario: true } },
+      empresa: { select: { id_empresa: true, nombre: true, id_gerente: true } },
       calificacion: true,
     },
   });
@@ -236,8 +237,12 @@ export async function obtenerViaje(req, res) {
   const esCliente = viaje.cliente.id_usuario === req.usuario.id_usuario;
   const esConductor =
     viaje.conductor !== null && viaje.conductor.id_usuario === req.usuario.id_usuario;
+  // Tercera via: el gerente de la empresa dueña del viaje (viajes reservados o
+  // asignados por su empresa) lo lee para seguimiento, igual que el cliente.
+  const esGerenteDeLaEmpresa =
+    viaje.empresa !== null && viaje.empresa.id_gerente === req.usuario.id_usuario;
 
-  if (!esCliente && !esConductor) {
+  if (!esCliente && !esConductor && !esGerenteDeLaEmpresa) {
     return res.status(403).json({ error: 'Sin acceso a este viaje' });
   }
 

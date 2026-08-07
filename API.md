@@ -565,9 +565,12 @@ ve únicamente sus propios viajes.
 
 ### GET /api/viajes/:id
 
-Detalle de un viaje. Solo puede acceder el cliente que lo creó o el conductor asignado.
+Detalle de un viaje. Pueden acceder tres perfiles: el **cliente** que lo creó, el
+**conductor** asignado, y el **gerente de la empresa dueña** del viaje (es decir,
+`viaje.id_empresa` apunta a una empresa cuyo `id_gerente` sos vos). Cualquier otro
+usuario autenticado recibe `403`.
 
-**Rol requerido:** Autenticado (`CLIENTE` o `CONDUCTOR`)
+**Rol requerido:** Autenticado (`CLIENTE`, `CONDUCTOR` o `GERENTE`)
 
 **Respuesta exitosa — 200:**
 ```json
@@ -612,10 +615,20 @@ Detalle de un viaje. Solo puede acceder el cliente que lo creó o el conductor a
       "telefono": "+5491187654321"
     }
   },
+  "empresa": {
+    "id_empresa": 5,
+    "nombre": "Fletes del Sur",
+    "id_gerente": 12
+  },
   "ruta_planeada": [[-58.38162, -34.60361], [-58.38201, -34.60280], "..."]
 }
 ```
 
+- `empresa`: **`null`** si el viaje no es de ninguna empresa (viaje de un conductor
+  independiente). Si el viaje fue reservado/asignado por una empresa, trae sus datos
+  y es lo que habilita el acceso del gerente a este endpoint.
+- `condiciones_req`: condiciones requeridas del viaje, siempre presente (array vacío
+  si el cliente no pidió ninguna).
 - `ruta_planeada`: array de puntos `[lng, lat]` (ver [Formato de ruta](#formato-de-ruta)). Es
   **`null`** si el viaje ya terminó (`FINALIZADO`/`CANCELADO`, con el cache de Redis ya limpio)
   o si la ruta nunca llegó a calcularse.
@@ -628,7 +641,7 @@ Detalle de un viaje. Solo puede acceder el cliente que lo creó o el conductor a
 | Status | Body | Causa |
 |--------|------|-------|
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
-| 403 | `{ "error": "Sin acceso a este viaje" }` | El usuario no es el cliente ni el conductor del viaje |
+| 403 | `{ "error": "Sin acceso a este viaje" }` | El usuario no es el cliente, ni el conductor asignado, ni el gerente de la empresa dueña del viaje |
 | 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
 
 ---
@@ -670,9 +683,9 @@ emiten con `{ "error": "..." }` (ver esa sección). Conviene leer ambos campos:
 
 ### Evento: viaje:disponible
 
-**Dirección:** servidor → conductor  
-**Quién lo recibe:** conductores elegibles conectados cuando se crea un viaje nuevo  
-**Cuándo:** inmediatamente después de que un cliente hace `POST /api/viajes`
+**Dirección:** servidor → conductores y gerentes elegibles  
+**Quién lo recibe:** conductores independientes elegibles **y** gerentes cuya empresa activa tiene al menos un vehículo de flota que cumple las condiciones del viaje (elegibilidad a nivel empresa)  
+**Cuándo:** inmediatamente después de que un cliente hace `POST /api/viajes`, y también cuando un viaje **vuelve al mercado** (cancelación de conductor independiente, o una reserva de empresa liberada por `cancelar-reserva`/timeout)
 
 **Payload:**
 ```json
@@ -822,24 +835,18 @@ socket.on('viaje:ya_asignado', (data) => {
 
 ### Evento: viaje:cancelado_sin_conductor
 
-**Dirección:** servidor → cliente  
-**Quién lo recibe:** el cliente que creó el viaje  
-**Cuándo:** cuando nadie acepta el viaje dentro del tiempo límite (10 minutos por defecto)
+> **⚠️ Obsoleto — el servidor ya no lo emite.** El mecanismo de auto-cancelación por
+> timeout de matching (`MATCHING_TIMEOUT_MINUTOS`) fue **eliminado por completo**. Un viaje
+> en `BUSCANDO_CONDUCTOR` **ya no se cancela solo** si nadie lo acepta: queda disponible hasta
+> que un conductor lo acepte, un gerente lo reserve, o el cliente/admin lo cancele. Se
+> documenta acá solo por compatibilidad histórica; el front ya no necesita escucharlo.
 
-**Payload:**
+**Payload (histórico):**
 ```json
 {
   "id_viaje": 42,
   "mensaje": "No se encontro un conductor disponible"
 }
-```
-
-**Cómo escucharlo:**
-```js
-socket.on('viaje:cancelado_sin_conductor', (data) => {
-  // mostrar mensaje y ofrecer volver a publicar el viaje
-  console.log(data.mensaje);
-});
 ```
 
 ---
@@ -895,18 +902,24 @@ Estados válidos para este endpoint: `CARGANDO`, `EN_RUTA`, `DESCARGANDO`.
 ```json
 {
   "id_viaje": 42,
-  "estado_anterior": "EN_RUTA",
+  "estado_anterior": "EN_CAMINO_A_ORIGEN",
   "estado_nuevo": "CARGANDO"
 }
 ```
 
 **Comportamiento adicional:** emite el evento `viaje:estado_cambiado` al room del viaje via WebSocket.
 
+**Máquina de estados:** este endpoint valida la transición contra la máquina de estados (ver
+[Máquina de estados](#maquina-de-estados)). Solo se permite avanzar por el flujo manual
+`EN_CAMINO_A_ORIGEN → CARGANDO → EN_RUTA → DESCARGANDO`. Cualquier **retroceso**
+(p. ej. `EN_RUTA → CARGANDO`), salto de estado, o transición desde un estado terminal se
+rechaza con `400`.
+
 **Errores posibles:**
 | Status | Body | Causa |
 |--------|------|-------|
-| 400 | `{ "error": "mensaje de validación" }` | Estado no válido |
-| 400 | `{ "error": "El viaje ya esta finalizado o cancelado" }` | Viaje en estado terminal |
+| 400 | `{ "error": "mensaje de validación" }` | El `estado` del body no es `CARGANDO`/`EN_RUTA`/`DESCARGANDO` |
+| 400 | `{ "error": "Transicion invalida: no se puede pasar de <ESTADO> a <ESTADO>" }` | La transición no está permitida por la máquina de estados (retroceso, salto o viaje terminal) |
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
 | 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
 | 403 | `{ "error": "No sos el conductor de este viaje" }` | El conductor no está asignado a este viaje |
@@ -916,23 +929,29 @@ Estados válidos para este endpoint: `CARGANDO`, `EN_RUTA`, `DESCARGANDO`.
 
 ### POST /api/viajes/:id/iniciar
 
-El conductor asignado inicia el viaje (**botón "Iniciar viaje"**). Es la **única** forma de pasar
-de `CONDUCTOR_ASIGNADO` a `EN_CAMINO_A_ORIGEN`: el inicio automático por primer ping GPS **ya no
-existe**. Registra el momento real del inicio (`fecha_inicio`) y califica la puntualidad
+El conductor asignado **o el gerente de la empresa del viaje** inicia el viaje (**botón "Iniciar
+viaje"**). Es la **única** forma de pasar de `CONDUCTOR_ASIGNADO` a `EN_CAMINO_A_ORIGEN`: el
+inicio automático por primer ping GPS **ya no existe**. Registra el momento real del inicio
+(`fecha_inicio`), quién lo inició (`iniciado_por`) y califica la puntualidad
 (`puntualidad_inicio`) contra la `fecha_programada`.
 
+> **El GPS siempre viene del celular del conductor**, sin importar quién apretó "Iniciar viaje".
 > **Flujo correcto del mobile:** botón → `200` → **recién ahí** arrancar el GPS. Los pings
 > enviados antes de iniciar se rechazan (ver el evento `conductor:ubicacion`).
 
-**Rol requerido:** `CONDUCTOR` (debe ser el conductor asignado al viaje)
+**Rol requerido:** `CONDUCTOR` (el conductor asignado) **o** `GERENTE` (el gerente de la empresa del viaje)
 
 **Body:** Ninguno (vacío)
 
 **Validaciones en orden:**
 1. El viaje existe. Si no → `404`.
-2. El usuario autenticado es el conductor asignado al viaje. Si no → `403`.
+2. El usuario autenticado es el conductor asignado **o** el gerente de la empresa del viaje
+   (`viaje.id_empresa`). Si no es ninguno → `403`.
 3. El viaje está en estado `CONDUCTOR_ASIGNADO`. Cualquier otro estado → `400`.
 4. Ventana de tiempo (ver abajo). Demasiado temprano → `400`.
+
+`iniciado_por` queda en `"CONDUCTOR"` si lo inició el conductor asignado, o `"GERENTE"` si lo
+inició el gerente.
 
 **Ventana de tiempo:**
 El viaje puede iniciarse a partir de `fecha_programada - VENTANA_INICIO_MINUTOS` (variable de
@@ -957,14 +976,15 @@ Se calcula con el retraso en minutos entre el momento del inicio y la `fecha_pro
   "id_viaje": 42,
   "estado": "EN_CAMINO_A_ORIGEN",
   "fecha_inicio": "2026-07-14T21:51:39.023Z",
-  "puntualidad_inicio": "A_TIEMPO"
+  "puntualidad_inicio": "A_TIEMPO",
+  "iniciado_por": "GERENTE"
 }
 ```
 
 **Efectos secundarios:**
-- El viaje pasa a `EN_CAMINO_A_ORIGEN` y se persisten `fecha_inicio` y `puntualidad_inicio`.
+- El viaje pasa a `EN_CAMINO_A_ORIGEN` y se persisten `fecha_inicio`, `puntualidad_inicio` e `iniciado_por`.
 - Se emite `viaje:iniciado` al room personal del cliente (`usuario:{id_usuario_cliente}`).
-- A partir de este momento se aceptan los pings `conductor:ubicacion` de este viaje.
+- A partir de este momento se aceptan los pings `conductor:ubicacion` de este viaje (siempre desde el conductor).
 
 **Errores posibles:**
 | Status | Body | Causa |
@@ -972,20 +992,27 @@ Se calcula con el retraso en minutos entre el momento del inicio y la `fecha_pro
 | 400 | `{ "error": "Solo se puede iniciar un viaje en estado CONDUCTOR_ASIGNADO, el viaje actual esta en estado <ESTADO>" }` | El viaje no está en `CONDUCTOR_ASIGNADO`. Incluye el **doble inicio** (ya está en `EN_CAMINO_A_ORIGEN`) |
 | 400 | `{ "error": "El viaje solo puede iniciarse a partir de las <HH:MM>" }` | Todavía no abrió la ventana de inicio |
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
-| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
-| 403 | `{ "error": "No autorizado para iniciar este viaje" }` | El viaje está asignado a otro conductor |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol `CONDUCTOR` ni `GERENTE` |
+| 403 | `{ "error": "No autorizado para iniciar este viaje" }` | No es el conductor asignado ni el gerente de la empresa del viaje |
 | 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
 
 ---
 
 ### POST /api/viajes/:id/cancelar-conductor
 
-El conductor asignado cancela el viaje y lo devuelve al pool de búsqueda. El viaje
-**mantiene su `id_viaje`**, vuelve a estado `BUSCANDO_CONDUCTOR` con `id_conductor` e
-`id_vehiculo` en `null`, y se vuelve a publicar a los conductores elegibles reutilizando
-el mismo flujo que la creación (`POST /api/viajes`). Solo se permite mientras el viaje está
-en estado `CONDUCTOR_ASIGNADO` (es decir, hasta el instante en que el conductor pulsa
-**Iniciar viaje** con `POST /api/viajes/:id/iniciar`, que ya lo lleva a `EN_CAMINO_A_ORIGEN`).
+El conductor asignado cancela el viaje. El viaje **mantiene su `id_viaje`** y se libera
+`id_conductor`/`id_vehiculo`. Solo se permite mientras el viaje está en estado
+`CONDUCTOR_ASIGNADO` (es decir, hasta el instante en que se pulsa **Iniciar viaje**, que ya lo
+lleva a `EN_CAMINO_A_ORIGEN`).
+
+**El destino depende de si el viaje es de una empresa:**
+- **Viaje independiente** (sin `id_empresa`): vuelve a `BUSCANDO_CONDUCTOR` y se **republica** a
+  los conductores/gerentes elegibles reutilizando el mismo flujo que la creación
+  (`POST /api/viajes`). Comportamiento de siempre.
+- **Viaje de empresa** (con `id_empresa`): vuelve a `RESERVADO_POR_EMPRESA` (NO al mercado
+  abierto) para que el gerente reasigne, y se emite `viaje:requiere_reasignacion` al room
+  personal del gerente con `motivo: "conductor_cancelo"` (ver
+  [Estructura jerárquica](#estructura-jerarquica)). No se republica.
 
 **Rol requerido:** `CONDUCTOR` (debe ser el conductor asignado al viaje)
 
@@ -2350,13 +2377,184 @@ conductor y por cliente no notifican por WebSocket — pendiente para el futuro)
 
 ---
 
+<a id="estructura-jerarquica"></a>
+## Estructura jerárquica — empresas, flota y afiliación
+
+Modelo para empresas de logística. Roles:
+
+- **CLIENTE**: crea viajes (sin cambios).
+- **Conductor INDEPENDIENTE**: sin empresa, ve/acepta/coordina viajes con sus propios vehículos (sin cambios).
+- **Conductor AFILIADO**: pertenece a 1 o N empresas. **Conserva su menú personal** (sigue viendo y aceptando viajes propios con sus vehículos) y **además** recibe asignaciones de sus gerentes (pestaña "asignados", ver `GET /api/viajes/asignados`).
+- **GERENTE**: responsable de una empresa. Ve viajes disponibles, los reserva, asigna conductor + vehículo de su flota, registra vehículos, aprueba/desafilia conductores y ve el tracking de los viajes de su empresa.
+
+Un GERENTE se registra con `POST /api/auth/registro-gerente` (crea gerente + su primera empresa con `codigo_afiliacion`) y puede crear más empresas con `POST /api/empresas`.
+
+<a id="maquina-de-estados"></a>
+### Máquina de estados del viaje
+
+`PATCH /api/viajes/:id/estado` y todos los endpoints de esta sección validan las transiciones contra esta tabla. Cualquier transición no listada se rechaza con `400` (`Transicion invalida: no se puede pasar de <ESTADO> a <ESTADO>`).
+
+| Desde | Hacia | Quién / trigger |
+|-------|-------|-----------------|
+| BUSCANDO_CONDUCTOR | CONDUCTOR_ASIGNADO | Conductor independiente acepta (atómico, socket) |
+| BUSCANDO_CONDUCTOR | RESERVADO_POR_EMPRESA | Gerente reserva (atómico) |
+| BUSCANDO_CONDUCTOR | CANCELADO | Cliente / admin |
+| RESERVADO_POR_EMPRESA | CONDUCTOR_ASIGNADO | Gerente asigna conductor + vehículo |
+| RESERVADO_POR_EMPRESA | BUSCANDO_CONDUCTOR | Timeout, gerente suelta (cancelar-reserva), o desafiliación |
+| RESERVADO_POR_EMPRESA | CANCELADO | Cliente / admin |
+| CONDUCTOR_ASIGNADO | EN_CAMINO_A_ORIGEN | Iniciar viaje (conductor o gerente) |
+| CONDUCTOR_ASIGNADO | BUSCANDO_CONDUCTOR | Cancela conductor INDEPENDIENTE |
+| CONDUCTOR_ASIGNADO | RESERVADO_POR_EMPRESA | Cancela conductor de EMPRESA |
+| CONDUCTOR_ASIGNADO | CANCELADO | Cliente / admin |
+| EN_CAMINO_A_ORIGEN | CARGANDO | Manual, PATCH /estado |
+| CARGANDO | EN_RUTA | Manual, PATCH /estado |
+| EN_RUTA | DESCARGANDO | Manual, PATCH /estado |
+| DESCARGANDO | FINALIZADO | QR última parada |
+| cualquiera (no terminal) | CANCELADO | Admin |
+
+---
+
+### /empresas — gestión de empresas (rol GERENTE)
+
+Todos requieren token + rol `GERENTE`. Los que operan sobre `:id` verifican que seas el gerente dueño (si no → `403 "No sos el gerente de esta empresa"`; inexistente → `404`).
+
+**POST /api/empresas** — crea una empresa; el creador queda como gerente y se genera un `codigo_afiliacion` único.
+Body: `{ "nombre": "string", "cuit": "11 dígitos" }`. → `201` con el objeto empresa (`id_empresa`, `codigo_afiliacion`, `activa: true`). `409` si el CUIT ya existe.
+
+**GET /api/empresas/mias** — empresas donde soy gerente; cada una con `_count` de conductores vigentes, vehículos y viajes.
+
+**GET /api/empresas/:id** — detalle + `calificacion_promedio` = promedio de las calificaciones de los conductores **ACTIVOS que ya tienen al menos una calificación propia** (los que no tienen no cuentan como 0; `null` si ninguno tiene) + `cantidad_conductores_activos`.
+
+**POST /api/empresas/:id/regenerar-codigo** — nuevo `codigo_afiliacion`. → `200 { id_empresa, codigo_afiliacion }`.
+
+**GET /api/empresas/:id/conductores** — conductores vigentes de la empresa (ACTIVO y PENDIENTE) con datos de usuario y `estado`.
+
+**POST /api/empresas/:id/conductores/:idc/aprobar** — aprueba una solicitud PENDIENTE → ACTIVO (`:idc` = `id_conductor`). `409` si ya está ACTIVO; `404` si no hay solicitud.
+
+**DELETE /api/empresas/:id/conductores/:idc** — desafilia un conductor (soft-delete). Reglas: viaje EN CURSO (`EN_CAMINO_A_ORIGEN..DESCARGANDO`) de esa empresa → `400`. Viajes `CONDUCTOR_ASIGNADO` sin iniciar → vuelven a `RESERVADO_POR_EMPRESA` + `viaje:requiere_reasignacion` (`motivo: "conductor_desafiliado"`).
+
+**POST /api/empresas/:id/vehiculos** — registra un vehículo en la flota. Body: `{ patente (6-8), marca, modelo, anio, color, tipo_vehiculo, condiciones? }`. → `201` con `id_empresa`. `409` patente duplicada.
+
+**GET /api/empresas/:id/vehiculos** — lista la flota (con condiciones).
+
+**DELETE /api/empresas/:id/vehiculos/:idv** — da de baja un vehículo de flota. `400` si está en un viaje activo.
+
+**GET /api/empresas/:id/viajes** — viajes de la empresa (activos e históricos), con paradas, `condiciones_req`, el vehículo asignado (con sus `condiciones`), cliente y conductor.
+
+---
+
+### GET /api/empresas/:id/viajes-disponibles
+
+Pull REST del mercado abierto para el gerente: los viajes en `BUSCANDO_CONDUCTOR`
+con `fecha_programada` futura que **la flota de esa empresa puede cumplir**. Es el
+equivalente a `GET /api/viajes/disponibles` del conductor, a nivel empresa, y
+complementa el push por socket `viaje:disponible` (sirve para el gerente que se
+conecta después de que el viaje se publicó, o que recarga la pantalla).
+
+**Rol requerido:** `GERENTE`, y tenés que ser el gerente dueño de `:id`.
+
+**Filtro de elegibilidad:** una empresa es elegible para un viaje si **al menos un
+vehículo de su flota cumple TODAS las condiciones requeridas** del viaje. Si el
+viaje no requiere condiciones, alcanza con tener al menos un vehículo de flota —
+una empresa sin vehículos no es elegible para ningún viaje. Es la misma regla del
+push (`obtenerGerentesElegibles`), resuelta con el mismo helper de matching de
+condiciones (`conductorEsElegible`), así que el pull y el push no se pueden
+desincronizar.
+
+**Respuesta exitosa — 200:** array ordenado por `fecha_programada` ascendente.
+```json
+[
+  {
+    "id_viaje": 42,
+    "zona": "CABA",
+    "precio_estimado": 2500,
+    "fecha_programada": "2026-07-01T10:00:00.000Z",
+    "descripcion": "Carga frágil, llamar al llegar, portón azul",
+    "estado": "BUSCANDO_CONDUCTOR",
+    "paradas": [
+      {
+        "orden": 1,
+        "direccion": "Plaza de Mayo, CABA",
+        "latitud": -34.6037,
+        "longitud": -58.3816
+      }
+    ],
+    "condiciones_req": [
+      { "condicion": "FRAGIL" }
+    ],
+    "cliente": {
+      "usuario": {
+        "nombre": "Juan",
+        "apellido": "Pérez",
+        "telefono": "+5491112345678"
+      }
+    }
+  }
+]
+```
+
+`condiciones_req` viene en cada viaje para que el front pueda filtrar la flota al
+momento de asignar (`POST /api/viajes/:id/asignar` rechaza un vehículo que no
+cumpla). `descripcion` es `null` si el cliente no escribió una.
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "id de empresa invalido" }` | `:id` no es un entero positivo |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol GERENTE |
+| 403 | `{ "error": "No sos el gerente de esta empresa" }` | La empresa existe pero es de otro gerente |
+| 404 | `{ "error": "Empresa no encontrada" }` | No existe empresa con ese id |
+
+---
+
+### /afiliaciones — afiliación de conductores (rol CONDUCTOR)
+
+**POST /api/afiliaciones** — el conductor se afilia con el `codigo_afiliacion` de una empresa → solicitud en `PENDIENTE`.
+Body: `{ "codigo_afiliacion": "string" }`. → `201` con la afiliación. `404` código inválido; `400` empresa inactiva; `409` si ya estás afiliado o con solicitud pendiente.
+
+**GET /api/afiliaciones/mias** — todas las afiliaciones vigentes del conductor con su `estado` (PENDIENTE/ACTIVO) y la empresa.
+
+**DELETE /api/afiliaciones/:id** — el conductor se va de una empresa (`:id` = `id_conductor_empresa`). Aplica las mismas reglas de desafiliación (viaje EN CURSO → `400`; asignados sin iniciar → `RESERVADO_POR_EMPRESA`).
+
+---
+
+### Reserva y asignación (rol GERENTE)
+
+**POST /api/viajes/:id/reservar** — reserva **atómica** de un viaje en `BUSCANDO_CONDUCTOR` → `RESERVADO_POR_EMPRESA` (setea `id_empresa`, `fecha_reserva`). Body: `{ "id_empresa": N }` (opcional si el gerente tiene una sola empresa). Emite `viaje:reservado` al room (sale del pool). `409` si el viaje ya no está disponible.
+
+**POST /api/viajes/:id/asignar** — asigna conductor + vehículo a un viaje `RESERVADO_POR_EMPRESA` → `CONDUCTOR_ASIGNADO`. Body: `{ "id_conductor": N, "id_vehiculo": N }`. Valida: viaje de mi empresa, conductor ACTIVO en la empresa, vehículo de la flota que cumple las condiciones del viaje. Emite `viaje:asignado` al room personal del conductor y **suma al gerente al room `viaje:{id}`** (tracking: recibe `mapa:actualizar`/`eta:actualizar` como el cliente). `400` si el conductor no está activo o el vehículo no pertenece/no cumple.
+
+**POST /api/viajes/:id/reasignar** — reemplaza conductor y/o vehículo de un viaje `CONDUCTOR_ASIGNADO` **que todavía no arrancó** (`fecha_inicio` null). Mismas validaciones que asignar; re-emite `viaje:asignado`. `400` si el viaje ya arrancó.
+
+**POST /api/viajes/:id/cancelar-reserva** — suelta una reserva: `RESERVADO_POR_EMPRESA` → `BUSCANDO_CONDUCTOR`, limpia `id_empresa`/`fecha_reserva`, y **republica el viaje de cero** (re-corre elegibilidad de conductores + gerentes y los suma al room, así un conector que llega después también recibe `viaje:disponible`). Emite `viaje:reserva_cancelada`. También ocurre **automáticamente por timeout** (`RESERVA_TIMEOUT_MINUTOS`, default 10) vía un job periódico.
+
+**GET /api/viajes/asignados** (rol `CONDUCTOR`) — viajes en `CONDUCTOR_ASIGNADO` donde soy el conductor asignado. Devuelve paradas (origen/destino), `fecha_programada` y el vehículo asignado.
+
+---
+
+### WebSocket — eventos nuevos
+
+| Evento | Room / destinatario | Payload |
+|--------|---------------------|---------|
+| `viaje:reservado` | room `viaje:{id}` (sacar del pool a los demás) | `{ id_viaje, id_empresa }` |
+| `viaje:asignado` | room personal del conductor `usuario:{id_usuario}` | `{ id_viaje, id_empresa, fecha_programada, vehiculo, paradas }` |
+| `viaje:reserva_cancelada` | room `viaje:{id}` (vuelve al mercado) | `{ id_viaje }` |
+| `viaje:requiere_reasignacion` | room personal del gerente `usuario:{id_gerente}` | `{ id_viaje, id_empresa, motivo }` |
+
+- `viaje:asignado` le puede llegar al mismo conductor desde **varias empresas** — no asumir una sola empresa por conductor.
+- `viaje:requiere_reasignacion` avisa que un viaje **ya asignado** volvió a `RESERVADO_POR_EMPRESA` y necesita reasignarse. `motivo`: `"conductor_desafiliado"` o `"conductor_cancelo"`. Es distinto de `viaje:reserva_cancelada` (ese es "vuelve al mercado abierto").
+
+---
+
 ## Convenciones generales
 
 - Todos los errores devuelven `{ "error": "mensaje legible" }`
 - Fechas en formato ISO 8601 UTC
 - El campo `contrasena` nunca se almacena en la DB — solo va a Firebase
-- `id_conductor`, `id_vehiculo` e `id_empresa` en el viaje son `null` hasta que se asigne un conductor
+- En el viaje: `id_conductor`/`id_vehiculo` son `null` hasta que se asigna (por aceptación o por el gerente). `id_empresa` y `fecha_reserva` se setean cuando un gerente **reserva** el viaje (`RESERVADO_POR_EMPRESA`), antes de que haya conductor. `iniciado_por` (`"CONDUCTOR"`/`"GERENTE"`) se setea al iniciar.
 - El campo `vehiculo` en `viaje:conductor_asignado` siempre es un objeto no nulo — si el conductor no tiene vehículo elegible el servidor emite `error` antes de asignar el viaje
+- Estados del viaje: `BUSCANDO_CONDUCTOR`, `RESERVADO_POR_EMPRESA`, `CONDUCTOR_ASIGNADO`, `EN_CAMINO_A_ORIGEN`, `CARGANDO`, `EN_RUTA`, `DESCARGANDO`, `FINALIZADO`, `CANCELADO` (ver [Máquina de estados](#maquina-de-estados))
 
 <a id="formato-de-ruta"></a>
 ### Formato de ruta

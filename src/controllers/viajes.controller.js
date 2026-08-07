@@ -10,6 +10,7 @@ import { cerrarViaje } from '../services/cierre.service.js';
 import { recalcularEtaInmediato } from '../services/eta-emisor.js';
 import { limpiarViajeActivo } from '../services/cancelacion.service.js';
 import { calcularYGuardarRuta, obtenerRutaPlaneada } from '../services/ruta.service.js';
+import { validarTransicion } from '../services/estado-viaje.service.js';
 import { io } from '../sockets/index.js';
 
 // ─── QR helpers ──────────────────────────────────────────────────────────────
@@ -224,6 +225,7 @@ export async function obtenerViaje(req, res) {
       condiciones_req: true,
       cliente: { include: { usuario: true } },
       conductor: { include: { usuario: true } },
+      empresa: { select: { id_empresa: true, nombre: true, id_gerente: true } },
       calificacion: true,
     },
   });
@@ -235,8 +237,12 @@ export async function obtenerViaje(req, res) {
   const esCliente = viaje.cliente.id_usuario === req.usuario.id_usuario;
   const esConductor =
     viaje.conductor !== null && viaje.conductor.id_usuario === req.usuario.id_usuario;
+  // Tercera via: el gerente de la empresa dueña del viaje (viajes reservados o
+  // asignados por su empresa) lo lee para seguimiento, igual que el cliente.
+  const esGerenteDeLaEmpresa =
+    viaje.empresa !== null && viaje.empresa.id_gerente === req.usuario.id_usuario;
 
-  if (!esCliente && !esConductor) {
+  if (!esCliente && !esConductor && !esGerenteDeLaEmpresa) {
     return res.status(403).json({ error: 'Sin acceso a este viaje' });
   }
 
@@ -264,8 +270,14 @@ export async function cambiarEstado(req, res) {
   if (!viaje.conductor || viaje.conductor.id_usuario !== req.usuario.id_usuario) {
     return res.status(403).json({ error: 'No sos el conductor de este viaje' });
   }
-  if (viaje.estado === 'FINALIZADO' || viaje.estado === 'CANCELADO') {
-    return res.status(400).json({ error: 'El viaje ya esta finalizado o cancelado' });
+
+  // La maquina de estados es la unica fuente de verdad de que transiciones son
+  // validas. Reemplaza el viejo chequeo ad-hoc de FINALIZADO/CANCELADO y ademas
+  // rechaza retrocesos (p. ej. EN_RUTA -> CARGANDO).
+  try {
+    validarTransicion(viaje.estado, estado);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
   }
 
   const estado_anterior = viaje.estado;
@@ -291,7 +303,7 @@ export async function iniciarViaje(req, res) {
 
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },
-    include: { conductor: true, cliente: true },
+    include: { conductor: true, cliente: true, empresa: true },
   });
 
   // 1. El viaje existe.
@@ -299,10 +311,17 @@ export async function iniciarViaje(req, res) {
     return res.status(404).json({ error: 'Viaje no encontrado' });
   }
 
-  // 2. El conductor autenticado es el asignado.
-  if (!viaje.conductor || viaje.conductor.id_usuario !== req.usuario.id_usuario) {
+  // 2. Lo puede iniciar el conductor asignado O el gerente de la empresa del
+  //    viaje. iniciado_por guarda quien apreto el boton. El GPS sigue viniendo
+  //    siempre del celular del conductor, sin importar quien inicio.
+  const esConductorAsignado =
+    viaje.conductor && viaje.conductor.id_usuario === req.usuario.id_usuario;
+  const esGerenteDeLaEmpresa =
+    viaje.empresa && viaje.empresa.id_gerente === req.usuario.id_usuario;
+  if (!esConductorAsignado && !esGerenteDeLaEmpresa) {
     return res.status(403).json({ error: 'No autorizado para iniciar este viaje' });
   }
+  const iniciado_por = esConductorAsignado ? 'CONDUCTOR' : 'GERENTE';
 
   // 3. Solo se puede iniciar desde CONDUCTOR_ASIGNADO.
   if (viaje.estado !== 'CONDUCTOR_ASIGNADO') {
@@ -351,6 +370,7 @@ export async function iniciarViaje(req, res) {
       estado: 'EN_CAMINO_A_ORIGEN',
       fecha_inicio: ahora,
       puntualidad_inicio,
+      iniciado_por,
     },
   });
 
@@ -368,6 +388,7 @@ export async function iniciarViaje(req, res) {
     estado: 'EN_CAMINO_A_ORIGEN',
     fecha_inicio: actualizado.fecha_inicio,
     puntualidad_inicio,
+    iniciado_por,
   });
 }
 
@@ -376,7 +397,7 @@ export async function cancelarViajeConductor(req, res) {
 
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },
-    include: { conductor: true },
+    include: { conductor: true, empresa: true },
   });
 
   // 1. El viaje existe.
@@ -398,24 +419,33 @@ export async function cancelarViajeConductor(req, res) {
     });
   }
 
-  // El viaje mantiene su id_viaje: vuelve a BUSCANDO_CONDUCTOR y se libera
-  // conductor/vehiculo en una sola transaccion.
-  await prisma.$transaction([
-    prisma.viaje.update({
-      where: { id_viaje },
-      data: { estado: 'BUSCANDO_CONDUCTOR', id_conductor: null, id_vehiculo: null },
-    }),
-  ]);
+  // Si el viaje es de una empresa, la cancelacion lo devuelve a la empresa
+  // (RESERVADO_POR_EMPRESA) para que el gerente reasigne — NO al mercado
+  // abierto. Si es independiente, vuelve a BUSCANDO_CONDUCTOR y se republica,
+  // igual que hoy. El viaje mantiene su id_viaje en ambos casos.
+  const esDeEmpresa = viaje.id_empresa != null;
+  const nuevoEstado = esDeEmpresa ? 'RESERVADO_POR_EMPRESA' : 'BUSCANDO_CONDUCTOR';
+  validarTransicion(viaje.estado, nuevoEstado);
 
-  // Fuera de la transaccion: cleanup del estado activo del viaje (corta el
-  // emisor de ETA y borra TODAS las keys gps:{id_viaje}:*). Mismo helper que usa
-  // la cancelacion por cliente.
+  await prisma.viaje.update({
+    where: { id_viaje },
+    data: {
+      estado: nuevoEstado,
+      id_conductor: null,
+      id_vehiculo: null,
+      // Reinicia la ventana de reserva para el timeout cuando vuelve a la empresa.
+      ...(esDeEmpresa ? { fecha_reserva: new Date() } : {}),
+    },
+  });
+
+  // Cleanup del estado activo del viaje (corta el emisor de ETA y borra TODAS
+  // las keys gps:{id_viaje}:*). Idempotente. Mismo helper que la cancelacion por
+  // cliente.
   await limpiarViajeActivo(id_viaje);
 
+  // El socket del conductor que cancelo sale del room del viaje (best-effort,
+  // no bloqueante), en ambos caminos.
   if (io) {
-    // El socket del conductor que cancelo sale del room del viaje (best-effort,
-    // no bloqueante). Si sigue siendo elegible, publicarViajeAConductoresElegibles
-    // lo vuelve a unir enseguida: puede recibir viaje:disponible y reaceptar.
     try {
       const sockets = await io.in(`viaje:${id_viaje}`).fetchSockets();
       for (const s of sockets) {
@@ -429,10 +459,29 @@ export async function cancelarViajeConductor(req, res) {
         err.message
       );
     }
+  }
 
-    // Republicar reutilizando el mismo flujo que la creacion del viaje. El
-    // recalculo de ruta_planeada (Google Maps) ocurre cuando el siguiente
-    // conductor acepte y se haga el primer ping, igual que en un viaje nuevo.
+  // Camino EMPRESA: avisar al gerente que el viaje necesita reasignacion. Mismo
+  // evento que la desafiliacion, distinto motivo. No se republica al mercado.
+  if (esDeEmpresa) {
+    if (io && viaje.empresa) {
+      io.to(`usuario:${viaje.empresa.id_gerente}`).emit('viaje:requiere_reasignacion', {
+        id_viaje,
+        id_empresa: viaje.id_empresa,
+        motivo: 'conductor_cancelo',
+      });
+    }
+    return res.status(200).json({
+      mensaje: 'Viaje devuelto a la empresa para reasignacion',
+      id_viaje,
+      estado: 'RESERVADO_POR_EMPRESA',
+    });
+  }
+
+  // Camino INDEPENDIENTE: republicar reutilizando el mismo flujo que la creacion
+  // del viaje. El recalculo de ruta_planeada (Google Maps) ocurre cuando el
+  // siguiente conductor acepte y se haga el primer ping, igual que un viaje nuevo.
+  if (io) {
     const viajeRepublicar = await prisma.viaje.findUnique({
       where: { id_viaje },
       include: {
@@ -800,6 +849,53 @@ export async function listarMisViajesConductor(req, res) {
       },
     },
     orderBy: { creado_en: 'desc' },
+  });
+
+  return res.status(200).json(viajes);
+}
+
+// GET /api/viajes/asignados — pestaña "asignados" del conductor: viajes que un
+// gerente le asigno y todavia no arrancaron (CONDUCTOR_ASIGNADO). Devuelve las
+// paradas (origen/destino), la hora de inicio (fecha_programada) y el vehiculo
+// asignado por la empresa.
+export async function listarViajesAsignados(req, res) {
+  const conductor = await prisma.conductor.findUnique({
+    where: { id_usuario: req.usuario.id_usuario },
+  });
+  if (!conductor) {
+    return res.status(400).json({ error: 'El usuario no tiene perfil de conductor' });
+  }
+
+  const viajes = await prisma.viaje.findMany({
+    where: { id_conductor: conductor.id_conductor, estado: 'CONDUCTOR_ASIGNADO' },
+    select: {
+      id_viaje: true,
+      zona: true,
+      precio_estimado: true,
+      estado: true,
+      fecha_programada: true,
+      descripcion: true,
+      paradas: {
+        select: { orden: true, direccion: true, latitud: true, longitud: true },
+        orderBy: { orden: 'asc' },
+      },
+      vehiculo: {
+        select: {
+          id_vehiculo: true,
+          patente: true,
+          marca: true,
+          modelo: true,
+          tipo_vehiculo: true,
+        },
+      },
+      empresa: { select: { id_empresa: true, nombre: true } },
+      cliente: {
+        select: {
+          usuario: { select: { nombre: true, apellido: true, telefono: true } },
+        },
+      },
+    },
+    orderBy: { fecha_programada: 'asc' },
   });
 
   return res.status(200).json(viajes);

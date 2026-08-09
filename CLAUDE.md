@@ -150,6 +150,55 @@ Transiciones validas:
 - Al gerente se lo suma al room viaje:{id} de los viajes de su empresa,
   para que reciba mapa:actualizar / eta:actualizar como el cliente.
 
+## Deteccion de zona (CABA / PROVINCIA / MIXTO)
+
+La zona de un viaje la calcula SIEMPRE el servidor. El campo `zona` del body de
+POST /api/viajes y POST /api/viajes/estimar-costo se acepta por compatibilidad
+con el front (que la sigue mandando) pero su valor se IGNORA.
+
+### Poligono de CABA
+- Archivo: src/data/limite-caba.geojson (Feature GeoJSON, MultiPolygon, 1024
+  vertices, ~82 KB). NO editar a mano: regenerar desde la fuente.
+- Fuente: IGN (Instituto Geografico Nacional), via el Servicio de Normalizacion
+  de Datos Geograficos de Argentina (georef-ar), dataset de provincias
+  v12.1.0 (2023-11-27), provincia id "02".
+  URL: https://infra.datos.gob.ar/georef/provincias.ndjson
+  (dataset en datos.gob.ar: jgm-servicio-normalizacion-datos-geograficos)
+- Se eligio el IGN porque data.buenosaires.gob.ar estaba caido (503) al
+  momento de implementarlo. El dataset del GCBA ("Perimetro") es equivalente.
+- Validado contra 20 puntos conocidos (10 dentro: Obelisco, Plaza de Mayo,
+  Caballito, Lugano, Nunez, Puerto Madero, Mataderos, Retiro, Liniers, Villa
+  Riachuelo; 10 fuera: La Plata, Avellaneda, San Isidro, Lanus, Ezeiza,
+  Ciudadela, Olivos, Tigre, San Justo, y un punto en el Rio de la Plata).
+  Los cruces de borde caen donde corresponde: Av. Gral Paz a la altura de
+  Liniers en lng ~-58.530, y el Riachuelo en Barracas en lat ~-34.658.
+
+### src/services/zona.service.js
+- clasificarParada(lat, lng) -> boolean. turf.booleanPointInPolygon contra el
+  poligono. Un punto sobre el borde cuenta como dentro.
+- contarParadasPorZona(paradas) -> { en_caba, fuera_caba, total, fraccion_caba }
+- clasificarZona(paradas) -> 'CABA' (todas dentro) | 'PROVINCIA' (todas fuera)
+  | 'MIXTO' (mezcla). Unica fuente de verdad de la zona.
+- repartirPorZona({ zona, paradas, tiempo_horas, distancia_km })
+  -> { tiempo_capital, distancia_provincia, fraccion_caba }.
+  Unica definicion del reparto facturable. La usan costo.service (estimacion),
+  cierre.service (cierre) y viajes.controller (precio acumulado en vivo), para
+  que los tres no se puedan desincronizar.
+- Las funciones aceptan paradas como { lat, lng } (body) o
+  { latitud, longitud } (base), asi el caller no tiene que mapear.
+
+### Reparto de MIXTO
+  fraccion_caba = paradas_en_caba / total_paradas
+  tiempo_capital      = tiempo_total    * fraccion_caba
+  distancia_provincia = distancia_total * (1 - fraccion_caba)
+CABA y PROVINCIA puros no cambiaron (tiempo total / distancia total).
+Antes, MIXTO cobraba el tiempo total Y la distancia total: doble cobro.
+
+### PENDIENTE
+El reparto de MIXTO es una APROXIMACION POR CANTIDAD DE PARADAS, no por
+recorrido real. Prorratear por tramo GPS real (clasificando cada punto del
+recorrido con clasificarParada y acumulando por tramo) queda para mas adelante.
+
 ## Eventos WebSocket nuevos
 | Evento          | Destinatario                                   |
 |-----------------|------------------------------------------------|
@@ -194,3 +243,4 @@ node scripts/test-admin.js
 node scripts/test-iniciar-viaje.js
 node scripts/test-jerarquia.js
 node scripts/test-visibilidad-gerente.js   (nuevo, visibilidad del gerente)
+node scripts/test-zona.js                  (nuevo, deteccion de zona)

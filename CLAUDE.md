@@ -129,6 +129,36 @@ Transiciones validas:
   del viaje (viaje.id_empresa → empresa.id_gerente), ademas del cliente
   dueño y el conductor asignado. Cualquier otro → 403.
 
+### Helper de acceso compartido — src/services/acceso-viaje.service.js
+La regla de lectura de un viaje vive en UN solo lugar y la usan los TRES
+endpoints que devuelven datos del viaje. Antes estaba inline en obtenerViaje y
+los otros dos se habian quedado en CLIENTE/CONDUCTOR (el gerente no veia ni el
+costo ni el remito de un viaje de su propia empresa).
+
+- puedeVerViaje(viaje, usuario) → bool. Pasa el cliente dueño, el conductor
+  asignado, o el gerente de la empresa dueña. La usan:
+  * GET /api/viajes/:id
+  * GET /api/viajes/:id/costo-acumulado
+  * GET /api/viajes/:id/remito
+- INCLUDE_ACCESO_VIAJE: el include de Prisma con las relaciones que el helper
+  necesita (cliente, conductor, empresa). Los callers que no necesitan el objeto
+  completo (costo-acumulado, remito) lo spreadean tal cual. puedeVerViaje TIRA
+  error si alguna de las tres viene undefined: sin ese guard, olvidarse un
+  include no rompe — devuelve un 403 silencioso al gerente, justo el bug que el
+  helper viene a evitar.
+- puedeVerViajeDisponible(viaje, usuario) → Promise<bool>. Regla ADICIONAL y
+  EXCLUSIVA del detalle: un viaje en BUSCANDO_CONDUCTOR todavia tiene
+  id_empresa null, asi que ningun gerente pasa por puedeVerViaje; este permite
+  leerlo al gerente cuya flota cumple las condiciones_req, para que pueda
+  decidir si lo reserva. REUSA obtenerGerentesElegibles (elegibilidad.service),
+  el MISMO helper que decide a que gerentes les llega el push viaje:disponible
+  — si te llego el push, podes abrir el detalle; push y detalle no se pueden
+  desincronizar. NO se reimplementa el matching de condiciones.
+  NO aplica a costo-acumulado ni remito (un viaje sin conductor no tiene ni
+  costo acumulado ni remito).
+
+Ninguna de las tres rutas tiene requireRol: la validacion real es el helper.
+
 ### Ejecucion
 - El conductor asignado NO confirma la asignacion (por ahora): la ve en su
   pestaña "asignados" y puede iniciarla.
@@ -244,3 +274,5 @@ node scripts/test-iniciar-viaje.js
 node scripts/test-jerarquia.js
 node scripts/test-visibilidad-gerente.js   (nuevo, visibilidad del gerente)
 node scripts/test-zona.js                  (nuevo, deteccion de zona)
+node scripts/test-acceso-gerente.js        (nuevo, acceso del gerente a
+                                            detalle / costo-acumulado / remito)

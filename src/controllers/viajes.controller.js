@@ -12,6 +12,11 @@ import { limpiarViajeActivo } from '../services/cancelacion.service.js';
 import { calcularYGuardarRuta, obtenerRutaPlaneada } from '../services/ruta.service.js';
 import { validarTransicion } from '../services/estado-viaje.service.js';
 import { repartirPorZona } from '../services/zona.service.js';
+import {
+  puedeVerViaje,
+  puedeVerViajeDisponible,
+  INCLUDE_ACCESO_VIAJE,
+} from '../services/acceso-viaje.service.js';
 import { io } from '../sockets/index.js';
 
 // ─── QR helpers ──────────────────────────────────────────────────────────────
@@ -242,15 +247,16 @@ export async function obtenerViaje(req, res) {
     return res.status(404).json({ error: 'Viaje no encontrado' });
   }
 
-  const esCliente = viaje.cliente.id_usuario === req.usuario.id_usuario;
-  const esConductor =
-    viaje.conductor !== null && viaje.conductor.id_usuario === req.usuario.id_usuario;
-  // Tercera via: el gerente de la empresa dueña del viaje (viajes reservados o
-  // asignados por su empresa) lo lee para seguimiento, igual que el cliente.
-  const esGerenteDeLaEmpresa =
-    viaje.empresa !== null && viaje.empresa.id_gerente === req.usuario.id_usuario;
+  // Regla compartida con costo-acumulado y remito: cliente dueño, conductor
+  // asignado, o gerente de la empresa dueña del viaje.
+  //
+  // Segunda via, exclusiva del detalle: si el viaje esta en BUSCANDO_CONDUCTOR
+  // todavia no tiene empresa, y el gerente cuya flota cumple las condiciones
+  // necesita leerlo (paradas, ruta_planeada) para decidir si lo reserva.
+  const acceso =
+    puedeVerViaje(viaje, req.usuario) || (await puedeVerViajeDisponible(viaje, req.usuario));
 
-  if (!esCliente && !esConductor && !esGerenteDeLaEmpresa) {
+  if (!acceso) {
     return res.status(403).json({ error: 'Sin acceso a este viaje' });
   }
 
@@ -571,17 +577,18 @@ export async function obtenerCostoAcumulado(req, res) {
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },
     include: {
-      cliente: true,
-      conductor: true,
+      // Misma regla de acceso que GET /api/viajes/:id (ver acceso-viaje.service).
+      ...INCLUDE_ACCESO_VIAJE,
       // Las paradas hacen falta para repartir el precio de los viajes MIXTO.
       paradas: { select: { latitud: true, longitud: true } },
     },
   });
   if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
 
-  const esCliente = viaje.cliente.id_usuario === req.usuario.id_usuario;
-  const esConductor = viaje.conductor !== null && viaje.conductor.id_usuario === req.usuario.id_usuario;
-  if (!esCliente && !esConductor) {
+  // Cliente dueño, conductor asignado, o gerente de la empresa dueña del viaje.
+  // La via de "gerente elegible del mercado abierto" NO aplica aca: un viaje en
+  // BUSCANDO_CONDUCTOR no tiene costo acumulado.
+  if (!puedeVerViaje(viaje, req.usuario)) {
     return res.status(403).json({ error: 'Sin acceso a este viaje' });
   }
 
@@ -779,14 +786,18 @@ export async function obtenerRemito(req, res) {
 
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },
-    include: { cliente: true, conductor: true },
+    // Misma regla de acceso que GET /api/viajes/:id (ver acceso-viaje.service).
+    include: INCLUDE_ACCESO_VIAJE,
   });
 
   if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
 
-  const esCliente = viaje.cliente.id_usuario === req.usuario.id_usuario;
-  const esConductor = viaje.conductor?.id_usuario === req.usuario.id_usuario;
-  if (!esCliente && !esConductor) return res.status(403).json({ error: 'Sin acceso a este viaje' });
+  // Cliente dueño, conductor asignado, o gerente de la empresa dueña del viaje.
+  // La via de "gerente elegible del mercado abierto" NO aplica aca: un viaje en
+  // BUSCANDO_CONDUCTOR no tiene remito.
+  if (!puedeVerViaje(viaje, req.usuario)) {
+    return res.status(403).json({ error: 'Sin acceso a este viaje' });
+  }
   if (viaje.estado !== 'FINALIZADO') return res.status(400).json({ error: 'El remito solo esta disponible para viajes finalizados' });
 
   return res.status(200).json({ remito_url: `${process.env.R2_PUBLIC_URL}/remitos/${id_viaje}.pdf` });

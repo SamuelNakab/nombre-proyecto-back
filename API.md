@@ -629,12 +629,34 @@ ve únicamente sus propios viajes.
 
 ### GET /api/viajes/:id
 
-Detalle de un viaje. Pueden acceder tres perfiles: el **cliente** que lo creó, el
-**conductor** asignado, y el **gerente de la empresa dueña** del viaje (es decir,
-`viaje.id_empresa` apunta a una empresa cuyo `id_gerente` sos vos). Cualquier otro
-usuario autenticado recibe `403`.
+Detalle de un viaje.
 
-**Rol requerido:** Autenticado (`CLIENTE`, `CONDUCTOR` o `GERENTE`)
+**Quién puede llamarlo.** Se pasa por **cualquiera** de estas cuatro vías; cualquier
+otro usuario autenticado recibe `403`:
+
+| Vía | Quién | En qué estados |
+|-----|-------|----------------|
+| Cliente dueño | El `CLIENTE` que creó el viaje | Todos |
+| Conductor asignado | El `CONDUCTOR` de `viaje.id_conductor` | Todos (desde que se le asigna) |
+| Gerente de la empresa dueña | El `GERENTE` de la empresa de `viaje.id_empresa` | Todos aquellos en que el viaje ya tiene empresa (`RESERVADO_POR_EMPRESA` en adelante) |
+| **Gerente con flota elegible** | Un `GERENTE` cuya empresa activa tiene **al menos un vehículo de flota que cumple TODAS las `condiciones_req`** del viaje | **Solo `BUSCANDO_CONDUCTOR`** |
+
+Las tres primeras vías son la regla de acceso compartida con
+[`GET /api/viajes/:id/costo-acumulado`](#get-apiviajesidcosto-acumulado) y
+[`GET /api/viajes/:id/remito`](#get-apiviajesidremito) (helper `puedeVerViaje`).
+
+La cuarta vía es **exclusiva de este endpoint**. Un viaje en `BUSCANDO_CONDUCTOR`
+todavía tiene `id_empresa` en `null`, así que ningún gerente entra por la tercera vía;
+pero el gerente necesita abrir el detalle (paradas, `ruta_planeada`, `condiciones_req`)
+para decidir si lo reserva. Es el equivalente a lo que el conductor ve en
+[`GET /api/viajes/disponibles`](#get-apiviajesdisponibles), y usa exactamente el mismo
+criterio de elegibilidad a nivel empresa que decide a qué gerentes les llega el push
+`viaje:disponible` — si te llegó el push, podés abrir el detalle. Un gerente cuya flota
+**no** cumple las condiciones recibe `403`. Esta vía **no** aplica a `costo-acumulado`
+ni a `remito`: un viaje sin conductor no tiene ni costo acumulado ni remito.
+
+**Rol requerido:** Autenticado (`CLIENTE`, `CONDUCTOR` o `GERENTE`). No hay filtro de
+rol a nivel de ruta: la validación real es la tabla de arriba.
 
 **Respuesta exitosa — 200:**
 ```json
@@ -705,7 +727,7 @@ usuario autenticado recibe `403`.
 | Status | Body | Causa |
 |--------|------|-------|
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
-| 403 | `{ "error": "Sin acceso a este viaje" }` | El usuario no es el cliente, ni el conductor asignado, ni el gerente de la empresa dueña del viaje |
+| 403 | `{ "error": "Sin acceso a este viaje" }` | El usuario no entra por ninguna de las cuatro vías de acceso. Casos típicos: un conductor que no es el asignado; un gerente cuya empresa no es dueña del viaje; un gerente cuya flota **no** cumple las `condiciones_req` de un viaje en `BUSCANDO_CONDUCTOR`; un gerente elegible sobre un viaje que **ya** salió de `BUSCANDO_CONDUCTOR` y quedó en otra empresa |
 | 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
 
 ---
@@ -1181,9 +1203,28 @@ decir mientras está en `BUSCANDO_CONDUCTOR` (todavía nadie lo aceptó) o `COND
 ### GET /api/viajes/:id/costo-acumulado
 
 Devuelve el costo acumulado del viaje en curso calculado a partir de los datos GPS en Redis.
-Solo puede acceder el cliente que creó el viaje o el conductor asignado.
 
-**Rol requerido:** Autenticado (`CLIENTE` o `CONDUCTOR`)
+**Quién puede llamarlo.** Misma regla de acceso que
+[`GET /api/viajes/:id`](#get-apiviajesid) (helper `puedeVerViaje`) — se pasa por
+cualquiera de estas tres vías, y cualquier otro usuario autenticado recibe `403`:
+
+| Vía | Quién |
+|-----|-------|
+| Cliente dueño | El `CLIENTE` que creó el viaje |
+| Conductor asignado | El `CONDUCTOR` de `viaje.id_conductor` |
+| Gerente de la empresa dueña | El `GERENTE` de la empresa de `viaje.id_empresa` |
+
+La tercera vía es nueva: antes este endpoint era solo `CLIENTE`/`CONDUCTOR` y el gerente
+no podía ver el costo en vivo de un viaje de su propia empresa. Si el viaje **no** es de
+una empresa (`id_empresa` en `null`, viaje de un conductor independiente), ningún gerente
+pasa.
+
+**No** aplica la vía de "gerente con flota elegible" que sí tiene el detalle: un viaje en
+`BUSCANDO_CONDUCTOR` no tiene costo acumulado, y un gerente elegible que llame acá recibe
+`403`.
+
+**Rol requerido:** Autenticado (`CLIENTE`, `CONDUCTOR` o `GERENTE`). No hay filtro de rol
+a nivel de ruta: la validación real es la tabla de arriba.
 
 **Respuesta exitosa — 200 (con GPS activo):**
 ```json
@@ -1222,7 +1263,7 @@ Solo puede acceder el cliente que creó el viaje o el conductor asignado.
 | Status | Body | Causa |
 |--------|------|-------|
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
-| 403 | `{ "error": "Sin acceso a este viaje" }` | El usuario no es el cliente ni el conductor del viaje |
+| 403 | `{ "error": "Sin acceso a este viaje" }` | El usuario no es el cliente dueño, ni el conductor asignado, ni el gerente de la empresa dueña del viaje |
 | 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
 
 ---
@@ -2032,10 +2073,30 @@ como el promedio de todos sus puntajes en DB.
 ### GET /api/viajes/:id/remito
 
 
-Devuelve la URL pública del remito PDF del viaje. Solo disponible para viajes finalizados.
+Devuelve la URL pública del remito PDF del viaje. Solo disponible para viajes en estado
+`FINALIZADO` — en cualquier otro estado devuelve `400`.
 
+**Quién puede llamarlo.** Misma regla de acceso que
+[`GET /api/viajes/:id`](#get-apiviajesid) (helper `puedeVerViaje`) — se pasa por
+cualquiera de estas tres vías, y cualquier otro usuario autenticado recibe `403`:
 
-**Rol requerido:** `CLIENTE` o `CONDUCTOR` del viaje
+| Vía | Quién |
+|-----|-------|
+| Cliente dueño | El `CLIENTE` que creó el viaje |
+| Conductor asignado | El `CONDUCTOR` de `viaje.id_conductor` |
+| Gerente de la empresa dueña | El `GERENTE` de la empresa de `viaje.id_empresa` |
+
+La tercera vía es nueva: antes este endpoint era solo `CLIENTE`/`CONDUCTOR` y el gerente
+no podía descargar el remito de un viaje que hizo su propia empresa. Si el viaje **no** es
+de una empresa (`id_empresa` en `null`, viaje de un conductor independiente), ningún
+gerente pasa.
+
+**No** aplica la vía de "gerente con flota elegible" que sí tiene el detalle: un viaje en
+`BUSCANDO_CONDUCTOR` no tiene remito, y un gerente elegible que llame acá recibe `403`
+(el chequeo de acceso corre **antes** que el de estado, así que es `403` y no `400`).
+
+**Rol requerido:** Autenticado (`CLIENTE`, `CONDUCTOR` o `GERENTE`). No hay filtro de rol
+a nivel de ruta: la validación real es la tabla de arriba.
 
 
 **Respuesta exitosa — 200:**
@@ -2053,9 +2114,9 @@ y desglose de costo (tiempo, distancia, tarifas, precio real).
 **Errores posibles:**
 | Status | Body | Causa |
 |--------|------|-------|
-| 400 | `{ "error": "El remito solo esta disponible para viajes finalizados" }` | Estado incorrecto |
+| 400 | `{ "error": "El remito solo esta disponible para viajes finalizados" }` | El usuario tiene acceso pero el viaje no está `FINALIZADO` |
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
-| 403 | `{ "error": "Sin acceso a este viaje" }` | No es el cliente ni el conductor del viaje |
+| 403 | `{ "error": "Sin acceso a este viaje" }` | El usuario no es el cliente dueño, ni el conductor asignado, ni el gerente de la empresa dueña del viaje |
 | 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
 
 

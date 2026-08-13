@@ -453,18 +453,35 @@ Las tarifas se calculan automáticamente según la zona y si la `fecha_programad
     { "id_condicion_req": 1, "condicion": "FRAGIL" },
     { "id_condicion_req": 2, "condicion": "REFRIGERADO" }
   ],
+  "duracion_estimada_horas": 0.5,
   "ruta_planeada": [[-58.38162, -34.60361], [-58.38201, -34.60280], "..."],
   "desglose_estimado": {
     "precio_por_tiempo": 2500,
     "precio_por_distancia": 2000,
     "tiempo_horas": 0.5,
     "distancia_km": 10,
+    "tiempo_capital": 0.25,
+    "distancia_provincia": 5,
+    "fraccion_caba": 0.5,
     "tarifa_hora": 5000,
     "tarifa_km": 200,
     "es_hora_pico": true
   }
 }
 ```
+
+- `desglose_estimado` es **exactamente el mismo objeto** que
+  [`POST /api/viajes/estimar-costo`](#post-apiviajesestimar-costo) devuelve bajo la clave
+  `desglose`. Son **dos nombres para la misma cosa**: acá se llama `desglose_estimado` y allá
+  `desglose`. No se unificaron porque el front ya consume ambos nombres.
+- `tiempo_capital` / `distancia_provincia`: las magnitudes que **efectivamente se facturan**
+  (`null` = no se cobra por ese concepto). El ejemplo es un viaje `MIXTO` con `fraccion_caba` 0.5,
+  por eso los dos tienen valor y son la mitad de los totales. Ver
+  [Cómo se factura cada zona](#cómo-se-factura-cada-zona).
+- `duracion_estimada_horas`: la duración estimada de la ruta **en horas (float)**, persistida en
+  el viaje. Es el mismo valor que `desglose_estimado.tiempo_horas`. El detalle del viaje
+  ([`GET /api/viajes/:id`](#get-apiviajesid)) lo expone además como `duracion_estimada`, **en
+  minutos enteros** — ver la nota de unidades ahí.
 
 - `ruta_planeada`: array de puntos `[lng, lat]` (ver [Formato de ruta](#formato-de-ruta)). La
   ruta se calcula al crear el viaje. Es **`null`** si Google Maps falla en ese momento; en ese
@@ -553,11 +570,12 @@ Devuelve todos los viajes del cliente autenticado, del más reciente al más ant
     "id_viaje": 42,
     "zona": "CABA",
     "precio_estimado": 2500,
-    "precio_real": null,
-    "estado": "BUSCANDO_CONDUCTOR",
+    "precio_real": 2610,
+    "estado": "FINALIZADO",
     "fecha_programada": "2026-07-01T10:00:00.000Z",
-    "fecha_inicio": null,
-    "puntualidad_inicio": null,
+    "fecha_inicio": "2026-07-01T10:04:00.000Z",
+    "puntualidad_inicio": "A_TIEMPO",
+    "duracion_real": 45,
     "creado_en": "2026-05-09T12:00:00.000Z",
     "paradas": [
       { "orden": 1, "direccion": "Plaza de Mayo, CABA" }
@@ -566,6 +584,16 @@ Devuelve todos los viajes del cliente autenticado, del más reciente al más ant
   }
 ]
 ```
+
+- `duracion_real`: cuánto duró el viaje **en minutos (entero redondeado)**. Se calcula en el
+  momento de la lectura como `última fecha_entrega de las paradas − fecha_inicio`; **no** es una
+  columna de la base. Se toma el **máximo** de las `fecha_entrega`, no la parada de mayor `orden`:
+  las paradas se confirman escaneando un QR y nada garantiza que se confirmen en orden.
+- Es **`null`** si el viaje no está `FINALIZADO`, o si nunca se inició (`fecha_inicio` en `null`).
+  Una duración "real" a mitad de viaje no sería real, así que no se devuelve parcial.
+- Va en **minutos**, igual que `duracion_estimada` del detalle. No confundir con
+  `desglose_estimado.tiempo_horas`, que va en **horas (float)** — ver
+  [`GET /api/viajes/:id`](#get-apiviajesid).
 
 **Errores posibles:**
 | Status | Body | Causa |
@@ -670,6 +698,8 @@ rol a nivel de ruta: la validación real es la tabla de arriba.
   "fecha_programada": "2026-07-01T10:00:00.000Z",
   "fecha_inicio": null,
   "puntualidad_inicio": null,
+  "duracion_estimada": 30,
+  "duracion_estimada_horas": 0.5,
   "creado_en": "2026-05-09T12:00:00.000Z",
   "paradas": [
     {
@@ -701,6 +731,15 @@ rol a nivel de ruta: la validación real es la tabla de arriba.
       "telefono": "+5491187654321"
     }
   },
+  "vehiculo": {
+    "id_vehiculo": 9,
+    "patente": "ABC123",
+    "marca": "Ford",
+    "modelo": "Transit",
+    "anio": 2020,
+    "color": "Blanco",
+    "tipo_vehiculo": "furgon"
+  },
   "empresa": {
     "id_empresa": 5,
     "nombre": "Fletes del Sur",
@@ -710,6 +749,30 @@ rol a nivel de ruta: la validación real es la tabla de arriba.
 }
 ```
 
+<a id="unidades-de-duracion"></a>
+> **Unidades de duración.** En este endpoint conviven los dos formatos y no hay que mezclarlos:
+>
+> | Campo | Unidad | Para qué sirve |
+> |-------|--------|----------------|
+> | `duracion_estimada` | **minutos**, entero | Mostrarle la duración al usuario |
+> | `duracion_estimada_horas` | **horas**, float | La columna cruda; es el input del cálculo de precio |
+> | `desglose_estimado.tiempo_horas` (en `POST /api/viajes`) | **horas**, float | El mismo valor que `duracion_estimada_horas` |
+> | `duracion_real` (en `mis-viajes`) | **minutos**, entero | Duración efectiva del viaje ya cerrado |
+>
+> Regla: **todo lo que se llama `duracion_*` (sin sufijo `_horas`) va en minutos enteros.** Todo
+> lo que se llama `tiempo_*` va en horas float. `duracion_estimada` es exactamente
+> `round(duracion_estimada_horas × 60)`.
+
+- `duracion_estimada`: duración estimada de la ruta **en minutos (entero)**, calculada por Google
+  Distance Matrix al crear el viaje. Es la misma estimación que se usó para calcular
+  `precio_estimado`, así que los dos números siempre son consistentes entre sí. Es **`null`** en
+  viajes creados antes de que existiera el campo, o si Google Maps falló al crear el viaje.
+- `vehiculo`: el vehículo con el que se hace el viaje — lo elige el conductor al aceptar (viaje
+  independiente) o el gerente al asignar (viaje de empresa). Es **`null`** mientras no haya
+  conductor asignado (`BUSCANDO_CONDUCTOR`, `RESERVADO_POR_EMPRESA`), y la clave **siempre está
+  presente**. (Ojo: esto es distinto del `vehiculo` del evento
+  [`viaje:conductor_asignado`](#evento-viajeconductor_asignado), que nunca es `null` — ahí el
+  evento solo se emite si ya hay vehículo.)
 - `empresa`: **`null`** si el viaje no es de ninguna empresa (viaje de un conductor
   independiente). Si el viaje fue reservado/asignado por una empresa, trae sus datos
   y es lo que habilita el acceso del gerente a este endpoint.
@@ -859,6 +922,7 @@ si ganó la carrera o `viaje:ya_asignado` si otro conductor fue más rápido.
 ```json
 {
   "id_viaje": 42,
+  "id_usuario_conductor": 17,
   "conductor": {
     "nombre": "Carlos",
     "apellido": "López",
@@ -874,9 +938,16 @@ si ganó la carrera o `viaje:ya_asignado` si otro conductor fue más rápido.
 }
 ```
 
+- `id_usuario_conductor`: `id_usuario` (no `id_conductor`) del conductor que ganó. Es el id con el
+  que se arma su room personal `usuario:{id}`.
+- **`vehiculo` NUNCA es `null`.** Está garantizado por el orden de las validaciones del servidor:
+  si el conductor no tiene ningún vehículo que cumpla las condiciones del viaje, el servidor emite
+  `error` (`"No tenes un vehiculo que cumpla las condiciones del viaje"`) y **corta antes de
+  asignar** — el viaje ni siquiera cambia de estado. Dicho de otra forma: si este evento llegó,
+  hay vehículo. El front no necesita defenderse de `vehiculo == null` acá.
 - `ruta_planeada`: array de puntos `[lng, lat]` (ver [Formato de ruta](#formato-de-ruta)) para
-  dibujar la ruta en el mapa apenas se asigna el conductor. Puede ser `null` si la ruta falló al
-  crearse y todavía no se recalculó.
+  dibujar la ruta en el mapa apenas se asigna el conductor. **Sí** puede ser `null` (si la ruta
+  falló al crearse y todavía no se recalculó) — es el único campo nullable del payload.
 
 **Cómo escucharlo:**
 ```js
@@ -1997,12 +2068,23 @@ Si era la última parada pendiente, cierra el viaje automáticamente.
     "precio_por_distancia": null,
     "tiempo_horas": 0.5,
     "distancia_km": 8.2,
+    "tiempo_capital": 0.5,
+    "distancia_provincia": null,
     "tarifa_hora": 3500,
     "tarifa_km": null
   },
   "remito_url": "https://pub.r2.example.com/remitos/42.pdf"
 }
 ```
+
+- `tiempo_horas` / `distancia_km`: totales medidos por GPS durante el viaje.
+- `tiempo_capital` / `distancia_provincia`: la parte de esos totales que **efectivamente se
+  facturó**, y los dos valores que se persisten en el viaje al cerrarlo. `null` = no se cobra por
+  ese concepto. En `MIXTO` van prorrateados por `fraccion_caba` — ver
+  [Cómo se factura cada zona](#cómo-se-factura-cada-zona). El ejemplo de arriba es un viaje `CABA`
+  (todo tiempo, nada de distancia).
+- A diferencia del desglose de la estimación, este **no** incluye `fraccion_caba` ni
+  `es_hora_pico`.
 
 
 **Cómo escucharlo:**
@@ -2570,7 +2652,129 @@ Body: `{ "nombre": "string", "cuit": "11 dígitos" }`. → `201` con el objeto e
 
 **DELETE /api/empresas/:id/vehiculos/:idv** — da de baja un vehículo de flota. `400` si está en un viaje activo.
 
-**GET /api/empresas/:id/viajes** — viajes de la empresa (activos e históricos), con paradas, `condiciones_req`, el vehículo asignado (con sus `condiciones`), cliente y conductor.
+---
+
+### GET /api/empresas/:id/viajes
+
+Viajes de la empresa (activos e históricos), ordenados por `creado_en` descendente. Devuelve
+**todos** los viajes con `id_empresa = :id`, es decir desde que un gerente reservó el viaje
+(`RESERVADO_POR_EMPRESA`) en adelante, incluidos los `FINALIZADO` y `CANCELADO`.
+
+**Rol requerido:** `GERENTE`, y tenés que ser el gerente dueño de `:id`.
+
+**Respuesta exitosa — 200:** array de viajes. Ejemplo **completo** de un elemento — estos son
+todos los campos que devuelve, sin recortar:
+
+```json
+[
+  {
+    "id_viaje": 407,
+    "id_cliente": 30,
+    "id_conductor": 47,
+    "id_vehiculo": 60,
+    "id_empresa": 54,
+    "zona": "CABA",
+    "tarifa_hora": 3500,
+    "tarifa_km": null,
+    "distancia_provincia": null,
+    "tiempo_capital": null,
+    "duracion_estimada_horas": 0.2483333333333333,
+    "fecha_programada": "2026-08-14T01:32:04.298Z",
+    "descripcion": null,
+    "estado": "CONDUCTOR_ASIGNADO",
+    "fecha_inicio": null,
+    "puntualidad_inicio": null,
+    "fecha_reserva": "2026-08-13T23:32:06.136Z",
+    "iniciado_por": null,
+    "precio_estimado": 869.1666666666666,
+    "precio_real": null,
+    "creado_en": "2026-08-13T23:32:04.507Z",
+    "motivo_cancelacion": null,
+    "cancelado_por_admin_id": null,
+    "paradas": [
+      {
+        "id_parada": 794,
+        "id_viaje": 407,
+        "orden": 1,
+        "direccion": "Plaza de Mayo, CABA",
+        "latitud": -34.6037,
+        "longitud": -58.3816,
+        "qr_token": "cmss5kj6j0036x97wzt5tgoby",
+        "estado": "PENDIENTE",
+        "fecha_entrega": null
+      }
+    ],
+    "condiciones_req": [
+      { "id_condicion_req": 15, "id_viaje": 407, "condicion": "FRAGIL" }
+    ],
+    "vehiculo": {
+      "id_vehiculo": 60,
+      "id_empresa": 54,
+      "id_conductor": null,
+      "patente": "FV06947",
+      "marca": "Iveco",
+      "modelo": "Daily",
+      "anio": 2021,
+      "color": "Gris",
+      "tipo_vehiculo": "camion",
+      "condiciones": [
+        { "id_condicion": 31, "id_vehiculo": 60, "condicion": "FRAGIL" }
+      ]
+    },
+    "cliente": {
+      "id_cliente": 30,
+      "id_usuario": 114,
+      "cuit": null,
+      "nombre_empresa": null,
+      "direccion_principal": null,
+      "usuario": { "nombre": "Cli", "apellido": "Vis", "telefono": null }
+    },
+    "conductor": {
+      "id_conductor": 47,
+      "id_usuario": 115,
+      "nro_licencia": "LVA3906947",
+      "licencia_vencimiento": "2028-01-01T00:00:00.000Z",
+      "calificacion_promedio": 0,
+      "usuario": { "nombre": "Con", "apellido": "Vis", "telefono": null }
+    }
+  }
+]
+```
+
+Campos que el front venía infiriendo y ahora quedan documentados:
+
+- **`fecha_reserva`**: momento exacto en que el gerente reservó el viaje. Se setea al pasar a
+  `RESERVADO_POR_EMPRESA` y **no** se limpia al asignar conductor. Es contra este timestamp que
+  corre el timeout de reserva (`RESERVA_TIMEOUT_MINUTOS`, default 10). Vuelve a `null` si la
+  reserva se libera y el viaje sale al mercado. Si el conductor cancela un viaje de empresa,
+  se **reinicia** a la fecha de la cancelación (el gerente recibe la ventana completa para
+  reasignar).
+- **`id_vehiculo`**: FK cruda del vehículo asignado; `null` hasta que se asigna conductor. El
+  objeto `vehiculo` de abajo es esa misma relación ya expandida — usá `vehiculo` para mostrar y
+  `id_vehiculo` para comparar.
+- **`precio_real`**: precio final cobrado, calculado con el GPS acumulado al cerrar el viaje. Es
+  **`null` en todo viaje que no esté `FINALIZADO`** (incluidos los `CANCELADO`). Mientras el viaje
+  está en curso el valor en vivo se consulta con
+  [`GET /api/viajes/:id/costo-acumulado`](#get-apiviajesidcosto-acumulado), no acá.
+- `vehiculo.condiciones` viene expandido a propósito: es lo que el front necesita para filtrar la
+  flota por las `condiciones_req` del viaje sin pedir la flota aparte.
+- `tiempo_capital` / `distancia_provincia`: `null` hasta el cierre — se persisten recién al
+  finalizar. Ver [Cómo se factura cada zona](#cómo-se-factura-cada-zona).
+- `duracion_estimada_horas` va en **horas (float)**, no en minutos: este endpoint devuelve la fila
+  cruda del viaje. El campo `duracion_estimada` en minutos existe solo en
+  [`GET /api/viajes/:id`](#unidades-de-duracion).
+- `cliente` y `conductor` traen la fila completa del perfil, pero de `usuario` solo `nombre`,
+  `apellido` y `telefono` (sin email ni DNI).
+- `motivo_cancelacion` / `cancelado_por_admin_id`: solo tienen valor si el viaje lo canceló un
+  admin desde el panel.
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "id de empresa invalido" }` | `:id` no es un entero positivo |
+| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
+| 403 | `{ "error": "No sos el gerente de esta empresa" }` | La empresa no es tuya |
+| 404 | `{ "error": "Empresa no encontrada" }` | No existe empresa con ese id |
 
 ---
 
@@ -2654,9 +2858,16 @@ Body: `{ "codigo_afiliacion": "string" }`. → `201` con la afiliación. `404` c
 
 **POST /api/viajes/:id/reservar** — reserva **atómica** de un viaje en `BUSCANDO_CONDUCTOR` → `RESERVADO_POR_EMPRESA` (setea `id_empresa`, `fecha_reserva`). Body: `{ "id_empresa": N }` (opcional si el gerente tiene una sola empresa). Emite `viaje:reservado` al room (sale del pool). `409` si el viaje ya no está disponible.
 
-**POST /api/viajes/:id/asignar** — asigna conductor + vehículo a un viaje `RESERVADO_POR_EMPRESA` → `CONDUCTOR_ASIGNADO`. Body: `{ "id_conductor": N, "id_vehiculo": N }`. Valida: viaje de mi empresa, conductor ACTIVO en la empresa, vehículo de la flota que cumple las condiciones del viaje. Emite `viaje:asignado` al room personal del conductor y **suma al gerente al room `viaje:{id}`** (tracking: recibe `mapa:actualizar`/`eta:actualizar` como el cliente). `400` si el conductor no está activo o el vehículo no pertenece/no cumple.
+**POST /api/viajes/:id/asignar** — asignación **atómica** de conductor + vehículo a un viaje `RESERVADO_POR_EMPRESA` → `CONDUCTOR_ASIGNADO`. Body: `{ "id_conductor": N, "id_vehiculo": N }`. Valida: viaje de mi empresa, conductor ACTIVO en la empresa, vehículo de la flota que cumple las condiciones del viaje. Emite `viaje:asignado` al room personal del conductor y **suma al gerente al room `viaje:{id}`** (tracking: recibe `mapa:actualizar`/`eta:actualizar` como el cliente). `400` si el conductor no está activo o el vehículo no pertenece/no cumple. **`409 "El viaje ya no esta en RESERVADO_POR_EMPRESA"`** si otra asignación ganó primero.
 
-**POST /api/viajes/:id/reasignar** — reemplaza conductor y/o vehículo de un viaje `CONDUCTOR_ASIGNADO` **que todavía no arrancó** (`fecha_inicio` null). Mismas validaciones que asignar; re-emite `viaje:asignado`. `400` si el viaje ya arrancó.
+**POST /api/viajes/:id/reasignar** — reemplaza conductor y/o vehículo de un viaje `CONDUCTOR_ASIGNADO` **que todavía no arrancó** (`fecha_inicio` null). Mismas validaciones que asignar; re-emite `viaje:asignado`. `400` si el viaje ya arrancó según la lectura previa; **`409 "El viaje ya no se puede reasignar (cambio de estado o ya arranco)"`** si cambió de estado o arrancó entre la validación y la escritura.
+
+> **Garantía de concurrencia.** `reservar`, `asignar` y `reasignar` escriben con un `UPDATE ... WHERE`
+> condicionado por el estado esperado (el mismo patrón atómico que el `viaje:aceptar` del conductor),
+> no con un update plano sobre una lectura previa. Consecuencia para el front: ante un doble-submit
+> o dos gerentes/pestañas compitiendo, **exactamente una request devuelve `200` y la otra `409`** —
+> nunca quedan dos conductores creyéndose asignados al mismo viaje. Un `409` acá no es un error a
+> reintentar: significa que alguien más ya resolvió ese viaje, y lo correcto es refrescar su estado.
 
 **POST /api/viajes/:id/cancelar-reserva** — suelta una reserva: `RESERVADO_POR_EMPRESA` → `BUSCANDO_CONDUCTOR`, limpia `id_empresa`/`fecha_reserva`, y **republica el viaje de cero** (re-corre elegibilidad de conductores + gerentes y los suma al room, así un conector que llega después también recibe `viaje:disponible`). Emite `viaje:reserva_cancelada`. También ocurre **automáticamente por timeout** (`RESERVA_TIMEOUT_MINUTOS`, default 10) vía un job periódico.
 
@@ -2684,7 +2895,8 @@ Body: `{ "codigo_afiliacion": "string" }`. → `201` con la afiliación. `404` c
 - Fechas en formato ISO 8601 UTC
 - El campo `contrasena` nunca se almacena en la DB — solo va a Firebase
 - En el viaje: `id_conductor`/`id_vehiculo` son `null` hasta que se asigna (por aceptación o por el gerente). `id_empresa` y `fecha_reserva` se setean cuando un gerente **reserva** el viaje (`RESERVADO_POR_EMPRESA`), antes de que haya conductor. `iniciado_por` (`"CONDUCTOR"`/`"GERENTE"`) se setea al iniciar.
-- El campo `vehiculo` en `viaje:conductor_asignado` siempre es un objeto no nulo — si el conductor no tiene vehículo elegible el servidor emite `error` antes de asignar el viaje
+- El campo `vehiculo` en `viaje:conductor_asignado` siempre es un objeto no nulo — si el conductor no tiene vehículo elegible el servidor emite `error` antes de asignar el viaje (detalle en [el evento](#evento-viajeconductor_asignado)). En cambio el `vehiculo` de `GET /api/viajes/:id` **sí** puede ser `null`: ahí el viaje puede todavía no tener conductor.
+- **Unidades de tiempo:** todo campo `duracion_*` sin sufijo va en **minutos enteros** (`duracion_real`, `duracion_estimada`); todo campo `tiempo_*` y todo `*_horas` van en **horas float** (`tiempo_horas`, `tiempo_capital`, `duracion_estimada_horas`). Ver [Unidades de duración](#unidades-de-duracion).
 - Estados del viaje: `BUSCANDO_CONDUCTOR`, `RESERVADO_POR_EMPRESA`, `CONDUCTOR_ASIGNADO`, `EN_CAMINO_A_ORIGEN`, `CARGANDO`, `EN_RUTA`, `DESCARGANDO`, `FINALIZADO`, `CANCELADO` (ver [Máquina de estados](#maquina-de-estados))
 
 <a id="formato-de-ruta"></a>

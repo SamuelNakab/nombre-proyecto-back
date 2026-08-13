@@ -118,7 +118,30 @@ async function crearVehiculoFlota(gerenteToken, id_empresa, patente) {
 const reservar = (token, id_viaje, id_empresa) =>
   api('POST', `/api/viajes/${id_viaje}/reservar`, { id_empresa }, token);
 
+const asignar = (token, id_viaje, id_conductor, id_vehiculo) =>
+  api('POST', `/api/viajes/${id_viaje}/asignar`, { id_conductor, id_vehiculo }, token);
+
 const estadoDe = async (id_viaje) => await prisma.viaje.findUnique({ where: { id_viaje } });
+
+async function conductorIdPorEmail(email) {
+  const u = await prisma.usuario.findUnique({ where: { email }, include: { conductor: true } });
+  return u.conductor.id_conductor;
+}
+
+// Afilia el conductor a la empresa y lo deja ACTIVO (pide el codigo + aprueba).
+async function afiliarYAprobar(condToken, gerenteToken, codigo_afiliacion, id_empresa, id_conductor) {
+  const { status: sAfi } = await api('POST', '/api/afiliaciones', { codigo_afiliacion }, condToken);
+  if (sAfi !== 201 && sAfi !== 200 && sAfi !== 409) {
+    throw new Error(`afiliacion fallo (${sAfi})`);
+  }
+  const { status: sApr } = await api(
+    'POST',
+    `/api/empresas/${id_empresa}/conductores/${id_conductor}/aprobar`,
+    null,
+    gerenteToken
+  );
+  if (sApr !== 200) throw new Error(`aprobar conductor fallo (${sApr})`);
+}
 
 async function cleanup(sockets) {
   for (const s of sockets) {
@@ -180,6 +203,24 @@ async function main() {
       cuit_empresa: '30' + d + '20',
       nombre_empresa: `Ger2Conc ${stamp}`,
     },
+    // Dos conductores afiliados a la empresa1, para el CASO C: dos asignaciones
+    // concurrentes con conductor+vehiculo DISTINTOS sobre el mismo viaje.
+    conA: {
+      email: `cona-conc-${stamp}@test.com`,
+      dni: d + '4',
+      nombre: 'ConA',
+      apellido: 'Conc',
+      nro_licencia: 'LCA' + d,
+      licencia_vencimiento: lic,
+    },
+    conB: {
+      email: `conb-conc-${stamp}@test.com`,
+      dni: d + '5',
+      nombre: 'ConB',
+      apellido: 'Conc',
+      nro_licencia: 'LCB' + d,
+      licencia_vencimiento: lic,
+    },
   };
 
   console.log('── SETUP: cliente, conductor independiente, 2 gerentes con empresa + flota ──\n');
@@ -188,20 +229,33 @@ async function main() {
   await registrar({ ...U.conInd, contrasena: pass }, 'conductor');
   await registrar({ ...U.ger1, contrasena: pass }, 'gerente');
   await registrar({ ...U.ger2, contrasena: pass }, 'gerente');
+  await registrar({ ...U.conA, contrasena: pass }, 'conductor');
+  await registrar({ ...U.conB, contrasena: pass }, 'conductor');
 
   const clienteToken = await getToken(U.cli.email, pass);
   const conIndToken = await getToken(U.conInd.email, pass);
   const ger1Token = await getToken(U.ger1.email, pass);
   const ger2Token = await getToken(U.ger2.email, pass);
+  const conAToken = await getToken(U.conA.email, pass);
+  const conBToken = await getToken(U.conB.email, pass);
 
   await crearVehiculoPropioSiNoExiste(conIndToken, `PI${String(stamp).slice(-5)}`);
 
   const emp1 = await crearEmpresa(ger1Token, `Flota Conc1 ${stamp}`, '31' + String(stamp).slice(-9));
   const emp2 = await crearEmpresa(ger2Token, `Flota Conc2 ${stamp}`, '32' + String(stamp).slice(-9));
-  await crearVehiculoFlota(ger1Token, emp1.id_empresa, `F1${String(stamp).slice(-5)}`);
+  // empresa1 lleva DOS vehiculos de flota: el CASO C necesita asignar dos pares
+  // (conductor, vehiculo) distintos en paralelo.
+  const flota1A = await crearVehiculoFlota(ger1Token, emp1.id_empresa, `F1${String(stamp).slice(-5)}`);
+  const flota1B = await crearVehiculoFlota(ger1Token, emp1.id_empresa, `F3${String(stamp).slice(-5)}`);
   await crearVehiculoFlota(ger2Token, emp2.id_empresa, `F2${String(stamp).slice(-5)}`);
 
+  const conAId = await conductorIdPorEmail(U.conA.email);
+  const conBId = await conductorIdPorEmail(U.conB.email);
+  await afiliarYAprobar(conAToken, ger1Token, emp1.codigo_afiliacion, emp1.id_empresa, conAId);
+  await afiliarYAprobar(conBToken, ger1Token, emp1.codigo_afiliacion, emp1.id_empresa, conBId);
+
   console.log(`  empresa1=${emp1.id_empresa} (gerente1)   empresa2=${emp2.id_empresa} (gerente2)`);
+  console.log(`  flota1: vehiculos ${flota1A} y ${flota1B}   conductores ACTIVOS: ${conAId} y ${conBId}`);
 
   sConductor = await conectar(conIndToken);
   await esperar(1000);
@@ -287,6 +341,67 @@ async function main() {
         ? vBDb.estado === 'CONDUCTOR_ASIGNADO' && vBDb.id_conductor !== null && vBDb.id_empresa === null
         : false,
     `estado=${vBDb.estado} id_empresa=${vBDb.id_empresa} id_conductor=${vBDb.id_conductor}`
+  );
+
+  // ── CASO C: doble asignacion concurrente sobre el MISMO viaje reservado ────
+  //
+  // Este es el caso que cubre el guard atomico de asignarViaje. Antes el
+  // controller hacia un prisma.viaje.update plano sobre una lectura ya vieja:
+  // las dos requests leian RESERVADO_POR_EMPRESA, las dos escribian, el ultimo
+  // id_conductor/id_vehiculo pisaba al primero y los DOS conductores recibian
+  // viaje:asignado — uno de ellos para un viaje que no era suyo. Con el
+  // updateMany condicionado (where estado = RESERVADO_POR_EMPRESA) solo una
+  // matchea la fila.
+  console.log('\n── CASO C: doble POST /asignar concurrente sobre el mismo viaje ──\n');
+  const vC = await crearViaje(clienteToken);
+  await esperar(500);
+  const resReservaC = await reservar(ger1Token, vC, emp1.id_empresa);
+  if (resReservaC.status !== 200) {
+    throw new Error(`CASO C: la reserva previa fallo (${resReservaC.status}): ${JSON.stringify(resReservaC.data)}`);
+  }
+  await esperar(300);
+
+  // Mismo gerente, mismo viaje, pares (conductor, vehiculo) DISTINTOS —
+  // disparados sin await entre medio.
+  const [resC1, resC2] = await Promise.all([
+    asignar(ger1Token, vC, conAId, flota1A),
+    asignar(ger1Token, vC, conBId, flota1B),
+  ]);
+  await esperar(500);
+  const vCDb = await estadoDe(vC);
+
+  console.log(`  asignar(conA=${conAId}, veh=${flota1A}) → status=${resC1.status} body=${JSON.stringify(resC1.data)}`);
+  console.log(`  asignar(conB=${conBId}, veh=${flota1B}) → status=${resC2.status} body=${JSON.stringify(resC2.data)}`);
+  console.log(`  DB final → estado=${vCDb.estado} id_conductor=${vCDb.id_conductor} id_vehiculo=${vCDb.id_vehiculo}`);
+
+  const ganadoresC = [resC1, resC2].filter((r) => r.status === 200);
+  const perdedoresC = [resC1, resC2].filter((r) => r.status !== 200);
+
+  paso(
+    'CASO C1: exactamente una asignacion gana (200)',
+    ganadoresC.length === 1,
+    `ganadores=${ganadoresC.length} status=[${resC1.status}, ${resC2.status}]`
+  );
+  paso(
+    'CASO C2: la perdedora recibe 409 con error explicativo',
+    perdedoresC.length === 1 &&
+      perdedoresC[0].status === 409 &&
+      typeof perdedoresC[0].data.error === 'string',
+    `status=${perdedoresC[0]?.status} err=${perdedoresC[0]?.data?.error}`
+  );
+  paso(
+    'CASO C3: la DB queda CONDUCTOR_ASIGNADO con el par (conductor, vehiculo) del ganador',
+    vCDb.estado === 'CONDUCTOR_ASIGNADO' &&
+      ganadoresC.length === 1 &&
+      vCDb.id_conductor === ganadoresC[0].data.id_conductor &&
+      vCDb.id_vehiculo === ganadoresC[0].data.id_vehiculo,
+    `estado=${vCDb.estado} db=(${vCDb.id_conductor}, ${vCDb.id_vehiculo}) ganador=(${ganadoresC[0]?.data?.id_conductor}, ${ganadoresC[0]?.data?.id_vehiculo})`
+  );
+  paso(
+    'CASO C4: no queda un par cruzado (conductor de una request con vehiculo de la otra)',
+    (vCDb.id_conductor === conAId && vCDb.id_vehiculo === flota1A) ||
+      (vCDb.id_conductor === conBId && vCDb.id_vehiculo === flota1B),
+    `db=(${vCDb.id_conductor}, ${vCDb.id_vehiculo}) parA=(${conAId}, ${flota1A}) parB=(${conBId}, ${flota1B})`
   );
 
   // ── RESUMEN ──────────────────────────────────────────────────────────────

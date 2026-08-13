@@ -12,6 +12,7 @@ import { limpiarViajeActivo } from '../services/cancelacion.service.js';
 import { calcularYGuardarRuta, obtenerRutaPlaneada } from '../services/ruta.service.js';
 import { validarTransicion } from '../services/estado-viaje.service.js';
 import { repartirPorZona } from '../services/zona.service.js';
+import { horasAMinutos, calcularDuracionRealMinutos } from '../services/duracion.service.js';
 import {
   puedeVerViaje,
   puedeVerViajeDisponible,
@@ -144,6 +145,10 @@ export async function crearViaje(req, res) {
       fecha_programada: new Date(fecha_programada),
       descripcion: descripcion ?? null,
       precio_estimado: resultado.precio_estimado,
+      // Mismo tiempo_horas que se acaba de usar para estimar el precio. Se
+      // persiste (en HORAS) para que el detalle del viaje pueda devolver la
+      // duracion estimada sin volver a pegarle a Google en cada lectura.
+      duracion_estimada_horas: resultado.desglose.tiempo_horas,
       paradas: {
         create: paradas.map((p, i) => ({
           orden: i + 1,
@@ -238,6 +243,20 @@ export async function obtenerViaje(req, res) {
       condiciones_req: true,
       cliente: { include: { usuario: true } },
       conductor: { include: { usuario: true } },
+      // Vehiculo con el que se hace el viaje: lo elige el conductor al aceptar
+      // (independiente) o el gerente al asignar (empresa). null mientras no hay
+      // conductor asignado.
+      vehiculo: {
+        select: {
+          id_vehiculo: true,
+          patente: true,
+          marca: true,
+          modelo: true,
+          anio: true,
+          color: true,
+          tipo_vehiculo: true,
+        },
+      },
       empresa: { select: { id_empresa: true, nombre: true, id_gerente: true } },
       calificacion: true,
     },
@@ -263,7 +282,15 @@ export async function obtenerViaje(req, res) {
   // null si el viaje ya termino (Redis limpio) o si la ruta nunca se calculo.
   const ruta_planeada = await obtenerRutaPlaneada(viaje.id_viaje);
 
-  return res.status(200).json({ ...viaje, ruta_planeada });
+  // duracion_estimada sale de la columna duracion_estimada_horas, que se llena al
+  // crear el viaje con el mismo tiempo que se uso para estimar el precio. Se
+  // expone en MINUTOS (la columna esta en horas). null en viajes creados antes
+  // de que existiera la columna, o si Google no respondio al crear.
+  return res.status(200).json({
+    ...viaje,
+    duracion_estimada: horasAMinutos(viaje.duracion_estimada_horas),
+    ruta_planeada,
+  });
 }
 
 export async function cambiarEstado(req, res) {
@@ -820,7 +847,15 @@ export async function listarMisViajes(req, res) {
     orderBy: { creado_en: 'desc' },
   });
 
-  return res.status(200).json(viajes);
+  // duracion_real se calcula en el read a partir de fecha_inicio y la ultima
+  // fecha_entrega de las paradas — no hay columna. En MINUTOS, como todas las
+  // duraciones de la API. null mientras el viaje no este FINALIZADO.
+  return res.status(200).json(
+    viajes.map((viaje) => ({
+      ...viaje,
+      duracion_real: calcularDuracionRealMinutos(viaje),
+    }))
+  );
 }
 
 const ESTADOS_VIAJE = [

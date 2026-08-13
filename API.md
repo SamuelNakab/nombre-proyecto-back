@@ -272,6 +272,53 @@ Actualiza el perfil del usuario autenticado. Solo se actualizan los campos prese
 
 ## /viajes — Gestión de viajes
 
+### Cómo se determina la zona
+
+La `zona` de un viaje (`CABA` | `PROVINCIA` | `MIXTO`) **la calcula siempre el servidor** a partir
+de las coordenadas de las paradas. `POST /api/viajes` y `POST /api/viajes/estimar-costo` siguen
+aceptando un campo `zona` en el body por compatibilidad con el front actual, pero **su valor se
+descarta**: mandar `zona: "CABA"` en un viaje con una parada en La Plata guarda `MIXTO` igual.
+
+Cada parada se clasifica con `booleanPointInPolygon` (turf.js) contra el **polígono oficial de
+CABA** (`src/data/limite-caba.geojson`, 1024 vértices, fuente IGN). Después:
+
+| Paradas | Zona |
+|---------|------|
+| Todas dentro de CABA | `CABA` |
+| Todas fuera de CABA | `PROVINCIA` |
+| Algunas dentro y otras fuera | `MIXTO` |
+
+### Cómo se factura cada zona
+
+Se facturan dos magnitudes: **`tiempo_capital`** (horas × `tarifa_hora`) y
+**`distancia_provincia`** (km × `tarifa_km`). `null` significa que no se cobra por ese concepto.
+
+| Zona | `tiempo_capital` | `distancia_provincia` |
+|------|------------------|------------------------|
+| `CABA` | tiempo total | `null` |
+| `PROVINCIA` | `null` | distancia total |
+| `MIXTO` | `tiempo_total × fraccion_caba` | `distancia_total × (1 − fraccion_caba)` |
+
+donde:
+
+```
+fraccion_caba = paradas_en_caba / total_paradas
+```
+
+**Aproximación conocida:** en `MIXTO` el reparto se hace por **cantidad de paradas**, no por el
+recorrido real. Un viaje con 1 parada en CABA y 1 en Provincia factura mitad y mitad aunque el
+tramo recorrido dentro de CABA haya sido mucho más corto o más largo. Prorratear por tramo GPS
+real queda **pendiente** como mejora futura.
+
+> Antes de este cambio, un viaje `MIXTO` cobraba el **tiempo total Y la distancia total**
+> (doble cobro). El reparto proporcional corrige eso. `CABA` y `PROVINCIA` puros no cambiaron.
+
+Estas magnitudes aparecen en `POST /api/viajes/estimar-costo`, en
+`GET /api/viajes/:id/costo-acumulado`, en el evento `viaje:finalizado` y se persisten en el viaje
+al cerrarlo.
+
+---
+
 ### POST /api/viajes/estimar-costo
 
 Calcula el costo estimado de un viaje sin crearlo.
@@ -291,25 +338,38 @@ Si `GOOGLE_MAPS_API_KEY` no está configurada usa valores mock (10 km, 0.5 h).
 }
 ```
 
-- `zona`: `"CABA"` | `"PROVINCIA"` | `"MIXTO"`
+- `zona`: **se acepta pero se IGNORA.** Se mantiene solo por compatibilidad con el front actual,
+  que la sigue mandando. La zona real la calcula el servidor a partir de las coordenadas de las
+  paradas — ver [Cómo se determina la zona](#cómo-se-determina-la-zona).
 - `paradas`: mínimo 2 elementos
 - `fecha_programada`: opcional. Si se omite se usa la fecha/hora actual para determinar si es hora pico.
 
 **Respuesta exitosa — 200:**
 ```json
 {
+  "zona": "CABA",
   "precio_estimado": 2500,
   "desglose": {
     "precio_por_tiempo": 2500,
     "precio_por_distancia": null,
     "tiempo_horas": 0.5,
     "distancia_km": 2.3,
+    "tiempo_capital": 0.5,
+    "distancia_provincia": null,
+    "fraccion_caba": 1,
     "tarifa_hora": 5000,
     "tarifa_km": null,
     "es_hora_pico": true
   }
 }
 ```
+
+- `zona`: la zona **calculada por el servidor**. Si mandaste una `zona` distinta en el body, esta
+  es la que vale.
+- `tiempo_horas` / `distancia_km`: totales medidos de la ruta completa.
+- `tiempo_capital` / `distancia_provincia`: las magnitudes que **efectivamente se facturan**
+  (`null` = no se cobra por ese concepto).
+- `fraccion_caba`: proporción de paradas que caen dentro de CABA (`1` en CABA, `0` en PROVINCIA).
 
 **Errores posibles:**
 | Status | Body | Causa |
@@ -342,6 +402,10 @@ instantáneamente a los conductores elegibles conectados via WebSocket.
 }
 ```
 
+- `zona`: **se acepta pero se IGNORA.** Igual que en `estimar-costo`, la zona que se persiste es
+  la que calcula el servidor de las coordenadas de las paradas, nunca la del body. En el ejemplo
+  de arriba el `"MIXTO"` del body es irrelevante: se guarda `MIXTO` porque una parada cae en CABA
+  y la otra en La Plata. Ver [Cómo se determina la zona](#cómo-se-determina-la-zona).
 - `fecha_programada`: fecha ISO 8601 y **estrictamente mayor** a 1 hora (60 minutos) desde el
   momento del request. Solo se valida ese **mínimo**: no hay tope máximo de anticipación. Si el
   valor no es una fecha válida o no supera ese mínimo → `400` con
@@ -565,12 +629,34 @@ ve únicamente sus propios viajes.
 
 ### GET /api/viajes/:id
 
-Detalle de un viaje. Pueden acceder tres perfiles: el **cliente** que lo creó, el
-**conductor** asignado, y el **gerente de la empresa dueña** del viaje (es decir,
-`viaje.id_empresa` apunta a una empresa cuyo `id_gerente` sos vos). Cualquier otro
-usuario autenticado recibe `403`.
+Detalle de un viaje.
 
-**Rol requerido:** Autenticado (`CLIENTE`, `CONDUCTOR` o `GERENTE`)
+**Quién puede llamarlo.** Se pasa por **cualquiera** de estas cuatro vías; cualquier
+otro usuario autenticado recibe `403`:
+
+| Vía | Quién | En qué estados |
+|-----|-------|----------------|
+| Cliente dueño | El `CLIENTE` que creó el viaje | Todos |
+| Conductor asignado | El `CONDUCTOR` de `viaje.id_conductor` | Todos (desde que se le asigna) |
+| Gerente de la empresa dueña | El `GERENTE` de la empresa de `viaje.id_empresa` | Todos aquellos en que el viaje ya tiene empresa (`RESERVADO_POR_EMPRESA` en adelante) |
+| **Gerente con flota elegible** | Un `GERENTE` cuya empresa activa tiene **al menos un vehículo de flota que cumple TODAS las `condiciones_req`** del viaje | **Solo `BUSCANDO_CONDUCTOR`** |
+
+Las tres primeras vías son la regla de acceso compartida con
+[`GET /api/viajes/:id/costo-acumulado`](#get-apiviajesidcosto-acumulado) y
+[`GET /api/viajes/:id/remito`](#get-apiviajesidremito) (helper `puedeVerViaje`).
+
+La cuarta vía es **exclusiva de este endpoint**. Un viaje en `BUSCANDO_CONDUCTOR`
+todavía tiene `id_empresa` en `null`, así que ningún gerente entra por la tercera vía;
+pero el gerente necesita abrir el detalle (paradas, `ruta_planeada`, `condiciones_req`)
+para decidir si lo reserva. Es el equivalente a lo que el conductor ve en
+[`GET /api/viajes/disponibles`](#get-apiviajesdisponibles), y usa exactamente el mismo
+criterio de elegibilidad a nivel empresa que decide a qué gerentes les llega el push
+`viaje:disponible` — si te llegó el push, podés abrir el detalle. Un gerente cuya flota
+**no** cumple las condiciones recibe `403`. Esta vía **no** aplica a `costo-acumulado`
+ni a `remito`: un viaje sin conductor no tiene ni costo acumulado ni remito.
+
+**Rol requerido:** Autenticado (`CLIENTE`, `CONDUCTOR` o `GERENTE`). No hay filtro de
+rol a nivel de ruta: la validación real es la tabla de arriba.
 
 **Respuesta exitosa — 200:**
 ```json
@@ -641,7 +727,7 @@ usuario autenticado recibe `403`.
 | Status | Body | Causa |
 |--------|------|-------|
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
-| 403 | `{ "error": "Sin acceso a este viaje" }` | El usuario no es el cliente, ni el conductor asignado, ni el gerente de la empresa dueña del viaje |
+| 403 | `{ "error": "Sin acceso a este viaje" }` | El usuario no entra por ninguna de las cuatro vías de acceso. Casos típicos: un conductor que no es el asignado; un gerente cuya empresa no es dueña del viaje; un gerente cuya flota **no** cumple las `condiciones_req` de un viaje en `BUSCANDO_CONDUCTOR`; un gerente elegible sobre un viaje que **ya** salió de `BUSCANDO_CONDUCTOR` y quedó en otra empresa |
 | 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
 
 ---
@@ -1117,9 +1203,28 @@ decir mientras está en `BUSCANDO_CONDUCTOR` (todavía nadie lo aceptó) o `COND
 ### GET /api/viajes/:id/costo-acumulado
 
 Devuelve el costo acumulado del viaje en curso calculado a partir de los datos GPS en Redis.
-Solo puede acceder el cliente que creó el viaje o el conductor asignado.
 
-**Rol requerido:** Autenticado (`CLIENTE` o `CONDUCTOR`)
+**Quién puede llamarlo.** Misma regla de acceso que
+[`GET /api/viajes/:id`](#get-apiviajesid) (helper `puedeVerViaje`) — se pasa por
+cualquiera de estas tres vías, y cualquier otro usuario autenticado recibe `403`:
+
+| Vía | Quién |
+|-----|-------|
+| Cliente dueño | El `CLIENTE` que creó el viaje |
+| Conductor asignado | El `CONDUCTOR` de `viaje.id_conductor` |
+| Gerente de la empresa dueña | El `GERENTE` de la empresa de `viaje.id_empresa` |
+
+La tercera vía es nueva: antes este endpoint era solo `CLIENTE`/`CONDUCTOR` y el gerente
+no podía ver el costo en vivo de un viaje de su propia empresa. Si el viaje **no** es de
+una empresa (`id_empresa` en `null`, viaje de un conductor independiente), ningún gerente
+pasa.
+
+**No** aplica la vía de "gerente con flota elegible" que sí tiene el detalle: un viaje en
+`BUSCANDO_CONDUCTOR` no tiene costo acumulado, y un gerente elegible que llame acá recibe
+`403`.
+
+**Rol requerido:** Autenticado (`CLIENTE`, `CONDUCTOR` o `GERENTE`). No hay filtro de rol
+a nivel de ruta: la validación real es la tabla de arriba.
 
 **Respuesta exitosa — 200 (con GPS activo):**
 ```json
@@ -1130,6 +1235,9 @@ Solo puede acceder el cliente que creó el viaje o el conductor asignado.
     "precio_por_distancia": 87.5,
     "tiempo_horas": 0.5,
     "distancia_km": 8.75,
+    "tiempo_capital": 0.5,
+    "distancia_provincia": 8.75,
+    "fraccion_caba": 1,
     "tarifa_hora": 3500,
     "tarifa_km": 10,
     "es_hora_pico": false
@@ -1147,12 +1255,15 @@ Solo puede acceder el cliente que creó el viaje o el conductor asignado.
 
 - `precio_por_tiempo`: `null` si la zona es `PROVINCIA`
 - `precio_por_distancia`: `null` si la zona es `CABA`
+- `tiempo_horas` / `distancia_km`: totales medidos por GPS
+- `tiempo_capital` / `distancia_provincia`: la parte de esos totales que se factura. En `MIXTO`
+  van prorrateados por `fraccion_caba` — ver [Cómo se factura cada zona](#cómo-se-factura-cada-zona)
 
 **Errores posibles:**
 | Status | Body | Causa |
 |--------|------|-------|
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
-| 403 | `{ "error": "Sin acceso a este viaje" }` | El usuario no es el cliente ni el conductor del viaje |
+| 403 | `{ "error": "Sin acceso a este viaje" }` | El usuario no es el cliente dueño, ni el conductor asignado, ni el gerente de la empresa dueña del viaje |
 | 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
 
 ---
@@ -1962,10 +2073,30 @@ como el promedio de todos sus puntajes en DB.
 ### GET /api/viajes/:id/remito
 
 
-Devuelve la URL pública del remito PDF del viaje. Solo disponible para viajes finalizados.
+Devuelve la URL pública del remito PDF del viaje. Solo disponible para viajes en estado
+`FINALIZADO` — en cualquier otro estado devuelve `400`.
 
+**Quién puede llamarlo.** Misma regla de acceso que
+[`GET /api/viajes/:id`](#get-apiviajesid) (helper `puedeVerViaje`) — se pasa por
+cualquiera de estas tres vías, y cualquier otro usuario autenticado recibe `403`:
 
-**Rol requerido:** `CLIENTE` o `CONDUCTOR` del viaje
+| Vía | Quién |
+|-----|-------|
+| Cliente dueño | El `CLIENTE` que creó el viaje |
+| Conductor asignado | El `CONDUCTOR` de `viaje.id_conductor` |
+| Gerente de la empresa dueña | El `GERENTE` de la empresa de `viaje.id_empresa` |
+
+La tercera vía es nueva: antes este endpoint era solo `CLIENTE`/`CONDUCTOR` y el gerente
+no podía descargar el remito de un viaje que hizo su propia empresa. Si el viaje **no** es
+de una empresa (`id_empresa` en `null`, viaje de un conductor independiente), ningún
+gerente pasa.
+
+**No** aplica la vía de "gerente con flota elegible" que sí tiene el detalle: un viaje en
+`BUSCANDO_CONDUCTOR` no tiene remito, y un gerente elegible que llame acá recibe `403`
+(el chequeo de acceso corre **antes** que el de estado, así que es `403` y no `400`).
+
+**Rol requerido:** Autenticado (`CLIENTE`, `CONDUCTOR` o `GERENTE`). No hay filtro de rol
+a nivel de ruta: la validación real es la tabla de arriba.
 
 
 **Respuesta exitosa — 200:**
@@ -1983,9 +2114,9 @@ y desglose de costo (tiempo, distancia, tarifas, precio real).
 **Errores posibles:**
 | Status | Body | Causa |
 |--------|------|-------|
-| 400 | `{ "error": "El remito solo esta disponible para viajes finalizados" }` | Estado incorrecto |
+| 400 | `{ "error": "El remito solo esta disponible para viajes finalizados" }` | El usuario tiene acceso pero el viaje no está `FINALIZADO` |
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
-| 403 | `{ "error": "Sin acceso a este viaje" }` | No es el cliente ni el conductor del viaje |
+| 403 | `{ "error": "Sin acceso a este viaje" }` | El usuario no es el cliente dueño, ni el conductor asignado, ni el gerente de la empresa dueña del viaje |
 | 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
 
 

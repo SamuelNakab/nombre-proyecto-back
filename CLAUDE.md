@@ -129,6 +129,36 @@ Transiciones validas:
   del viaje (viaje.id_empresa → empresa.id_gerente), ademas del cliente
   dueño y el conductor asignado. Cualquier otro → 403.
 
+### Helper de acceso compartido — src/services/acceso-viaje.service.js
+La regla de lectura de un viaje vive en UN solo lugar y la usan los TRES
+endpoints que devuelven datos del viaje. Antes estaba inline en obtenerViaje y
+los otros dos se habian quedado en CLIENTE/CONDUCTOR (el gerente no veia ni el
+costo ni el remito de un viaje de su propia empresa).
+
+- puedeVerViaje(viaje, usuario) → bool. Pasa el cliente dueño, el conductor
+  asignado, o el gerente de la empresa dueña. La usan:
+  * GET /api/viajes/:id
+  * GET /api/viajes/:id/costo-acumulado
+  * GET /api/viajes/:id/remito
+- INCLUDE_ACCESO_VIAJE: el include de Prisma con las relaciones que el helper
+  necesita (cliente, conductor, empresa). Los callers que no necesitan el objeto
+  completo (costo-acumulado, remito) lo spreadean tal cual. puedeVerViaje TIRA
+  error si alguna de las tres viene undefined: sin ese guard, olvidarse un
+  include no rompe — devuelve un 403 silencioso al gerente, justo el bug que el
+  helper viene a evitar.
+- puedeVerViajeDisponible(viaje, usuario) → Promise<bool>. Regla ADICIONAL y
+  EXCLUSIVA del detalle: un viaje en BUSCANDO_CONDUCTOR todavia tiene
+  id_empresa null, asi que ningun gerente pasa por puedeVerViaje; este permite
+  leerlo al gerente cuya flota cumple las condiciones_req, para que pueda
+  decidir si lo reserva. REUSA obtenerGerentesElegibles (elegibilidad.service),
+  el MISMO helper que decide a que gerentes les llega el push viaje:disponible
+  — si te llego el push, podes abrir el detalle; push y detalle no se pueden
+  desincronizar. NO se reimplementa el matching de condiciones.
+  NO aplica a costo-acumulado ni remito (un viaje sin conductor no tiene ni
+  costo acumulado ni remito).
+
+Ninguna de las tres rutas tiene requireRol: la validacion real es el helper.
+
 ### Ejecucion
 - El conductor asignado NO confirma la asignacion (por ahora): la ve en su
   pestaña "asignados" y puede iniciarla.
@@ -149,6 +179,55 @@ Transiciones validas:
 ### Tracking del gerente
 - Al gerente se lo suma al room viaje:{id} de los viajes de su empresa,
   para que reciba mapa:actualizar / eta:actualizar como el cliente.
+
+## Deteccion de zona (CABA / PROVINCIA / MIXTO)
+
+La zona de un viaje la calcula SIEMPRE el servidor. El campo `zona` del body de
+POST /api/viajes y POST /api/viajes/estimar-costo se acepta por compatibilidad
+con el front (que la sigue mandando) pero su valor se IGNORA.
+
+### Poligono de CABA
+- Archivo: src/data/limite-caba.geojson (Feature GeoJSON, MultiPolygon, 1024
+  vertices, ~82 KB). NO editar a mano: regenerar desde la fuente.
+- Fuente: IGN (Instituto Geografico Nacional), via el Servicio de Normalizacion
+  de Datos Geograficos de Argentina (georef-ar), dataset de provincias
+  v12.1.0 (2023-11-27), provincia id "02".
+  URL: https://infra.datos.gob.ar/georef/provincias.ndjson
+  (dataset en datos.gob.ar: jgm-servicio-normalizacion-datos-geograficos)
+- Se eligio el IGN porque data.buenosaires.gob.ar estaba caido (503) al
+  momento de implementarlo. El dataset del GCBA ("Perimetro") es equivalente.
+- Validado contra 20 puntos conocidos (10 dentro: Obelisco, Plaza de Mayo,
+  Caballito, Lugano, Nunez, Puerto Madero, Mataderos, Retiro, Liniers, Villa
+  Riachuelo; 10 fuera: La Plata, Avellaneda, San Isidro, Lanus, Ezeiza,
+  Ciudadela, Olivos, Tigre, San Justo, y un punto en el Rio de la Plata).
+  Los cruces de borde caen donde corresponde: Av. Gral Paz a la altura de
+  Liniers en lng ~-58.530, y el Riachuelo en Barracas en lat ~-34.658.
+
+### src/services/zona.service.js
+- clasificarParada(lat, lng) -> boolean. turf.booleanPointInPolygon contra el
+  poligono. Un punto sobre el borde cuenta como dentro.
+- contarParadasPorZona(paradas) -> { en_caba, fuera_caba, total, fraccion_caba }
+- clasificarZona(paradas) -> 'CABA' (todas dentro) | 'PROVINCIA' (todas fuera)
+  | 'MIXTO' (mezcla). Unica fuente de verdad de la zona.
+- repartirPorZona({ zona, paradas, tiempo_horas, distancia_km })
+  -> { tiempo_capital, distancia_provincia, fraccion_caba }.
+  Unica definicion del reparto facturable. La usan costo.service (estimacion),
+  cierre.service (cierre) y viajes.controller (precio acumulado en vivo), para
+  que los tres no se puedan desincronizar.
+- Las funciones aceptan paradas como { lat, lng } (body) o
+  { latitud, longitud } (base), asi el caller no tiene que mapear.
+
+### Reparto de MIXTO
+  fraccion_caba = paradas_en_caba / total_paradas
+  tiempo_capital      = tiempo_total    * fraccion_caba
+  distancia_provincia = distancia_total * (1 - fraccion_caba)
+CABA y PROVINCIA puros no cambiaron (tiempo total / distancia total).
+Antes, MIXTO cobraba el tiempo total Y la distancia total: doble cobro.
+
+### PENDIENTE
+El reparto de MIXTO es una APROXIMACION POR CANTIDAD DE PARADAS, no por
+recorrido real. Prorratear por tramo GPS real (clasificando cada punto del
+recorrido con clasificarParada y acumulando por tramo) queda para mas adelante.
 
 ## Eventos WebSocket nuevos
 | Evento          | Destinatario                                   |
@@ -194,3 +273,6 @@ node scripts/test-admin.js
 node scripts/test-iniciar-viaje.js
 node scripts/test-jerarquia.js
 node scripts/test-visibilidad-gerente.js   (nuevo, visibilidad del gerente)
+node scripts/test-zona.js                  (nuevo, deteccion de zona)
+node scripts/test-acceso-gerente.js        (nuevo, acceso del gerente a
+                                            detalle / costo-acumulado / remito)

@@ -11,6 +11,12 @@ import { recalcularEtaInmediato } from '../services/eta-emisor.js';
 import { limpiarViajeActivo } from '../services/cancelacion.service.js';
 import { calcularYGuardarRuta, obtenerRutaPlaneada } from '../services/ruta.service.js';
 import { validarTransicion } from '../services/estado-viaje.service.js';
+import { repartirPorZona } from '../services/zona.service.js';
+import {
+  puedeVerViaje,
+  puedeVerViajeDisponible,
+  INCLUDE_ACCESO_VIAJE,
+} from '../services/acceso-viaje.service.js';
 import { io } from '../sockets/index.js';
 
 // ─── QR helpers ──────────────────────────────────────────────────────────────
@@ -46,7 +52,10 @@ function verificarQR(qr_firmado) {
 const CONDICIONES = ['FRAGIL', 'REFRIGERADO', 'CARGA_PESADA', 'PELIGROSO', 'VOLUMINOSO'];
 
 const camposBase = {
-  zona: z.enum(['CABA', 'PROVINCIA', 'MIXTO']),
+  // `zona` se acepta SOLO por compatibilidad con el front actual, que la sigue
+  // mandando. Su valor se IGNORA: la zona real se calcula en el servidor a
+  // partir de las coordenadas de las paradas (clasificarZona). Ver zona.service.
+  zona: z.enum(['CABA', 'PROVINCIA', 'MIXTO']).optional(),
   paradas: z
     .array(
       z.object({
@@ -87,11 +96,13 @@ export async function estimarCosto(req, res) {
     return res.status(400).json({ error: parsed.error.issues[0].message });
   }
 
-  const { zona, paradas, fecha_programada } = parsed.data;
+  // parsed.data.zona se descarta a proposito: estimarCostoService la calcula de
+  // las paradas y la devuelve en el resultado.
+  const { paradas, fecha_programada } = parsed.data;
   const fechaEfectiva = fecha_programada ?? new Date().toISOString();
 
   try {
-    const resultado = await estimarCostoService({ zona, paradas, fecha_programada: fechaEfectiva });
+    const resultado = await estimarCostoService({ paradas, fecha_programada: fechaEfectiva });
     return res.status(200).json(resultado);
   } catch {
     return res.status(503).json({ error: 'No se pudo calcular la distancia' });
@@ -104,7 +115,9 @@ export async function crearViaje(req, res) {
     return res.status(400).json({ error: parsed.error.issues[0].message });
   }
 
-  const { zona, paradas, fecha_programada, condiciones_requeridas, descripcion } = parsed.data;
+  // parsed.data.zona se descarta a proposito: la zona que se persiste es la que
+  // calcula el servidor de las coordenadas (resultado.zona), no la del body.
+  const { paradas, fecha_programada, condiciones_requeridas, descripcion } = parsed.data;
 
   const cliente = await prisma.cliente.findUnique({
     where: { id_usuario: req.usuario.id_usuario },
@@ -115,7 +128,7 @@ export async function crearViaje(req, res) {
 
   let resultado;
   try {
-    resultado = await estimarCostoService({ zona, paradas, fecha_programada });
+    resultado = await estimarCostoService({ paradas, fecha_programada });
   } catch {
     return res.status(503).json({ error: 'No se pudo calcular la distancia' });
   }
@@ -125,7 +138,7 @@ export async function crearViaje(req, res) {
   const viaje = await prisma.viaje.create({
     data: {
       id_cliente: cliente.id_cliente,
-      zona,
+      zona: resultado.zona,
       tarifa_hora,
       tarifa_km,
       fecha_programada: new Date(fecha_programada),
@@ -234,15 +247,16 @@ export async function obtenerViaje(req, res) {
     return res.status(404).json({ error: 'Viaje no encontrado' });
   }
 
-  const esCliente = viaje.cliente.id_usuario === req.usuario.id_usuario;
-  const esConductor =
-    viaje.conductor !== null && viaje.conductor.id_usuario === req.usuario.id_usuario;
-  // Tercera via: el gerente de la empresa dueña del viaje (viajes reservados o
-  // asignados por su empresa) lo lee para seguimiento, igual que el cliente.
-  const esGerenteDeLaEmpresa =
-    viaje.empresa !== null && viaje.empresa.id_gerente === req.usuario.id_usuario;
+  // Regla compartida con costo-acumulado y remito: cliente dueño, conductor
+  // asignado, o gerente de la empresa dueña del viaje.
+  //
+  // Segunda via, exclusiva del detalle: si el viaje esta en BUSCANDO_CONDUCTOR
+  // todavia no tiene empresa, y el gerente cuya flota cumple las condiciones
+  // necesita leerlo (paradas, ruta_planeada) para decidir si lo reserva.
+  const acceso =
+    puedeVerViaje(viaje, req.usuario) || (await puedeVerViajeDisponible(viaje, req.usuario));
 
-  if (!esCliente && !esConductor && !esGerenteDeLaEmpresa) {
+  if (!acceso) {
     return res.status(403).json({ error: 'Sin acceso a este viaje' });
   }
 
@@ -563,15 +577,18 @@ export async function obtenerCostoAcumulado(req, res) {
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },
     include: {
-      cliente: true,
-      conductor: true,
+      // Misma regla de acceso que GET /api/viajes/:id (ver acceso-viaje.service).
+      ...INCLUDE_ACCESO_VIAJE,
+      // Las paradas hacen falta para repartir el precio de los viajes MIXTO.
+      paradas: { select: { latitud: true, longitud: true } },
     },
   });
   if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
 
-  const esCliente = viaje.cliente.id_usuario === req.usuario.id_usuario;
-  const esConductor = viaje.conductor !== null && viaje.conductor.id_usuario === req.usuario.id_usuario;
-  if (!esCliente && !esConductor) {
+  // Cliente dueño, conductor asignado, o gerente de la empresa dueña del viaje.
+  // La via de "gerente elegible del mercado abierto" NO aplica aca: un viaje en
+  // BUSCANDO_CONDUCTOR no tiene costo acumulado.
+  if (!puedeVerViaje(viaje, req.usuario)) {
     return res.status(403).json({ error: 'Sin acceso a este viaje' });
   }
 
@@ -580,21 +597,20 @@ export async function obtenerCostoAcumulado(req, res) {
     return res.status(200).json({ precio_acumulado: 0, desglose: null });
   }
 
-  let precio_acumulado;
-  let precio_por_tiempo = null;
-  let precio_por_distancia = null;
+  // Mismo reparto que usan la estimacion y el cierre: en MIXTO se prorratea en
+  // vez de cobrar el tiempo total Y la distancia total.
+  const { tiempo_capital, distancia_provincia, fraccion_caba } = repartirPorZona({
+    zona: viaje.zona,
+    paradas: viaje.paradas,
+    tiempo_horas: acumulado.tiempo_horas,
+    distancia_km: acumulado.distancia_km,
+  });
 
-  if (viaje.zona === 'CABA') {
-    precio_por_tiempo = acumulado.tiempo_horas * (viaje.tarifa_hora || 0);
-    precio_acumulado = precio_por_tiempo;
-  } else if (viaje.zona === 'PROVINCIA') {
-    precio_por_distancia = acumulado.distancia_km * (viaje.tarifa_km || 0);
-    precio_acumulado = precio_por_distancia;
-  } else {
-    precio_por_tiempo = acumulado.tiempo_horas * (viaje.tarifa_hora || 0);
-    precio_por_distancia = acumulado.distancia_km * (viaje.tarifa_km || 0);
-    precio_acumulado = precio_por_tiempo + precio_por_distancia;
-  }
+  const precio_por_tiempo =
+    tiempo_capital === null ? null : tiempo_capital * (viaje.tarifa_hora || 0);
+  const precio_por_distancia =
+    distancia_provincia === null ? null : distancia_provincia * (viaje.tarifa_km || 0);
+  const precio_acumulado = (precio_por_tiempo ?? 0) + (precio_por_distancia ?? 0);
 
   const hora = new Date().getHours();
   const es_hora_pico = (hora >= 7 && hora <= 10) || (hora >= 17 && hora <= 20);
@@ -606,6 +622,9 @@ export async function obtenerCostoAcumulado(req, res) {
       precio_por_distancia,
       tiempo_horas: acumulado.tiempo_horas,
       distancia_km: acumulado.distancia_km,
+      tiempo_capital,
+      distancia_provincia,
+      fraccion_caba,
       tarifa_hora: viaje.tarifa_hora,
       tarifa_km: viaje.tarifa_km,
       es_hora_pico,
@@ -767,14 +786,18 @@ export async function obtenerRemito(req, res) {
 
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },
-    include: { cliente: true, conductor: true },
+    // Misma regla de acceso que GET /api/viajes/:id (ver acceso-viaje.service).
+    include: INCLUDE_ACCESO_VIAJE,
   });
 
   if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
 
-  const esCliente = viaje.cliente.id_usuario === req.usuario.id_usuario;
-  const esConductor = viaje.conductor?.id_usuario === req.usuario.id_usuario;
-  if (!esCliente && !esConductor) return res.status(403).json({ error: 'Sin acceso a este viaje' });
+  // Cliente dueño, conductor asignado, o gerente de la empresa dueña del viaje.
+  // La via de "gerente elegible del mercado abierto" NO aplica aca: un viaje en
+  // BUSCANDO_CONDUCTOR no tiene remito.
+  if (!puedeVerViaje(viaje, req.usuario)) {
+    return res.status(403).json({ error: 'Sin acceso a este viaje' });
+  }
   if (viaje.estado !== 'FINALIZADO') return res.status(400).json({ error: 'El remito solo esta disponible para viajes finalizados' });
 
   return res.status(200).json({ remito_url: `${process.env.R2_PUBLIC_URL}/remitos/${id_viaje}.pdf` });

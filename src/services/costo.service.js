@@ -1,4 +1,5 @@
 import { obtenerTarifas } from './tarifa.service.js';
+import { clasificarZona, repartirPorZona } from './zona.service.js';
 
 async function getDistanciaYTiempo(origenLat, origenLng, destinoLat, destinoLng) {
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
@@ -43,7 +44,12 @@ export async function calcularDistanciaYTiempo(origen, destino) {
   return getDistanciaYTiempo(origen.lat, origen.lng, destino.lat, destino.lng);
 }
 
-export async function estimarCosto({ zona, paradas, fecha_programada }) {
+// La zona NO se recibe por parametro: se deduce de las coordenadas de las
+// paradas con clasificarZona. Lo que el cliente mande como `zona` en el body se
+// ignora a proposito. Se devuelve la zona calculada para que el caller la
+// persista.
+export async function estimarCosto({ paradas, fecha_programada }) {
+  const zona = clasificarZona(paradas);
   const { tarifa_hora, tarifa_km, es_hora_pico } = obtenerTarifas(zona, new Date(fecha_programada));
 
   let distancia_total_km = 0;
@@ -55,29 +61,31 @@ export async function estimarCosto({ zona, paradas, fecha_programada }) {
     tiempo_total_horas += tramo.tiempo_horas;
   }
 
-  let precio_estimado;
-  let precio_por_tiempo = null;
-  let precio_por_distancia = null;
+  // Magnitudes facturables. En MIXTO esto reparte proporcionalmente en vez de
+  // cobrar el tiempo total Y la distancia total (ver repartirPorZona).
+  const { tiempo_capital, distancia_provincia, fraccion_caba } = repartirPorZona({
+    zona,
+    paradas,
+    tiempo_horas: tiempo_total_horas,
+    distancia_km: distancia_total_km,
+  });
 
-  if (zona === 'CABA') {
-    precio_por_tiempo = tiempo_total_horas * tarifa_hora;
-    precio_estimado = precio_por_tiempo;
-  } else if (zona === 'PROVINCIA') {
-    precio_por_distancia = distancia_total_km * tarifa_km;
-    precio_estimado = precio_por_distancia;
-  } else {
-    precio_por_tiempo = tiempo_total_horas * tarifa_hora;
-    precio_por_distancia = distancia_total_km * tarifa_km;
-    precio_estimado = precio_por_tiempo + precio_por_distancia;
-  }
+  const precio_por_tiempo = tiempo_capital === null ? null : tiempo_capital * tarifa_hora;
+  const precio_por_distancia =
+    distancia_provincia === null ? null : distancia_provincia * tarifa_km;
+  const precio_estimado = (precio_por_tiempo ?? 0) + (precio_por_distancia ?? 0);
 
   return {
+    zona,
     precio_estimado,
     desglose: {
       precio_por_tiempo,
       precio_por_distancia,
       tiempo_horas: tiempo_total_horas,
       distancia_km: distancia_total_km,
+      tiempo_capital,
+      distancia_provincia,
+      fraccion_caba,
       tarifa_hora,
       tarifa_km,
       es_hora_pico,

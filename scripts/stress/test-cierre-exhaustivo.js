@@ -1,10 +1,12 @@
-import Redis from 'ioredis';
+// El cliente compartido y no un `new Redis(process.env.REDIS_URL)` propio: este
+// script no cargaba dotenv, asi que REDIS_URL venia undefined y ioredis se caia
+// contra localhost:6379 antes de correr un solo caso.
+import redis from '../../src/config/redis.js';
+import prisma from '../../src/config/prisma.js';
 import {
   api, getToken, conectar, esperar, registrarSiNoExiste, crearVehiculoSiNoExiste,
   crearReporter, STRESS_USERS, PARADA_A, PARADA_B,
 } from './_helpers.js';
-
-const redis = new Redis(process.env.REDIS_URL);
 
 // Mismo default que el backend (src/controllers/viajes.controller.js). Si el
 // server corre con otro valor, exportá RADIO_CONFIRMACION_METROS tambien aca.
@@ -29,6 +31,13 @@ async function montarViajeEnRuta(tokenCli, tokenA) {
   await esperar(1200);
   sA.emit('viaje:aceptar', { id_viaje });
   await esperar(1500);
+
+  // El viaje arranca con POST /:id/iniciar: el inicio automatico por primer ping
+  // GPS ya no existe. Crear exige fecha_programada >= 1h a futuro y la ventana de
+  // inicio abre recien VENTANA_INICIO_MINUTOS antes, asi que la traemos a "ahora".
+  await prisma.viaje.update({ where: { id_viaje }, data: { fecha_programada: new Date() } });
+  await api('POST', `/api/viajes/${id_viaje}/iniciar`, null, tokenA);
+
   sA.emit('conductor:ubicacion', {
     id_viaje, lat: PARADA_A.lat, lng: PARADA_A.lng, timestamp: Date.now(),
   });
@@ -189,6 +198,7 @@ async function main() {
   v2.sA.disconnect();
   v3.sA.disconnect();
   await redis.quit();
+  try { await prisma.$disconnect(); } catch { /* noop */ }
   return r.resumen();
 }
 

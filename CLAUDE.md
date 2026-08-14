@@ -7,13 +7,16 @@ MVP: CABA + GBA.
 
 ## Estado actual
 - Fases 0-5 COMPLETAS (registro, viajes, matching atomico, GPS/tracking,
-  ETA, recalculo de ruta, QR de paradas, cierre, remito PDF, calificaciones,
-  vehiculos)
+  ETA, recalculo de ruta, confirmacion de paradas, cierre, remito PDF,
+  calificaciones, vehiculos)
 - Boton "Iniciar viaje" (inicio manual + puntualidad) COMPLETO, en produccion
 - CI/CD + deploy Railway por environment COMPLETO
 - Cancelacion por conductor, cliente y admin COMPLETO
 - Panel de administracion COMPLETO
-- **En curso: estructura jerarquica (empresas de logistica)**
+- Estructura jerarquica (empresas de logistica) COMPLETA
+- Deteccion de zona por poligono COMPLETA
+- Duraciones (estimada / real) y guard atomico en asignar COMPLETOS
+- Confirmacion de paradas por proximidad (reemplazo del QR) COMPLETA
 
 ## Stack
 - Node.js 22, ES Modules (NUNCA require()). Async/await siempre.
@@ -30,17 +33,19 @@ MVP: CABA + GBA.
 ## Reglas de migraciones Prisma
 - Hay drift. Usar npx prisma db push. NUNCA migrate reset/dev sin
   autorizacion explicita de Samuel.
-- Los cambios de esta tarea son ADITIVOS (tablas nuevas + columnas
-  nullable): db push es seguro, no borra datos.
+- La DB de Neon esta COMPARTIDA entre staging y produccion: un db push
+  local toca el schema de produccion en ese mismo instante. Solo cambios
+  ADITIVOS (tablas nuevas, columnas nullable) son seguros. NUNCA dropear
+  ni renombrar columnas sin autorizacion explicita.
+- El reemplazo del QR por proximidad NO tuvo cambios de schema.
 
-## Maquina de estados (NUEVO — usar en esta tarea)
-Crear src/services/estado-viaje.service.js con las transiciones validas
-como estructura de datos y una funcion validarTransicion(actual, destino)
-que tira error si no esta permitida. USARLA en:
-- El PATCH /api/viajes/:id/estado existente (hoy permite retrocesos invalidos).
-- TODOS los endpoints nuevos de esta tarea que cambien el estado del viaje.
-NO refactorizar todavia matching.service, cierre.service ni
-cancelacion.service (setean un estado fijo, se migran despues).
+## Maquina de estados — src/services/estado-viaje.service.js
+TRANSICIONES como estructura de datos + validarTransicion(actual, destino),
+que tira error si la transicion no esta permitida. La usan:
+- El PATCH /api/viajes/:id/estado (antes permitia retrocesos invalidos).
+- Todos los endpoints de la estructura jerarquica que cambian estado.
+PENDIENTE: matching.service, cierre.service y cancelacion.service todavia
+setean un estado fijo directo, sin validarTransicion. Se migran despues.
 
 Transiciones validas:
 | Desde                  | Hacia                    | Quien / trigger                          |
@@ -58,15 +63,74 @@ Transiciones validas:
 | EN_CAMINO_A_ORIGEN     | CARGANDO                 | Manual, PATCH /estado                    |
 | CARGANDO               | EN_RUTA                  | Manual, PATCH /estado                    |
 | EN_RUTA                | DESCARGANDO              | Manual, PATCH /estado                    |
-| DESCARGANDO            | FINALIZADO               | QR ultima parada                         |
+| DESCARGANDO            | FINALIZADO               | Confirmacion de la ULTIMA parada         |
 | cualquiera (no final)  | CANCELADO                | Admin                                    |
 
-## Estructura jerarquica (esta tarea)
+## Confirmacion de paradas (sin QR)
+
+El QR fue REEMPLAZADO por confirmacion por proximidad. Ya no existe el
+endpoint de qr-paradas ni la firma/validacion de tokens.
+
+Flujo: el conductor llega a la parada, toca el boton de confirmar en su
+app, y el backend valida que su posicion este dentro de
+RADIO_CONFIRMACION_METROS de esa parada.
+
+- POST /api/viajes/:id/confirmar-parada
+  Rol CONDUCTOR (solo el asignado al viaje).
+  Body: { id_parada, lat, lng }. El id_parada sale de las paradas que ya
+  devuelve GET /api/viajes/:id — no hay endpoint aparte para listarlas.
+  Validaciones, en este orden:
+  * el viaje existe -> 404
+  * el conductor autenticado es el asignado -> 403
+  * la parada pertenece a ese viaje -> 400
+  * la parada no esta confirmada todavia (fecha_entrega null) -> 400
+  * el viaje esta en EN_RUTA o DESCARGANDO -> 400
+  * distancia((lat,lng), parada) <= RADIO_CONFIRMACION_METROS -> si no,
+    400 con un mensaje que dice a cuantos metros esta y cual es el maximo
+  Setea Parada.fecha_entrega (y estado ENTREGADO). Si es la ULTIMA parada
+  sin confirmar, dispara el cierre del viaje igual que antes:
+  DESCARGANDO -> FINALIZADO, precio_real, remito PDF, evento
+  viaje:finalizado. Si quedan pendientes, solo recalcula el ETA.
+
+- El ORDEN de las validaciones es contrato, no detalle: define que error
+  ve el conductor cuando falla mas de una condicion. Esta documentado
+  igual en API.md. El codigo viejo validaba el estado ANTES de la parada.
+
+- "Ya confirmada" se chequea por fecha_entrega (no por estado ENTREGADO).
+  Los dos se escriben juntos en el mismo update, asi que da igual, pero
+  fecha_entrega es el campo que define el cierre. El conteo de paradas
+  pendientes que dispara el cierre sigue yendo por estado.
+
+- CAMBIO DE CONTRATO: una parada que no es de ese viaje devuelve 400
+  ("La parada no pertenece a este viaje"), no 404. El viaje de la URL si
+  existe; lo que esta mal es la combinacion. Mismo 400 exista o no la
+  parada, para no filtrar ids de paradas de viajes ajenos.
+
+- El orden de confirmacion ENTRE PARADAS no se valida: una parada se
+  puede confirmar antes que otra de orden menor. Es el comportamiento que
+  ya existia con el QR. De ahi que duracion_real use max(fecha_entrega).
+
+- La distancia se calcula con la MISMA funcion que ya usaba el codigo
+  (turf.distance en metros), no se escribio una nueva.
+
+- Antes de este cambio el radio estaba FIJO en 200m; ahora es variable de
+  entorno y el default bajo a 50m. Se bajo porque con el QR la proximidad
+  era un control secundario (el token firmado ya probaba la presencia) y
+  ahora es el UNICO control. Queda configurable porque 50m es agresivo
+  para GPS urbano entre edificios altos.
+
+- La columna qr_token queda en el schema pero SIN USO: la DB de Neon esta
+  compartida con produccion y dropear columnas ahi es destructivo. Se
+  dropea cuando se separen las DBs por environment. Sigue apareciendo en
+  las respuestas que serializan la fila cruda de la parada; API.md avisa
+  que se ignore.
+
+## Estructura jerarquica
 
 ### Actores
 - CLIENTE: sin cambios, crea viajes.
 - Conductor INDEPENDIENTE: sin empresa, ve/acepta/coordina viajes con sus
-  propios vehiculos. Igual que hoy, NO se toca.
+  propios vehiculos.
 - Conductor AFILIADO: pertenece a 1 o N empresas. CONSERVA su menu personal
   (sigue viendo y aceptando viajes propios con sus propios vehiculos), y
   ADEMAS recibe asignaciones de sus gerentes en una pestaña aparte.
@@ -74,16 +138,14 @@ Transiciones validas:
   asigna conductor + vehiculo de su flota, registra vehiculos de la empresa,
   aprueba y desafilia conductores, ve el tracking de los viajes de su empresa.
 
-### Modelos nuevos
+### Modelos
 - Empresa: nombre, cuit, codigo_afiliacion (unico), id_gerente, activa.
 - ConductorEmpresa (N-a-N): id_conductor, id_empresa, estado
   (PENDIENTE | ACTIVO), fecha_alta, fecha_baja.
-
-### Cambios en modelos existentes
 - Vehiculo: dueño explicito — id_conductor (nullable) O id_empresa (nullable),
-  exactamente uno de los dos. Los vehiculos de hoy son de conductor.
+  exactamente uno de los dos.
 - Viaje: id_empresa (nullable), fecha_reserva (nullable), iniciado_por
-  (nullable: "CONDUCTOR" | "GERENTE").
+  (nullable: "CONDUCTOR" | "GERENTE"), duracion_estimada_horas (Float?).
 
 ### Afiliacion
 - El conductor ingresa el codigo_afiliacion de la empresa → se crea
@@ -99,7 +161,7 @@ Transiciones validas:
 - Los viajes disponibles se publican a conductores independientes elegibles
   Y a gerentes cuya empresa tenga al menos un vehiculo de flota que cumpla
   las condiciones del viaje.
-- El gerente reserva (atomico, mismo patron que el aceptar de hoy) →
+- El gerente reserva (atomico, mismo patron que el aceptar) →
   RESERVADO_POR_EMPRESA. El viaje sale del pool para el resto.
 - El gerente asigna cualquier conductor ACTIVO de su empresa + cualquier
   vehiculo de la flota que cumpla las condiciones → CONDUCTOR_ASIGNADO.
@@ -179,10 +241,11 @@ Ninguna de las tres rutas tiene requireRol: la validacion real es el helper.
   pestaña "asignados" y puede iniciarla.
 - "Iniciar viaje" lo puede apretar el conductor O el gerente. Guardar
   iniciado_por. El GPS SIEMPRE viene del celular del conductor.
-- De CONDUCTOR_ASIGNADO en adelante, el flujo es identico al de hoy.
+- De CONDUCTOR_ASIGNADO en adelante, el flujo es identico para viajes de
+  empresa y de conductor independiente.
 
 ### Calificacion
-- Se califica al conductor, como hoy.
+- Se califica al conductor.
 - La calificacion de una empresa es el promedio de las de sus conductores
   ACTIVOS. Calcular en el read (GET empresa), no denormalizar.
 - SOLO se promedian los conductores ACTIVOS que YA tienen al menos una
@@ -205,21 +268,25 @@ Regla sin excepciones, para no mezclar unidades en una misma respuesta:
 - Nomenclatura: `duracion_*` sin sufijo = minutos enteros. `tiempo_*` y
   `*_horas` = horas float.
 
-- duracion_estimada_horas: columna NUEVA en Viaje (Float?, aditiva y nullable,
-  db push seguro). Se llena en crearViaje con resultado.desglose.tiempo_horas —
-  el MISMO tiempo que se acaba de usar para estimar el precio, asi que
+- duracion_estimada_horas: columna en Viaje (Float?, aditiva y nullable).
+  Se llena en crearViaje con resultado.desglose.tiempo_horas — el MISMO
+  tiempo que se acaba de usar para estimar el precio, asi que
   duracion_estimada y precio_estimado no se pueden desincronizar. Antes ese
   valor se calculaba y se descartaba: salia una sola vez en la respuesta de
   creacion y no habia forma de recuperarlo (en PROVINCIA tarifa_hora es null y
   en MIXTO el precio mezcla los dos ejes, asi que NO es derivable del precio).
 - duracion_real: NO hay columna, se calcula en el read con
   calcularDuracionRealMinutos(viaje) = max(paradas.fecha_entrega) − fecha_inicio.
-  Se usa max() y NO la parada de mayor `orden`: las paradas se confirman por QR
-  y nada garantiza que se confirmen en orden. null si el viaje no esta
-  FINALIZADO o no tiene fecha_inicio.
+  Se usa max() y NO la parada de mayor `orden`: nada garantiza que las paradas
+  se confirmen en orden (no se valida el orden de confirmacion). null si el
+  viaje no esta FINALIZADO o no tiene fecha_inicio.
 - Lo consumen: GET /api/viajes/mis-viajes (duracion_real) y GET /api/viajes/:id
   (duracion_estimada). El detalle ademas incluye el vehiculo asignado (null
   mientras no hay conductor).
+- Excepcion documentada: GET /api/empresas/:id/viajes devuelve
+  duracion_estimada_horas en HORAS, porque ese endpoint serializa la fila cruda
+  del viaje. El nombre lleva la unidad; la regla de minutos aplica a los campos
+  derivados.
 
 ## Deteccion de zona (CABA / PROVINCIA / MIXTO)
 
@@ -270,7 +337,7 @@ El reparto de MIXTO es una APROXIMACION POR CANTIDAD DE PARADAS, no por
 recorrido real. Prorratear por tramo GPS real (clasificando cada punto del
 recorrido con clasificarParada y acumulando por tramo) queda para mas adelante.
 
-## Eventos WebSocket nuevos
+## Eventos WebSocket
 | Evento          | Destinatario                                   |
 |-----------------|------------------------------------------------|
 | viaje:reservado | Room viaje:{id} (sacar del pool a los demas)   |
@@ -289,8 +356,14 @@ viaje:reserva_cancelada (ese es "vuelve al mercado abierto"). Payload
   (motivo: "conductor_desafiliado").
 - Cancelacion del conductor de un viaje de empresa (motivo: "conductor_cancelo").
 
-## Variables de entorno de esta tarea
-RESERVA_TIMEOUT_MINUTOS=10   (nueva, con default en codigo si no esta en .env)
+## Variables de entorno
+RESERVA_TIMEOUT_MINUTOS=10        (default en codigo si no esta en .env)
+RESERVA_CHECK_INTERVAL_MS=60000   (cada cuanto corre el job de timeout)
+RADIO_CONFIRMACION_METROS=50      (default en codigo si no esta en .env;
+                                   antes el radio estaba fijo en 200)
+
+QR_SECRET se SACO de .env.example. Puede seguir en el .env local de cada
+uno, pero ya no lo lee nadie: se elimino junto con firmarQR/verificarQR.
 
 MATCHING_TIMEOUT eliminado POR COMPLETO — no queda ningun rastro:
 - La env var MATCHING_TIMEOUT_MINUTOS se saco de .env.example y del codigo.
@@ -313,17 +386,29 @@ node scripts/test-cancelacion-cliente.js
 node scripts/test-admin.js
 node scripts/test-iniciar-viaje.js
 node scripts/test-jerarquia.js
-node scripts/test-visibilidad-gerente.js   (nuevo, visibilidad del gerente)
-node scripts/test-zona.js                  (nuevo, deteccion de zona)
-node scripts/test-acceso-gerente.js        (nuevo, acceso del gerente a
-                                            detalle / costo-acumulado / remito)
-node scripts/test-campos-duracion.js       (nuevo, duracion_real /
-                                            duracion_estimada / vehiculo en el
-                                            detalle / tiempo_capital y
-                                            distancia_provincia en las 3 zonas)
+node scripts/test-visibilidad-gerente.js   (visibilidad del gerente)
+node scripts/test-zona.js                  (deteccion de zona)
+node scripts/test-acceso-gerente.js        (acceso del gerente a detalle /
+                                            costo-acumulado / remito)
+node scripts/test-campos-duracion.js       (duracion_real / duracion_estimada /
+                                            vehiculo en el detalle /
+                                            tiempo_capital y distancia_provincia
+                                            en las 3 zonas)
 node scripts/test-concurrencia-jerarquia.js (reserva y asignacion atomicas;
                                             CASO C = doble asignacion)
+node scripts/test-confirmar-parada.js      (confirmacion por proximidad: radio,
+                                            parada ajena, conductor ajeno,
+                                            cierre del viaje, qr-paradas 404)
+node scripts/stress/test-cierre-exhaustivo.js (cierre + calificacion + remito +
+                                            limpieza de Redis. CORRERLO: quedo
+                                            roto meses por no correrse — sin
+                                            dotenv para Redis y sin POST
+                                            /:id/iniciar tras el boton nuevo)
 
 El CASO 8 de test-jerarquia necesita el server corriendo con
 RESERVA_CHECK_INTERVAL_MS=3000 (el default de 60s no llega a disparar el job
 dentro de la ventana del test).
+
+Nota de entorno: si el repo esta en una carpeta sincronizada por OneDrive,
+node --watch (npm run dev) se reinicia solo cuando OneDrive toca node_modules y
+corta requests en vuelo. Sintoma tipico: "fetch failed" a mitad de un script.

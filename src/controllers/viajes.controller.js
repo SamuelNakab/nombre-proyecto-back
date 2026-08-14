@@ -1,4 +1,3 @@
-import { createHmac, timingSafeEqual } from 'crypto';
 import { z } from 'zod';
 import * as turf from '@turf/turf';
 import prisma from '../config/prisma.js';
@@ -19,34 +18,6 @@ import {
   INCLUDE_ACCESO_VIAJE,
 } from '../services/acceso-viaje.service.js';
 import { io } from '../sockets/index.js';
-
-// ─── QR helpers ──────────────────────────────────────────────────────────────
-
-function firmarQR(payload) {
-  const data = Buffer.from(JSON.stringify(payload)).toString('base64url');
-  const firma = createHmac('sha256', process.env.QR_SECRET).update(data).digest('hex');
-  return `${data}.${firma}`;
-}
-
-function verificarQR(qr_firmado) {
-  const dot = qr_firmado.lastIndexOf('.');
-  if (dot === -1) return null;
-  const data = qr_firmado.slice(0, dot);
-  const firma = qr_firmado.slice(dot + 1);
-  const firmaEsperada = createHmac('sha256', process.env.QR_SECRET).update(data).digest('hex');
-  try {
-    const a = Buffer.from(firma, 'hex');
-    const b = Buffer.from(firmaEsperada, 'hex');
-    if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
-  } catch {
-    return null;
-  }
-  try {
-    return JSON.parse(Buffer.from(data, 'base64url').toString());
-  } catch {
-    return null;
-  }
-}
 
 // ─── Schemas de validacion ───────────────────────────────────────────────────
 
@@ -661,35 +632,9 @@ export async function obtenerCostoAcumulado(req, res) {
 
 // ─── Fase 5 ───────────────────────────────────────────────────────────────────
 
-export async function obtenerQRParadas(req, res) {
-  const id_viaje = Number(req.params.id);
-
-  const viaje = await prisma.viaje.findUnique({
-    where: { id_viaje },
-    include: {
-      cliente: true,
-      paradas: { orderBy: { orden: 'asc' } },
-    },
-  });
-
-  if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
-  if (viaje.cliente.id_usuario !== req.usuario.id_usuario) {
-    return res.status(403).json({ error: 'Sin acceso a este viaje' });
-  }
-
-  const qrs = viaje.paradas.map((p) => ({
-    id_parada: p.id_parada,
-    orden: p.orden,
-    direccion: p.direccion,
-    qr_firmado: firmarQR({ id_parada: p.id_parada, id_viaje, orden: p.orden }),
-  }));
-
-  return res.status(200).json(qrs);
-}
-
 export async function confirmarParada(req, res) {
   const schema = z.object({
-    qr_firmado: z.string(),
+    id_parada: z.number().int().positive(),
     lat: z.number(),
     lng: z.number(),
   });
@@ -697,12 +642,8 @@ export async function confirmarParada(req, res) {
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
 
-  const { qr_firmado, lat, lng } = parsed.data;
+  const { id_parada, lat, lng } = parsed.data;
   const id_viaje = Number(req.params.id);
-
-  const payload = verificarQR(qr_firmado);
-  if (!payload) return res.status(400).json({ error: 'QR invalido o firma incorrecta' });
-  if (payload.id_viaje !== id_viaje) return res.status(400).json({ error: 'El QR no corresponde a este viaje' });
 
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },
@@ -712,26 +653,38 @@ export async function confirmarParada(req, res) {
     },
   });
 
+  // Orden de validaciones fijado por contrato (mismo orden en API.md): primero
+  // lo que identifica al recurso y a quien lo pide, despues el estado, y la
+  // proximidad al final — es la unica que necesita las coordenadas del body.
   if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
   if (!viaje.conductor || viaje.conductor.id_usuario !== req.usuario.id_usuario) {
     return res.status(403).json({ error: 'No sos el conductor de este viaje' });
   }
+
+  // 400 y no 404: la parada puede existir perfectamente, solo que no es de este
+  // viaje. El recurso de la URL (el viaje) si existe.
+  const parada = viaje.paradas.find((p) => p.id_parada === id_parada);
+  if (!parada) return res.status(400).json({ error: 'La parada no pertenece a este viaje' });
+  if (parada.fecha_entrega !== null) {
+    return res.status(400).json({ error: 'La parada ya fue confirmada' });
+  }
+
   if (viaje.estado !== 'EN_RUTA' && viaje.estado !== 'DESCARGANDO') {
     return res.status(400).json({ error: 'El viaje debe estar en estado EN_RUTA o DESCARGANDO' });
   }
 
-  const parada = viaje.paradas.find((p) => p.id_parada === payload.id_parada);
-  if (!parada) return res.status(404).json({ error: 'Parada no encontrada' });
-  if (parada.estado === 'ENTREGADO') return res.status(400).json({ error: 'La parada ya fue confirmada' });
-
+  // Confirmacion por proximidad: reemplaza al QR firmado. El radio es
+  // configurable porque 50m es agresivo para GPS urbano con edificios altos y
+  // puede necesitar ajuste sin redeploy de codigo.
+  const radio_metros = parseFloat(process.env.RADIO_CONFIRMACION_METROS || '50');
   const distancia_metros = turf.distance(
     turf.point([lng, lat]),
     turf.point([parada.longitud, parada.latitud]),
     { units: 'meters' }
   );
-  if (distancia_metros > 200) {
+  if (distancia_metros > radio_metros) {
     return res.status(400).json({
-      error: `Estas a ${Math.round(distancia_metros)}m de la parada. Debes estar a menos de 200m`,
+      error: `Estas a ${Math.round(distancia_metros)}m de la parada. Debes estar a menos de ${radio_metros}m`,
     });
   }
 

@@ -108,12 +108,12 @@ async function finalizarViaje(clienteToken, conductorToken, sConductor) {
   // La maquina de estados no permite saltear CARGANDO (EN_CAMINO_A_ORIGEN -> EN_RUTA).
   await api('PATCH', `/api/viajes/${id_viaje}/estado`, { estado: 'CARGANDO' }, conductorToken);
   await api('PATCH', `/api/viajes/${id_viaje}/estado`, { estado: 'EN_RUTA' }, conductorToken);
-  const { data: qrs } = await api('GET', `/api/viajes/${id_viaje}/qr-paradas`, null, clienteToken);
-  const ordenadas = qrs.sort((a, b) => a.orden - b.orden);
+  const { data: det } = await api('GET', `/api/viajes/${id_viaje}`, null, clienteToken);
+  const ordenadas = [...det.paradas].sort((a, b) => a.orden - b.orden);
   await api('POST', `/api/viajes/${id_viaje}/confirmar-parada`,
-    { qr_firmado: ordenadas[0].qr_firmado, lat: PARADA_1.lat, lng: PARADA_1.lng }, conductorToken);
+    { id_parada: ordenadas[0].id_parada, lat: PARADA_1.lat, lng: PARADA_1.lng }, conductorToken);
   const { data: conf2 } = await api('POST', `/api/viajes/${id_viaje}/confirmar-parada`,
-    { qr_firmado: ordenadas[1].qr_firmado, lat: PARADA_2.lat, lng: PARADA_2.lng }, conductorToken);
+    { id_parada: ordenadas[1].id_parada, lat: PARADA_2.lat, lng: PARADA_2.lng }, conductorToken);
   if (!conf2.viaje_finalizado) throw new Error(`El viaje ${id_viaje} no finalizo: ${JSON.stringify(conf2)}`);
   return id_viaje;
 }

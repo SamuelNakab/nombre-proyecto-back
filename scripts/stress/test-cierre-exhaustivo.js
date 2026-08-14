@@ -6,6 +6,18 @@ import {
 
 const redis = new Redis(process.env.REDIS_URL);
 
+// Mismo default que el backend (src/controllers/viajes.controller.js). Si el
+// server corre con otro valor, exportá RADIO_CONFIRMACION_METROS tambien aca.
+const RADIO_METROS = parseFloat(process.env.RADIO_CONFIRMACION_METROS || '50');
+
+// Las paradas (id_parada + orden) salen del detalle del viaje: el endpoint de
+// QR ya no existe.
+async function paradasDe(id_viaje, token) {
+  const { status, data } = await api('GET', `/api/viajes/${id_viaje}`, null, token);
+  if (status !== 200) throw new Error(`GET /api/viajes/${id_viaje} fallo (${status}): ${JSON.stringify(data)}`);
+  return [...data.paradas].sort((a, b) => a.orden - b.orden);
+}
+
 async function montarViajeEnRuta(tokenCli, tokenA) {
   const fecha = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
   const { data: viaje } = await api('POST', '/api/viajes', {
@@ -41,76 +53,67 @@ async function main() {
   r.paso('Tokens y vehiculo listos', true);
 
   // ────────────────────────────────────────────────────────────────────────
-  r.seccion('1. QR firmado correcto + GPS cercano → 200');
+  r.seccion('1. Parada del viaje + GPS encima de la parada → 200');
   const v1 = await montarViajeEnRuta(tokenCli, tokenA);
-  const { data: qrs1 } = await api('GET', `/api/viajes/${v1.id_viaje}/qr-paradas`, null, tokenCli);
+  const paradas1 = await paradasDe(v1.id_viaje, tokenCli);
   const { status: sc1, data: dc1 } = await api(
     'POST', `/api/viajes/${v1.id_viaje}/confirmar-parada`,
-    { qr_firmado: qrs1[0].qr_firmado, lat: PARADA_A.lat, lng: PARADA_A.lng },
+    { id_parada: paradas1[0].id_parada, lat: PARADA_A.lat, lng: PARADA_A.lng },
     tokenA
   );
   r.paso('Confirmar parada legal → 200', sc1 === 200, `status ${sc1}`);
   r.paso('confirmada=true', sc1 === 200 && dc1.confirmada === true);
 
   // ────────────────────────────────────────────────────────────────────────
-  r.seccion('2. QR de OTRO viaje → rechazado');
+  r.seccion('2. Parada de OTRO viaje → rechazada');
   const v2 = await montarViajeEnRuta(tokenCli, tokenA);
-  const { data: qrs2 } = await api('GET', `/api/viajes/${v2.id_viaje}/qr-paradas`, null, tokenCli);
-  const { status: sc2 } = await api(
+  const paradas2 = await paradasDe(v2.id_viaje, tokenCli);
+  const { status: sc2, data: dc2 } = await api(
     'POST', `/api/viajes/${v1.id_viaje}/confirmar-parada`,
-    { qr_firmado: qrs2[0].qr_firmado, lat: PARADA_A.lat, lng: PARADA_A.lng },
+    { id_parada: paradas2[0].id_parada, lat: PARADA_A.lat, lng: PARADA_A.lng },
     tokenA
   );
-  r.paso('QR de OTRO viaje → 400', sc2 === 400, `status ${sc2}`);
+  r.paso('Parada de OTRO viaje → 400', sc2 === 400, `status ${sc2} — ${dc2.error}`);
 
   // ────────────────────────────────────────────────────────────────────────
-  r.seccion('3. Firma HMAC manipulada → rechazada');
-  // partes son base64(payload).hmac — manipulamos el hmac
-  const partes = qrs1[1].qr_firmado.split('.');
-  const fakeFirmado = partes[0] + '.deadbeef' + partes[1].slice(8);
-  const { status: sc3 } = await api(
+  r.seccion(`3. Conductor lejos (>${RADIO_METROS}m) → rechazado`);
+  const { status: sc3, data: dc3 } = await api(
     'POST', `/api/viajes/${v1.id_viaje}/confirmar-parada`,
-    { qr_firmado: fakeFirmado, lat: PARADA_A.lat, lng: PARADA_A.lng },
+    { id_parada: paradas1[1].id_parada, lat: -34.7, lng: -58.5 },
     tokenA
   );
-  r.paso('Firma manipulada → 400', sc3 === 400, `status ${sc3}`);
+  r.paso('GPS lejos → 400', sc3 === 400, `status ${sc3} — ${dc3.error}`);
+  r.paso('El error dice la distancia y el maximo',
+    sc3 === 400 && /Estas a \d+m de la parada/.test(dc3.error ?? '') && dc3.error.includes(`${RADIO_METROS}m`),
+    dc3.error ?? '');
 
   // ────────────────────────────────────────────────────────────────────────
-  r.seccion('4. Conductor lejos (>200m) → rechazado');
-  const { status: sc4, data: dc4 } = await api(
-    'POST', `/api/viajes/${v1.id_viaje}/confirmar-parada`,
-    { qr_firmado: qrs1[1].qr_firmado, lat: -34.7, lng: -58.5 },
-    tokenA
-  );
-  r.paso('GPS lejos → 400', sc4 === 400, `status ${sc4} — ${dc4.error}`);
-
-  // ────────────────────────────────────────────────────────────────────────
-  r.seccion('5. Confirmar misma parada dos veces');
+  r.seccion('4. Confirmar misma parada dos veces');
   // confirmar parada 2 legal
-  const { status: sc5a } = await api(
+  const { status: sc4a } = await api(
     'POST', `/api/viajes/${v1.id_viaje}/confirmar-parada`,
-    { qr_firmado: qrs1[1].qr_firmado, lat: PARADA_B.lat, lng: PARADA_B.lng },
+    { id_parada: paradas1[1].id_parada, lat: PARADA_B.lat, lng: PARADA_B.lng },
     tokenA
   );
   // (esto cierra el viaje porque era la ultima parada)
-  const { status: sc5b } = await api(
+  const { status: sc4b } = await api(
     'POST', `/api/viajes/${v1.id_viaje}/confirmar-parada`,
-    { qr_firmado: qrs1[1].qr_firmado, lat: PARADA_B.lat, lng: PARADA_B.lng },
+    { id_parada: paradas1[1].id_parada, lat: PARADA_B.lat, lng: PARADA_B.lng },
     tokenA
   );
-  r.paso('1ra confirmacion → 200', sc5a === 200, `status ${sc5a}`);
-  r.paso('2da confirmacion misma parada → rechazada (400)', sc5b === 400, `status ${sc5b}`);
+  r.paso('1ra confirmacion → 200', sc4a === 200, `status ${sc4a}`);
+  r.paso('2da confirmacion misma parada → rechazada (400)', sc4b === 400, `status ${sc4b}`);
 
   // ────────────────────────────────────────────────────────────────────────
-  r.seccion('6. Calificar viaje NO finalizado');
-  const { status: sc6, data: dc6 } = await api(
+  r.seccion('5. Calificar viaje NO finalizado');
+  const { status: sc5, data: dc5 } = await api(
     'POST', `/api/viajes/${v2.id_viaje}/calificacion`,
     { puntuacion: 5 }, tokenCli
   );
-  r.paso('Calificar viaje en EN_RUTA → 400', sc6 === 400, `status ${sc6} — ${dc6.error}`);
+  r.paso('Calificar viaje en EN_RUTA → 400', sc5 === 400, `status ${sc5} — ${dc5.error}`);
 
   // ────────────────────────────────────────────────────────────────────────
-  r.seccion('7. Calificar dos veces el mismo viaje');
+  r.seccion('6. Calificar dos veces el mismo viaje');
   const { status: scal1 } = await api(
     'POST', `/api/viajes/${v1.id_viaje}/calificacion`,
     { puntuacion: 5 }, tokenCli
@@ -123,34 +126,34 @@ async function main() {
   r.paso('2da calificacion → 409', scal2 === 409, `status ${scal2}`);
 
   // ────────────────────────────────────────────────────────────────────────
-  r.seccion('8. Puntaje fuera de 1-5');
+  r.seccion('7. Puntaje fuera de 1-5');
   // necesitamos otro viaje finalizado para calificar
   const v3 = await montarViajeEnRuta(tokenCli, tokenA);
-  const { data: qrs3 } = await api('GET', `/api/viajes/${v3.id_viaje}/qr-paradas`, null, tokenCli);
+  const paradas3 = await paradasDe(v3.id_viaje, tokenCli);
   await api('POST', `/api/viajes/${v3.id_viaje}/confirmar-parada`,
-    { qr_firmado: qrs3[0].qr_firmado, lat: PARADA_A.lat, lng: PARADA_A.lng }, tokenA);
+    { id_parada: paradas3[0].id_parada, lat: PARADA_A.lat, lng: PARADA_A.lng }, tokenA);
   await api('POST', `/api/viajes/${v3.id_viaje}/confirmar-parada`,
-    { qr_firmado: qrs3[1].qr_firmado, lat: PARADA_B.lat, lng: PARADA_B.lng }, tokenA);
+    { id_parada: paradas3[1].id_parada, lat: PARADA_B.lat, lng: PARADA_B.lng }, tokenA);
 
-  const { status: sc8a } = await api(
+  const { status: sc7a } = await api(
     'POST', `/api/viajes/${v3.id_viaje}/calificacion`, { puntuacion: 0 }, tokenCli
   );
-  r.paso('puntuacion 0 → 400', sc8a === 400, `status ${sc8a}`);
-  const { status: sc8b } = await api(
+  r.paso('puntuacion 0 → 400', sc7a === 400, `status ${sc7a}`);
+  const { status: sc7b } = await api(
     'POST', `/api/viajes/${v3.id_viaje}/calificacion`, { puntuacion: 6 }, tokenCli
   );
-  r.paso('puntuacion 6 → 400', sc8b === 400, `status ${sc8b}`);
-  const { status: sc8c } = await api(
+  r.paso('puntuacion 6 → 400', sc7b === 400, `status ${sc7b}`);
+  const { status: sc7c } = await api(
     'POST', `/api/viajes/${v3.id_viaje}/calificacion`, { puntuacion: -1 }, tokenCli
   );
-  r.paso('puntuacion -1 → 400', sc8c === 400, `status ${sc8c}`);
-  const { status: sc8d } = await api(
+  r.paso('puntuacion -1 → 400', sc7c === 400, `status ${sc7c}`);
+  const { status: sc7d } = await api(
     'POST', `/api/viajes/${v3.id_viaje}/calificacion`, { puntuacion: 2.5 }, tokenCli
   );
-  r.paso('puntuacion decimal (2.5) → 400', sc8d === 400, `status ${sc8d}`);
+  r.paso('puntuacion decimal (2.5) → 400', sc7d === 400, `status ${sc7d}`);
 
   // ────────────────────────────────────────────────────────────────────────
-  r.seccion('9. Remito PDF accesible (HEAD 200)');
+  r.seccion('8. Remito PDF accesible (HEAD 200)');
   const { data: rem } = await api('GET', `/api/viajes/${v1.id_viaje}/remito`, null, tokenCli);
   if (rem.remito_url) {
     try {
@@ -165,7 +168,7 @@ async function main() {
   }
 
   // ────────────────────────────────────────────────────────────────────────
-  r.seccion('10. Redis limpiado tras cierre — todas las keys gps:* del viaje 1');
+  r.seccion('9. Redis limpiado tras cierre — todas las keys gps:* del viaje 1');
   const keys = [
     `gps:${v1.id_viaje}:ultima`,
     `gps:${v1.id_viaje}:historial`,

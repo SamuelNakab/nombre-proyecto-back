@@ -149,10 +149,10 @@ async function mandarPings(socketConductor, id_viaje) {
 async function finalizarViaje(id_viaje, tokenConductor, tokenCliente) {
   await api('PATCH', `/api/viajes/${id_viaje}/estado`, { estado: 'CARGANDO' }, tokenConductor);
   await api('PATCH', `/api/viajes/${id_viaje}/estado`, { estado: 'EN_RUTA' }, tokenConductor);
-  const { data: qrs } = await api('GET', `/api/viajes/${id_viaje}/qr-paradas`, null, tokenCliente);
-  const ord = [...qrs].sort((a, b) => a.orden - b.orden);
-  await api('POST', `/api/viajes/${id_viaje}/confirmar-parada`, { qr_firmado: ord[0].qr_firmado, lat: PARADA_1.lat, lng: PARADA_1.lng }, tokenConductor);
-  const { data: fin } = await api('POST', `/api/viajes/${id_viaje}/confirmar-parada`, { qr_firmado: ord[1].qr_firmado, lat: PARADA_2.lat, lng: PARADA_2.lng }, tokenConductor);
+  const { data: det } = await api('GET', `/api/viajes/${id_viaje}`, null, tokenCliente);
+  const ord = [...det.paradas].sort((a, b) => a.orden - b.orden);
+  await api('POST', `/api/viajes/${id_viaje}/confirmar-parada`, { id_parada: ord[0].id_parada, lat: PARADA_1.lat, lng: PARADA_1.lng }, tokenConductor);
+  const { data: fin } = await api('POST', `/api/viajes/${id_viaje}/confirmar-parada`, { id_parada: ord[1].id_parada, lat: PARADA_2.lat, lng: PARADA_2.lng }, tokenConductor);
   return fin;
 }
 

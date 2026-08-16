@@ -166,10 +166,20 @@ export async function asignarViaje(req, res) {
     return res.status(400).json({ error: err.message });
   }
 
-  await prisma.viaje.update({
-    where: { id_viaje },
+  // Atomico, mismo patron que reservar y que el aceptar del conductor: el
+  // WHERE compuesto (id + estado) hace que, de dos asignaciones concurrentes
+  // sobre el mismo viaje reservado, solo una matchee la fila y la pase a
+  // CONDUCTOR_ASIGNADO. Antes era un update plano sobre una lectura ya vieja:
+  // un doble-submit escribia dos veces, el ultimo id_conductor/id_vehiculo
+  // pisaba al primero, y los DOS conductores recibian viaje:asignado — uno de
+  // ellos para un viaje que no tenia.
+  const resultado = await prisma.viaje.updateMany({
+    where: { id_viaje, estado: 'RESERVADO_POR_EMPRESA' },
     data: { estado: 'CONDUCTOR_ASIGNADO', id_conductor, id_vehiculo },
   });
+  if (resultado.count === 0) {
+    return res.status(409).json({ error: 'El viaje ya no esta en RESERVADO_POR_EMPRESA' });
+  }
 
   notificarAsignacion(req.usuario.id_usuario, viaje, val.conductor, val.vehiculo);
 
@@ -217,10 +227,27 @@ export async function reasignarViaje(req, res) {
 
   // No hay cambio de estado (sigue CONDUCTOR_ASIGNADO): es un swap de
   // conductor/vehiculo, por eso no pasa por validarTransicion.
-  await prisma.viaje.update({
-    where: { id_viaje },
+  //
+  // Mismo criterio atomico que asignar: las dos condiciones que se chequearon
+  // sobre la lectura de arriba (estado y "todavia no arranco") viajan al WHERE
+  // del UPDATE. Lo que cierra es la carrera contra POST /:id/iniciar — con el
+  // update plano, entre el findUnique y el update el conductor podia apretar
+  // "Iniciar viaje" y la reasignacion le cambiaba el conductor a un viaje ya en
+  // curso. Ahora esa escritura matchea 0 filas y devuelve 409.
+  //
+  // Dos reasignaciones concurrentes con el MISMO body son idempotentes; con
+  // bodies distintos sigue ganando la ultima (no hay un estado del que salir,
+  // el viaje ya esta en CONDUCTOR_ASIGNADO), pero ambas son asignaciones
+  // legitimas del mismo gerente y la fila queda consistente.
+  const resultado = await prisma.viaje.updateMany({
+    where: { id_viaje, estado: 'CONDUCTOR_ASIGNADO', fecha_inicio: null },
     data: { id_conductor, id_vehiculo },
   });
+  if (resultado.count === 0) {
+    return res
+      .status(409)
+      .json({ error: 'El viaje ya no se puede reasignar (cambio de estado o ya arranco)' });
+  }
 
   notificarAsignacion(req.usuario.id_usuario, viaje, val.conductor, val.vehiculo);
 

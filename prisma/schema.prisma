@@ -289,6 +289,12 @@ model Viaje {
   tarifa_km           Float?
   distancia_provincia Float?
   tiempo_capital      Float?
+  // Duracion total estimada de la ruta (Google Distance Matrix), en HORAS.
+  // Es el mismo tiempo_horas que costo.service usa para estimar el precio: se
+  // persiste al crear el viaje para no tener que volver a pedirlo a Google en
+  // cada lectura del detalle. La API lo expone convertido a MINUTOS enteros
+  // (duracion_estimada) — ver duracion.service.js.
+  duracion_estimada_horas Float?
   fecha_programada    DateTime
   descripcion         String?
   estado              EstadoViaje @default(BUSCANDO_CONDUCTOR)

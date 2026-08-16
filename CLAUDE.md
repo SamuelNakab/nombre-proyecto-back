@@ -104,6 +104,21 @@ Transiciones validas:
 - El gerente asigna cualquier conductor ACTIVO de su empresa + cualquier
   vehiculo de la flota que cumpla las condiciones → CONDUCTOR_ASIGNADO.
 - Puede reasignar conductor/vehiculo mientras el viaje no arranco.
+- GUARD ATOMICO: los TRES endpoints que escriben el viaje (reservar, asignar,
+  reasignar) usan updateMany con el estado esperado en el WHERE, nunca un
+  update plano sobre la lectura previa. count === 0 → 409.
+  * reservar:  where { id_viaje, estado: 'BUSCANDO_CONDUCTOR' }
+  * asignar:   where { id_viaje, estado: 'RESERVADO_POR_EMPRESA' }
+  * reasignar: where { id_viaje, estado: 'CONDUCTOR_ASIGNADO', fecha_inicio: null }
+  asignar era un update plano: dos POST /asignar concurrentes sobre el mismo
+  viaje reservado devolvian los DOS 200, el ultimo par (conductor, vehiculo)
+  pisaba al primero y los DOS conductores recibian viaje:asignado — uno para un
+  viaje que no era suyo. En reasignar lo que cierra el WHERE es la carrera
+  contra POST /:id/iniciar (reasignar un viaje que acaba de arrancar); dos
+  reasignaciones concurrentes del mismo gerente siguen siendo last-write-wins,
+  que es correcto porque las dos son legitimas.
+  Cubierto por scripts/test-concurrencia-jerarquia.js (CASO C), verificado
+  revirtiendo el guard: sin el, CASO C se pone en rojo con ganadores=2.
 - Si tarda mas de RESERVA_TIMEOUT_MINUTOS sin asignar → se cancela la
   reserva automaticamente y vuelve a BUSCANDO_CONDUCTOR. Tambien puede
   soltarlo el gerente a mano (cancelar-reserva).
@@ -179,6 +194,32 @@ Ninguna de las tres rutas tiene requireRol: la validacion real es el helper.
 ### Tracking del gerente
 - Al gerente se lo suma al room viaje:{id} de los viajes de su empresa,
   para que reciba mapa:actualizar / eta:actualizar como el cliente.
+
+## Duraciones y unidades — src/services/duracion.service.js
+
+Regla sin excepciones, para no mezclar unidades en una misma respuesta:
+- En la BASE y en el calculo de precio, el tiempo va en HORAS (float):
+  Viaje.duracion_estimada_horas, desglose.tiempo_horas, tiempo_capital.
+- En la API, toda duracion se expone en MINUTOS (entero redondeado):
+  duracion_estimada y duracion_real.
+- Nomenclatura: `duracion_*` sin sufijo = minutos enteros. `tiempo_*` y
+  `*_horas` = horas float.
+
+- duracion_estimada_horas: columna NUEVA en Viaje (Float?, aditiva y nullable,
+  db push seguro). Se llena en crearViaje con resultado.desglose.tiempo_horas —
+  el MISMO tiempo que se acaba de usar para estimar el precio, asi que
+  duracion_estimada y precio_estimado no se pueden desincronizar. Antes ese
+  valor se calculaba y se descartaba: salia una sola vez en la respuesta de
+  creacion y no habia forma de recuperarlo (en PROVINCIA tarifa_hora es null y
+  en MIXTO el precio mezcla los dos ejes, asi que NO es derivable del precio).
+- duracion_real: NO hay columna, se calcula en el read con
+  calcularDuracionRealMinutos(viaje) = max(paradas.fecha_entrega) − fecha_inicio.
+  Se usa max() y NO la parada de mayor `orden`: las paradas se confirman por QR
+  y nada garantiza que se confirmen en orden. null si el viaje no esta
+  FINALIZADO o no tiene fecha_inicio.
+- Lo consumen: GET /api/viajes/mis-viajes (duracion_real) y GET /api/viajes/:id
+  (duracion_estimada). El detalle ademas incluye el vehiculo asignado (null
+  mientras no hay conductor).
 
 ## Deteccion de zona (CABA / PROVINCIA / MIXTO)
 
@@ -276,3 +317,13 @@ node scripts/test-visibilidad-gerente.js   (nuevo, visibilidad del gerente)
 node scripts/test-zona.js                  (nuevo, deteccion de zona)
 node scripts/test-acceso-gerente.js        (nuevo, acceso del gerente a
                                             detalle / costo-acumulado / remito)
+node scripts/test-campos-duracion.js       (nuevo, duracion_real /
+                                            duracion_estimada / vehiculo en el
+                                            detalle / tiempo_capital y
+                                            distancia_provincia en las 3 zonas)
+node scripts/test-concurrencia-jerarquia.js (reserva y asignacion atomicas;
+                                            CASO C = doble asignacion)
+
+El CASO 8 de test-jerarquia necesita el server corriendo con
+RESERVA_CHECK_INTERVAL_MS=3000 (el default de 60s no llega a disparar el job
+dentro de la ventana del test).

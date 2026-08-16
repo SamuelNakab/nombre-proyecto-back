@@ -444,7 +444,6 @@ Las tarifas se calculan automáticamente según la zona y si la `fecha_programad
       "direccion": "Plaza de Mayo, CABA",
       "latitud": -34.6037,
       "longitud": -58.3816,
-      "qr_token": "cuid_generado_automaticamente",
       "estado": "PENDIENTE",
       "fecha_entrega": null
     }
@@ -588,7 +587,8 @@ Devuelve todos los viajes del cliente autenticado, del más reciente al más ant
 - `duracion_real`: cuánto duró el viaje **en minutos (entero redondeado)**. Se calcula en el
   momento de la lectura como `última fecha_entrega de las paradas − fecha_inicio`; **no** es una
   columna de la base. Se toma el **máximo** de las `fecha_entrega`, no la parada de mayor `orden`:
-  las paradas se confirman escaneando un QR y nada garantiza que se confirmen en orden.
+  el conductor confirma cada parada por proximidad y **no se valida el orden**, así que la
+  parada de mayor `orden` puede no ser la última en el tiempo.
 - Es **`null`** si el viaje no está `FINALIZADO`, o si nunca se inició (`fecha_inicio` en `null`).
   Una duración "real" a mitad de viaje no sería real, así que no se devuelve parcial.
 - Va en **minutos**, igual que `duracion_estimada` del detalle. No confundir con
@@ -1926,56 +1926,18 @@ Authorization: Bearer <firebase-id-token>
 ## Fase 5 — Confirmación, cierre y remito
 
 
-### GET /api/viajes/:id/qr-paradas
-
-
-Devuelve los tokens QR firmados de cada parada del viaje. El cliente los muestra
-como código QR en pantalla para que el conductor los escanee al llegar.
-
-
-**Rol requerido:** `CLIENTE` (debe ser el dueño del viaje)
-
-
-**Respuesta exitosa — 200:**
-```json
-[
-  {
-    "id_parada": 1,
-    "orden": 1,
-    "direccion": "Plaza de Mayo, CABA",
-    "qr_firmado": "eyJpZF9wYXJhZGEiOjEsImlkX3ZpYWplIjo0Miwib3JkZW4iOjF9.a3f9c8..."
-  },
-  {
-    "id_parada": 2,
-    "orden": 2,
-    "direccion": "Recoleta, CABA",
-    "qr_firmado": "eyJpZF9wYXJhZGEiOjIsImlkX3ZpYWplIjo0Miwib3JkZW4iOjJ9.d72b1e..."
-  }
-]
-```
-
-
-El campo `qr_firmado` es un string `base64url_payload.hmac_hex`. Es lo que
-se debe codificar como imagen QR y mostrar al cliente para que el conductor lo escanee.
-
-
-**Errores posibles:**
-| Status | Body | Causa |
-|--------|------|-------|
-| 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
-| 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CLIENTE |
-| 403 | `{ "error": "Sin acceso a este viaje" }` | El cliente no es el dueño del viaje |
-| 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
-
-
----
-
-
 ### POST /api/viajes/:id/confirmar-parada
 
 
-El conductor escanea el QR al llegar a una parada y confirma la entrega.
+El conductor llega a una parada, toca "confirmar" en su app y el backend valida
+que su posición GPS esté **dentro de `RADIO_CONFIRMACION_METROS` de esa parada**.
 Si era la última parada pendiente, cierra el viaje automáticamente.
+
+> **Cambio de contrato (reemplazo del QR).** Antes el conductor escaneaba un QR
+> firmado que el cliente mostraba en pantalla. Ese flujo ya no existe: se eliminó
+> `GET /api/viajes/:id/qr-paradas` y el campo `qr_firmado` del body. El
+> `id_parada` ahora se toma de las paradas que ya devuelve
+> [`GET /api/viajes/:id`](#get-apiviajesid).
 
 
 **Rol requerido:** `CONDUCTOR` (debe ser el conductor asignado al viaje)
@@ -1984,24 +1946,36 @@ Si era la última parada pendiente, cierra el viaje automáticamente.
 **Body:**
 ```json
 {
-  "qr_firmado": "eyJpZF9wYXJhZGEiOjEsImlkX3ZpYWplIjo0Miwib3JkZW4iOjF9.a3f9c8...",
+  "id_parada": 1,
   "lat": -34.6037,
   "lng": -58.3816
 }
 ```
 
 
-- `qr_firmado`: el string escaneado del QR (generado por `GET /api/viajes/:id/qr-paradas`)
-- `lat`, `lng`: coordenada GPS actual del conductor al momento del escaneo
+- `id_parada`: entero positivo. Sale de `paradas[].id_parada` del detalle del viaje.
+- `lat`, `lng`: coordenada GPS actual del conductor al momento de confirmar.
 
 
-**Validaciones en orden:**
-1. Firma HMAC válida
-2. `id_viaje` del QR coincide con el `:id` de la URL
-3. El conductor es el asignado al viaje
-4. El viaje está en estado `EN_RUTA` o `DESCARGANDO`
-5. La parada no está ya en estado `ENTREGADO`
-6. El conductor está a menos de 200 metros de la parada (Turf.js)
+**Validaciones en orden.** El orden importa: define qué error ve el conductor
+cuando falla más de una condición a la vez.
+
+| # | Condición | Si falla |
+|---|-----------|----------|
+| 1 | El viaje existe | `404 Viaje no encontrado` |
+| 2 | El conductor autenticado es el asignado al viaje | `403 No sos el conductor de este viaje` |
+| 3 | La parada pertenece a ese viaje | `400 La parada no pertenece a este viaje` |
+| 4 | La parada no está confirmada todavía (`fecha_entrega` en `null`) | `400 La parada ya fue confirmada` |
+| 5 | El viaje está en `EN_RUTA` o `DESCARGANDO` | `400 El viaje debe estar en estado EN_RUTA o DESCARGANDO` |
+| 6 | `distancia((lat,lng), parada) <= RADIO_CONFIRMACION_METROS` | `400 Estas a Xm de la parada. Debes estar a menos de Ym` |
+
+La distancia se mide con `turf.distance` en metros, la misma función que usan el
+tracking GPS y el detector de desvíos.
+
+**El orden de confirmación entre paradas NO se valida:** se puede confirmar la
+parada de `orden` 2 antes que la de `orden` 1. Es el comportamiento que ya existía
+con el QR. Por eso `duracion_real` toma el **máximo** de las `fecha_entrega` y no
+la parada de mayor `orden` — ver [`GET /api/viajes/mis-viajes`](#get-apiviajesmis-viajes).
 
 
 **Respuesta exitosa — 200 (parada confirmada, quedan pendientes):**
@@ -2031,20 +2005,40 @@ Si era la última parada pendiente, cierra el viaje automáticamente.
 - Se emite el evento WebSocket `viaje:finalizado` al room del viaje
 - Se eliminan todas las keys GPS de Redis
 
+Si quedan paradas pendientes no se cierra nada: solo se recalcula el ETA hacia la
+próxima parada (evento `eta:actualizar`).
+
 
 **Errores posibles:**
 | Status | Body | Causa |
 |--------|------|-------|
-| 400 | `{ "error": "QR invalido o firma incorrecta" }` | HMAC inválido o token malformado |
-| 400 | `{ "error": "El QR no corresponde a este viaje" }` | El QR es de otro viaje |
+| 400 | `{ "error": "La parada no pertenece a este viaje" }` | El `id_parada` es de otro viaje (o no existe) |
+| 400 | `{ "error": "La parada ya fue confirmada" }` | La parada ya tiene `fecha_entrega` |
 | 400 | `{ "error": "El viaje debe estar en estado EN_RUTA o DESCARGANDO" }` | Estado incorrecto |
-| 400 | `{ "error": "La parada ya fue confirmada" }` | La parada ya tiene estado ENTREGADO |
-| 400 | `{ "error": "Estas a Xm de la parada. Debes estar a menos de 200m" }` | Demasiado lejos de la parada |
+| 400 | `{ "error": "Estas a Xm de la parada. Debes estar a menos de 50m" }` | Demasiado lejos de la parada |
+| 400 | `{ "error": "<mensaje de Zod>" }` | Body inválido (falta `id_parada`, `lat`/`lng` no numéricos, etc.) |
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
 | 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
 | 403 | `{ "error": "No sos el conductor de este viaje" }` | Conductor diferente al asignado |
 | 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
-| 404 | `{ "error": "Parada no encontrada" }` | La parada del QR no existe en este viaje |
+
+`id_parada` de otro viaje devuelve **400, no 404**: el recurso de la URL (el viaje)
+sí existe, y la parada puede existir perfectamente — lo que está mal es la
+combinación. La respuesta es la misma exista o no la parada, para no filtrar qué
+ids de parada existen en viajes ajenos.
+
+
+<a id="radio-de-confirmacion"></a>
+#### Radio de confirmación
+
+`RADIO_CONFIRMACION_METROS` — variable de entorno, **default 50** en código si no
+está seteada. Antes de reemplazar el QR el radio estaba fijo en 200 m; se bajó
+porque con el QR la proximidad era un control secundario (el token firmado ya
+probaba la presencia) y ahora es **el único** control.
+
+Es configurable sin redeploy porque 50 m es agresivo para GPS urbano entre
+edificios altos: si en producción aparecen rechazos de conductores que sí están
+en la parada, se sube la variable.
 
 
 ---
@@ -2622,7 +2616,7 @@ Un GERENTE se registra con `POST /api/auth/registro-gerente` (crea gerente + su 
 | EN_CAMINO_A_ORIGEN | CARGANDO | Manual, PATCH /estado |
 | CARGANDO | EN_RUTA | Manual, PATCH /estado |
 | EN_RUTA | DESCARGANDO | Manual, PATCH /estado |
-| DESCARGANDO | FINALIZADO | QR última parada |
+| DESCARGANDO | FINALIZADO | Confirmación de la última parada pendiente |
 | cualquiera (no terminal) | CANCELADO | Admin |
 
 ---
@@ -2699,7 +2693,6 @@ todos los campos que devuelve, sin recortar:
         "direccion": "Plaza de Mayo, CABA",
         "latitud": -34.6037,
         "longitud": -58.3816,
-        "qr_token": "cmss5kj6j0036x97wzt5tgoby",
         "estado": "PENDIENTE",
         "fecha_entrega": null
       }
@@ -2898,6 +2891,12 @@ Body: `{ "codigo_afiliacion": "string" }`. → `201` con la afiliación. `404` c
 - El campo `vehiculo` en `viaje:conductor_asignado` siempre es un objeto no nulo — si el conductor no tiene vehículo elegible el servidor emite `error` antes de asignar el viaje (detalle en [el evento](#evento-viajeconductor_asignado)). En cambio el `vehiculo` de `GET /api/viajes/:id` **sí** puede ser `null`: ahí el viaje puede todavía no tener conductor.
 - **Unidades de tiempo:** todo campo `duracion_*` sin sufijo va en **minutos enteros** (`duracion_real`, `duracion_estimada`); todo campo `tiempo_*` y todo `*_horas` van en **horas float** (`tiempo_horas`, `tiempo_capital`, `duracion_estimada_horas`). Ver [Unidades de duración](#unidades-de-duracion).
 - Estados del viaje: `BUSCANDO_CONDUCTOR`, `RESERVADO_POR_EMPRESA`, `CONDUCTOR_ASIGNADO`, `EN_CAMINO_A_ORIGEN`, `CARGANDO`, `EN_RUTA`, `DESCARGANDO`, `FINALIZADO`, `CANCELADO` (ver [Máquina de estados](#maquina-de-estados))
+- **`qr_token` en las paradas: campo muerto, ignorarlo.** Las respuestas que serializan la fila
+  cruda de la parada todavía lo incluyen, pero desde que la confirmación pasó a ser por
+  proximidad no lo usa nadie (no se firma, no se valida, no se muestra). Sigue en la tabla
+  porque la base de Neon está compartida con producción y dropear una columna ahí es
+  destructivo; se elimina cuando se separen las bases por environment. Ver
+  [POST /api/viajes/:id/confirmar-parada](#post-apiviajesidconfirmar-parada).
 
 <a id="formato-de-ruta"></a>
 ### Formato de ruta

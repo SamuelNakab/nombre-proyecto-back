@@ -376,13 +376,13 @@ async function main() {
   const { data: enRuta12 } = await api('PATCH', `/api/viajes/${v12}/estado`, { estado: 'EN_RUTA' }, conductorAToken);
   paso('CASO 12c: CARGANDO → EN_RUTA', enRuta12.estado_nuevo === 'EN_RUTA', `estado=${enRuta12.estado_nuevo}`);
 
-  const { data: qrs12 } = await api('GET', `/api/viajes/${v12}/qr-paradas`, null, clienteToken);
-  const ordenadas = qrs12.sort((a, b) => a.orden - b.orden);
+  const { data: det12 } = await api('GET', `/api/viajes/${v12}`, null, clienteToken);
+  const ordenadas = [...det12.paradas].sort((a, b) => a.orden - b.orden);
   await api('POST', `/api/viajes/${v12}/confirmar-parada`,
-    { qr_firmado: ordenadas[0].qr_firmado, lat: PARADA_1.lat, lng: PARADA_1.lng }, conductorAToken);
+    { id_parada: ordenadas[0].id_parada, lat: PARADA_1.lat, lng: PARADA_1.lng }, conductorAToken);
   const { data: conf12 } = await api('POST', `/api/viajes/${v12}/confirmar-parada`,
-    { qr_firmado: ordenadas[1].qr_firmado, lat: PARADA_2.lat, lng: PARADA_2.lng }, conductorAToken);
-  paso('CASO 12d: confirmar ambas paradas por QR → viaje_finalizado con precio_real y remito',
+    { id_parada: ordenadas[1].id_parada, lat: PARADA_2.lat, lng: PARADA_2.lng }, conductorAToken);
+  paso('CASO 12d: confirmar ambas paradas por proximidad → viaje_finalizado con precio_real y remito',
     conf12.viaje_finalizado === true && typeof conf12.precio_real === 'number' && conf12.precio_real >= 0 &&
     typeof conf12.remito_url === 'string' && conf12.remito_url.startsWith('http'),
     `finalizado=${conf12.viaje_finalizado} precio_real=${conf12.precio_real} remito=${conf12.remito_url ? 'si' : 'no'}`);

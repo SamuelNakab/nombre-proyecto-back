@@ -38,7 +38,8 @@ const CLIENTE_PASSWORD = process.env.CLIENTE_PASSWORD;
 const CONDUCTOR_EMAIL = process.env.CONDUCTOR_EMAIL;
 const CONDUCTOR_PASSWORD = process.env.CONDUCTOR_PASSWORD;
 
-// Dos paradas reales en CABA (a <200m entre si → utiles para confirmar QR).
+// Dos paradas reales en CABA. Al confirmar, el default de lat/lng es la
+// coordenada de la parada elegida (distancia 0 → siempre dentro del radio).
 const PARADA_1 = { lat: -34.6037, lng: -58.3816, direccion: 'Plaza de Mayo, CABA' };
 const PARADA_2 = { lat: -34.5895, lng: -58.3974, direccion: 'Recoleta, CABA' };
 
@@ -222,36 +223,33 @@ async function accionCambiarEstado() {
 async function accionConfirmarParada() {
   if (!requiereViaje()) return;
 
-  // 1) tokens QR (rol CLIENTE)
-  const qr = await api('GET', `/api/viajes/${estado.idViaje}/qr-paradas`, null, estado.clienteToken);
-  if (qr.status !== 200 || !Array.isArray(qr.data)) {
-    console.log(`  ❌ GET /:id/qr-paradas → ${qr.status}: ${JSON.stringify(qr.data)}`);
+  // Las paradas (id_parada + coords + estado) salen del detalle del viaje.
+  const det = await api('GET', `/api/viajes/${estado.idViaje}`, null, estado.conductorToken);
+  if (det.status !== 200 || !Array.isArray(det.data?.paradas)) {
+    console.log(`  ❌ GET /:id → ${det.status}: ${JSON.stringify(det.data)}`);
     return;
   }
-  const qrs = qr.data.sort((a, b) => a.orden - b.orden);
-
-  // 2) coords de las paradas (del detalle del viaje) para default de lat/lng
-  const det = await api('GET', `/api/viajes/${estado.idViaje}`, null, estado.clienteToken);
-  const paradasDet = Array.isArray(det.data?.paradas) ? det.data.paradas : [];
+  const paradas = [...det.data.paradas].sort((a, b) => a.orden - b.orden);
 
   console.log('  Paradas:');
-  for (const q of qrs) {
-    const p = paradasDet.find((x) => x.orden === q.orden);
-    console.log(`    ${q.orden}) ${q.direccion} — estado=${p?.estado ?? '?'}`);
+  for (const p of paradas) {
+    console.log(`    ${p.orden}) ${p.direccion} — id_parada=${p.id_parada} estado=${p.estado}`);
   }
-  const opt = await preguntarNumero('Confirmar cual parada (orden)', qrs[0].orden);
-  const elegida = qrs.find((q) => q.orden === opt);
+  const opt = await preguntarNumero('Confirmar cual parada (orden)', paradas[0].orden);
+  const elegida = paradas.find((p) => p.orden === opt);
   if (!elegida) {
     console.log('  ⚠  Orden invalido.');
     return;
   }
-  const pDet = paradasDet.find((x) => x.orden === opt);
-  const lat = await preguntarNumero('lat', pDet?.latitud ?? PARADA_1.lat);
-  const lng = await preguntarNumero('lng', pDet?.longitud ?? PARADA_1.lng);
+
+  // Default = la coordenada exacta de la parada, para que confirme sin pelear
+  // con el radio. Cambiala a mano si queres probar el rechazo por distancia.
+  const lat = await preguntarNumero('lat', elegida.latitud);
+  const lng = await preguntarNumero('lng', elegida.longitud);
 
   const { status, data } = await api(
     'POST', `/api/viajes/${estado.idViaje}/confirmar-parada`,
-    { qr_firmado: elegida.qr_firmado, lat, lng }, estado.conductorToken
+    { id_parada: elegida.id_parada, lat, lng }, estado.conductorToken
   );
   console.log(`  ${status === 200 ? '✅' : '❌'} POST /:id/confirmar-parada → ${status}: ${JSON.stringify(data)}`);
 }
@@ -292,7 +290,7 @@ function imprimirMenu() {
 ║  3) Iniciar             (conductor, REST)      ║
 ║  4) Ping GPS            (conductor, socket)    ║
 ║  5) Cambiar estado      (conductor, REST)      ║
-║  6) Confirmar parada QR (cliente+conductor)    ║
+║  6) Confirmar parada     (conductor, REST)     ║
 ║  7) Cancelar conductor  (conductor, REST)      ║
 ║  8) Cancelar cliente    (cliente, REST)        ║
 ║  9) Ver estado del viaje(REST)                 ║

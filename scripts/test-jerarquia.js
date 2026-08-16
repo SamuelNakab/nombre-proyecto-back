@@ -433,12 +433,12 @@ async function main() {
   await api('PATCH', `/api/viajes/${v18}/estado`, { estado: 'CARGANDO' }, condAToken);
   const { status: er18 } = await api('PATCH', `/api/viajes/${v18}/estado`, { estado: 'EN_RUTA' }, condAToken);
 
-  const { data: qrs18 } = await api('GET', `/api/viajes/${v18}/qr-paradas`, null, clienteToken);
-  const ord = qrs18.sort((a, b) => a.orden - b.orden);
-  await api('POST', `/api/viajes/${v18}/confirmar-parada`, { qr_firmado: ord[0].qr_firmado, lat: PARADA_1.lat, lng: PARADA_1.lng }, condAToken);
-  const { data: conf18 } = await api('POST', `/api/viajes/${v18}/confirmar-parada`, { qr_firmado: ord[1].qr_firmado, lat: PARADA_2.lat, lng: PARADA_2.lng }, condAToken);
+  const { data: det18 } = await api('GET', `/api/viajes/${v18}`, null, clienteToken);
+  const ord = [...det18.paradas].sort((a, b) => a.orden - b.orden);
+  await api('POST', `/api/viajes/${v18}/confirmar-parada`, { id_parada: ord[0].id_parada, lat: PARADA_1.lat, lng: PARADA_1.lng }, condAToken);
+  const { data: conf18 } = await api('POST', `/api/viajes/${v18}/confirmar-parada`, { id_parada: ord[1].id_parada, lat: PARADA_2.lat, lng: PARADA_2.lng }, condAToken);
   const v18Db = await estadoDe(v18);
-  paso('CASO 18b: pings + CARGANDO→EN_RUTA + QR ambas paradas → FINALIZADO con remito', er18 === 200 && conf18.viaje_finalizado === true && typeof conf18.remito_url === 'string' && conf18.remito_url.startsWith('http') && v18Db.estado === 'FINALIZADO' && typeof v18Db.precio_real === 'number', `enruta=${er18} finalizado=${conf18.viaje_finalizado} estado=${v18Db.estado} remito=${conf18.remito_url ? 'si' : 'no'}`);
+  paso('CASO 18b: pings + CARGANDO→EN_RUTA + confirmar ambas paradas → FINALIZADO con remito', er18 === 200 && conf18.viaje_finalizado === true && typeof conf18.remito_url === 'string' && conf18.remito_url.startsWith('http') && v18Db.estado === 'FINALIZADO' && typeof v18Db.precio_real === 'number', `enruta=${er18} finalizado=${conf18.viaje_finalizado} estado=${v18Db.estado} remito=${conf18.remito_url ? 'si' : 'no'}`);
 
   // ── RESUMEN ────────────────────────────────────────────────────────────────
   await cleanup([sCliente, sGerente, sA, sB]);

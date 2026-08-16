@@ -107,11 +107,11 @@ async function fijarAcumulado(id_viaje, lat, lng) {
   );
 }
 
-// Confirma las paradas por QR. Antes de la ULTIMA fija el acumulado, asi el
-// cierre lee un tiempo/distancia conocido.
-async function cerrarPorQR(id_viaje, clienteToken, conductorToken, paradas) {
-  const { data: qrs } = await api('GET', `/api/viajes/${id_viaje}/qr-paradas`, null, clienteToken);
-  const ordenadas = [...qrs].sort((a, b) => a.orden - b.orden);
+// Confirma las paradas por proximidad. Antes de la ULTIMA fija el acumulado,
+// asi el cierre lee un tiempo/distancia conocido.
+async function cerrarConfirmandoParadas(id_viaje, clienteToken, conductorToken, paradas) {
+  const { data: det } = await api('GET', `/api/viajes/${id_viaje}`, null, clienteToken);
+  const ordenadas = [...det.paradas].sort((a, b) => a.orden - b.orden);
 
   for (let i = 0; i < ordenadas.length; i++) {
     const esUltima = i === ordenadas.length - 1;
@@ -120,7 +120,7 @@ async function cerrarPorQR(id_viaje, clienteToken, conductorToken, paradas) {
     const { status, data } = await api(
       'POST',
       `/api/viajes/${id_viaje}/confirmar-parada`,
-      { qr_firmado: ordenadas[i].qr_firmado, lat: paradas[i].lat, lng: paradas[i].lng },
+      { id_parada: ordenadas[i].id_parada, lat: paradas[i].lat, lng: paradas[i].lng },
       conductorToken
     );
     if (esUltima) return { status, data };
@@ -209,7 +209,7 @@ async function main() {
   console.log('\n── CASO 4: cierre MIXTO → reparto proporcional ────────────────\n');
   const v4 = await crearViaje(clienteToken, [OBELISCO, LA_PLATA], 'CABA');
   await prepararParaCierre(v4.id_viaje, id_conductor);
-  const cierre4 = await cerrarPorQR(v4.id_viaje, clienteToken, conductorToken, [OBELISCO, LA_PLATA]);
+  const cierre4 = await cerrarConfirmandoParadas(v4.id_viaje, clienteToken, conductorToken, [OBELISCO, LA_PLATA]);
   const viaje4 = await prisma.viaje.findUnique({
     where: { id_viaje: v4.id_viaje },
     select: { zona: true, estado: true, tiempo_capital: true, distancia_provincia: true, precio_real: true, tarifa_hora: true, tarifa_km: true },
@@ -242,7 +242,7 @@ async function main() {
 
   const v6a = await crearViaje(clienteToken, [OBELISCO, RECOLETA], 'CABA');
   await prepararParaCierre(v6a.id_viaje, id_conductor);
-  await cerrarPorQR(v6a.id_viaje, clienteToken, conductorToken, [OBELISCO, RECOLETA]);
+  await cerrarConfirmandoParadas(v6a.id_viaje, clienteToken, conductorToken, [OBELISCO, RECOLETA]);
   const viaje6a = await prisma.viaje.findUnique({
     where: { id_viaje: v6a.id_viaje },
     select: { zona: true, tiempo_capital: true, distancia_provincia: true, precio_real: true, tarifa_hora: true },
@@ -261,7 +261,7 @@ async function main() {
 
   const v6b = await crearViaje(clienteToken, [LA_PLATA, LA_PLATA_2], 'PROVINCIA');
   await prepararParaCierre(v6b.id_viaje, id_conductor);
-  await cerrarPorQR(v6b.id_viaje, clienteToken, conductorToken, [LA_PLATA, LA_PLATA_2]);
+  await cerrarConfirmandoParadas(v6b.id_viaje, clienteToken, conductorToken, [LA_PLATA, LA_PLATA_2]);
   const viaje6b = await prisma.viaje.findUnique({
     where: { id_viaje: v6b.id_viaje },
     select: { zona: true, tiempo_capital: true, distancia_provincia: true, precio_real: true, tarifa_km: true },

@@ -13,7 +13,6 @@ import {
   cancelarViajeConductor,
   cancelarViajeCliente,
   obtenerCostoAcumulado,
-  obtenerQRParadas,
   confirmarParada,
   calificarViaje,
   obtenerRemito,
@@ -44,7 +43,6 @@ router.post('/:id/asignar', verificarToken, requireRol('GERENTE'), asignarViaje)
 router.post('/:id/reasignar', verificarToken, requireRol('GERENTE'), reasignarViaje);
 router.post('/:id/cancelar-reserva', verificarToken, requireRol('GERENTE'), cancelarReserva);
 router.get('/:id/costo-acumulado', verificarToken, obtenerCostoAcumulado);
-router.get('/:id/qr-paradas', verificarToken, requireRol('CLIENTE'), obtenerQRParadas);
 router.post('/:id/confirmar-parada', verificarToken, requireRol('CONDUCTOR'), confirmarParada);
 router.post('/:id/calificacion', verificarToken, requireRol('CLIENTE'), calificarViaje);
 router.get('/:id/remito', verificarToken, obtenerRemito);

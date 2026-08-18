@@ -343,6 +343,8 @@ Si `GOOGLE_MAPS_API_KEY` no está configurada usa valores mock (10 km, 0.5 h).
   paradas — ver [Cómo se determina la zona](#cómo-se-determina-la-zona).
 - `paradas`: mínimo 2 elementos
 - `fecha_programada`: opcional. Si se omite se usa la fecha/hora actual para determinar si es hora pico.
+  **No** tiene mínimo de anticipación: a diferencia de [`POST /api/viajes`](#post-apiviajes), acá
+  no aplica `ANTICIPACION_MINIMA_MINUTOS` y se acepta cualquier fecha, incluso pasada.
 
 **Respuesta exitosa — 200:**
 ```json
@@ -406,10 +408,22 @@ instantáneamente a los conductores elegibles conectados via WebSocket.
   la que calcula el servidor de las coordenadas de las paradas, nunca la del body. En el ejemplo
   de arriba el `"MIXTO"` del body es irrelevante: se guarda `MIXTO` porque una parada cae en CABA
   y la otra en La Plata. Ver [Cómo se determina la zona](#cómo-se-determina-la-zona).
-- `fecha_programada`: fecha ISO 8601 y **estrictamente mayor** a 1 hora (60 minutos) desde el
-  momento del request. Solo se valida ese **mínimo**: no hay tope máximo de anticipación. Si el
-  valor no es una fecha válida o no supera ese mínimo → `400` con
-  `{ "error": "fecha_programada debe ser una fecha ISO futura (al menos 1 hora desde ahora)" }`
+- `fecha_programada`: fecha ISO 8601 y **estrictamente mayor** a
+  `ahora + ANTICIPACION_MINIMA_MINUTOS`. Solo se valida ese **mínimo**: no hay tope máximo de
+  anticipación. Si el valor no es una fecha válida o no supera ese mínimo → `400` con
+  `{ "error": "fecha_programada debe ser una fecha ISO futura (al menos 60 minutos desde ahora)" }`
+  (el mensaje lleva el valor **realmente configurado**, no un 60 fijo: con la variable en 5 dice
+  `al menos 5 minutos`).
+
+  `ANTICIPACION_MINIMA_MINUTOS` es una variable de entorno, **default 60** en código si no está
+  en `.env`. En staging/local se baja (o se pone en `0`) para poder crear un viaje y debuggearlo
+  al toque, sin esperar una hora. **El piso de "futura" no depende de la variable:** con `0` el
+  mínimo pasa a ser *ahora*, y una `fecha_programada` en el pasado (o igual al instante del
+  request) sigue devolviendo `400`.
+
+  [`POST /api/viajes/estimar-costo`](#post-apiviajesestimar-costo) **no** tiene este mínimo:
+  su `fecha_programada` es opcional y solo sirve para determinar si cae en hora pico, así que
+  acepta cualquier fecha, incluso pasada.
 - `condiciones_requeridas`: opcional. Valores posibles: `FRAGIL`, `REFRIGERADO`,
   `CARGA_PESADA`, `PELIGROSO`, `VOLUMINOSO`
 - `descripcion`: opcional. Texto libre visible para el conductor antes de aceptar y en el
@@ -494,7 +508,7 @@ Las tarifas se calculan automáticamente según la zona y si la `fecha_programad
 | Status | Body | Causa |
 |--------|------|-------|
 | 400 | `{ "error": "mensaje de validación" }` | Campo faltante o inválido |
-| 400 | `{ "error": "fecha_programada debe ser una fecha ISO futura (al menos 1 hora desde ahora)" }` | `fecha_programada` ausente, no es ISO válida, o no supera el mínimo de 1 hora desde el request |
+| 400 | `{ "error": "fecha_programada debe ser una fecha ISO futura (al menos 60 minutos desde ahora)" }` | `fecha_programada` no es ISO válida, o no supera el mínimo de `ANTICIPACION_MINIMA_MINUTOS` (default 60) desde el request. El número del mensaje es el valor configurado. Si el campo viene **ausente** el error es el genérico de tipo (`Invalid input: expected string, received undefined`) |
 | 400 | `{ "error": "El usuario no tiene perfil de cliente" }` | El usuario no tiene registro de cliente |
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
 | 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CLIENTE |

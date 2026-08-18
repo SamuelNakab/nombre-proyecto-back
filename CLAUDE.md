@@ -361,6 +361,24 @@ RESERVA_TIMEOUT_MINUTOS=10        (default en codigo si no esta en .env)
 RESERVA_CHECK_INTERVAL_MS=60000   (cada cuanto corre el job de timeout)
 RADIO_CONFIRMACION_METROS=50      (default en codigo si no esta en .env;
                                    antes el radio estaba fijo en 200)
+ANTICIPACION_MINIMA_MINUTOS=60    (default en codigo si no esta en .env;
+                                   antes estaba hardcodeado en 1 hora dentro
+                                   del .refine de fecha_programada)
+
+ANTICIPACION_MINIMA_MINUTOS es el minimo de anticipacion de fecha_programada en
+POST /api/viajes. Se baja en staging/local (o se pone en 0) para crear un viaje
+y debuggearlo sin esperar una hora. Detalles:
+- El piso "la fecha tiene que ser FUTURA" NO depende de la variable: con 0 el
+  minimo queda en `ahora` y la comparacion estricta rechaza igual el pasado.
+  Por eso anticipacionMinimaMinutos() nunca devuelve un negativo (un negativo
+  correria el minimo hacia atras y dejaria pasar fechas pasadas); un valor
+  basura o negativo cae al default 60.
+- El mensaje de error lleva el valor configurado, no un 60 fijo:
+  "fecha_programada debe ser una fecha ISO futura (al menos X minutos desde
+  ahora)". Es contrato: esta documentado igual en API.md.
+- La variable se lee en CADA request, no se cachea en el modulo.
+- NO aplica a POST /api/viajes/estimar-costo: ahi fecha_programada es opcional,
+  solo define si es hora pico, y acepta cualquier fecha (incluso pasada).
 
 QR_SECRET se SACO de .env.example. Puede seguir en el .env local de cada
 uno, pero ya no lo lee nadie: se elimino junto con firmarQR/verificarQR.
@@ -399,6 +417,11 @@ node scripts/test-concurrencia-jerarquia.js (reserva y asignacion atomicas;
 node scripts/test-confirmar-parada.js      (confirmacion por proximidad: radio,
                                             parada ajena, conductor ajeno,
                                             cierre del viaje, qr-paradas 404)
+node scripts/test-anticipacion.js          (ANTICIPACION_MINIMA_MINUTOS: valores
+                                            60 / 5 / 0, el piso de fecha futura
+                                            y el mensaje de error. NO usa el
+                                            server de :3000 — levanta uno propio
+                                            por valor, en puertos 3101-3103)
 node scripts/stress/test-cierre-exhaustivo.js (cierre + calificacion + remito +
                                             limpieza de Redis. CORRERLO: quedo
                                             roto meses por no correrse — sin

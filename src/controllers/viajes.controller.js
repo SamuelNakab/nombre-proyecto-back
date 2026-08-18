@@ -44,15 +44,38 @@ const schemaEstimar = z.object({
   fecha_programada: z.string().optional(),
 });
 
+// Anticipacion minima para programar un viaje. Configurable porque en
+// staging/local hay que poder crear viajes y debuggearlos sin esperar una hora.
+// Se lee en CADA request (no se cachea en el modulo) para que el umbral y el
+// mensaje de error no se puedan desincronizar, y para poder cambiarla sin
+// redeploy de codigo.
+const ANTICIPACION_MINIMA_DEFAULT = 60;
+
+function anticipacionMinimaMinutos() {
+  const valor = Number(process.env.ANTICIPACION_MINIMA_MINUTOS ?? ANTICIPACION_MINIMA_DEFAULT);
+  // Un valor basura (NaN) o negativo se ignora: sin este guard, NaN haria que
+  // TODA comparacion diera false y no se pudiera crear ningun viaje.
+  if (!Number.isFinite(valor) || valor < 0) return ANTICIPACION_MINIMA_DEFAULT;
+  return valor;
+}
+
 const schemaCrear = z.object({
   ...camposBase,
-  fecha_programada: z.string().refine(
-    (val) => {
-      const date = new Date(val);
-      return !isNaN(date.getTime()) && date > new Date(Date.now() + 60 * 60 * 1000);
-    },
-    { message: 'fecha_programada debe ser una fecha ISO futura (al menos 1 hora desde ahora)' }
-  ),
+  fecha_programada: z.string().superRefine((val, ctx) => {
+    const minutos = anticipacionMinimaMinutos();
+    const date = new Date(val);
+    // El piso es "futura" y no depende de la variable: con la anticipacion en 0
+    // el minimo queda en `ahora` y la comparacion estricta (<=) igual rechaza el
+    // presente y el pasado. Por eso anticipacionMinimaMinutos() nunca devuelve
+    // un negativo: correria el minimo hacia atras y dejaria pasar fechas pasadas.
+    const minimo = new Date(Date.now() + minutos * 60 * 1000);
+    if (isNaN(date.getTime()) || date <= minimo) {
+      ctx.addIssue({
+        code: 'custom',
+        message: `fecha_programada debe ser una fecha ISO futura (al menos ${minutos} minutos desde ahora)`,
+      });
+    }
+  }),
   condiciones_requeridas: z
     .array(z.enum(CONDICIONES))
     .optional()

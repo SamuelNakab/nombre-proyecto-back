@@ -1,4 +1,3 @@
-import { createHmac, timingSafeEqual } from 'crypto';
 import { z } from 'zod';
 import * as turf from '@turf/turf';
 import prisma from '../config/prisma.js';
@@ -9,6 +8,10 @@ import { obtenerAcumulado } from '../services/gps.service.js';
 import { cerrarViaje } from '../services/cierre.service.js';
 import { recalcularEtaInmediato } from '../services/eta-emisor.js';
 import { limpiarViajeActivo } from '../services/cancelacion.service.js';
+import {
+  programarTimeoutReserva,
+  cancelarTimeoutReserva,
+} from '../services/reserva.service.js';
 import { calcularYGuardarRuta, obtenerRutaPlaneada } from '../services/ruta.service.js';
 import { validarTransicion } from '../services/estado-viaje.service.js';
 import { repartirPorZona } from '../services/zona.service.js';
@@ -19,34 +22,6 @@ import {
   INCLUDE_ACCESO_VIAJE,
 } from '../services/acceso-viaje.service.js';
 import { io } from '../sockets/index.js';
-
-// ─── QR helpers ──────────────────────────────────────────────────────────────
-
-function firmarQR(payload) {
-  const data = Buffer.from(JSON.stringify(payload)).toString('base64url');
-  const firma = createHmac('sha256', process.env.QR_SECRET).update(data).digest('hex');
-  return `${data}.${firma}`;
-}
-
-function verificarQR(qr_firmado) {
-  const dot = qr_firmado.lastIndexOf('.');
-  if (dot === -1) return null;
-  const data = qr_firmado.slice(0, dot);
-  const firma = qr_firmado.slice(dot + 1);
-  const firmaEsperada = createHmac('sha256', process.env.QR_SECRET).update(data).digest('hex');
-  try {
-    const a = Buffer.from(firma, 'hex');
-    const b = Buffer.from(firmaEsperada, 'hex');
-    if (a.length !== b.length || !timingSafeEqual(a, b)) return null;
-  } catch {
-    return null;
-  }
-  try {
-    return JSON.parse(Buffer.from(data, 'base64url').toString());
-  } catch {
-    return null;
-  }
-}
 
 // ─── Schemas de validacion ───────────────────────────────────────────────────
 
@@ -73,15 +48,38 @@ const schemaEstimar = z.object({
   fecha_programada: z.string().optional(),
 });
 
+// Anticipacion minima para programar un viaje. Configurable porque en
+// staging/local hay que poder crear viajes y debuggearlos sin esperar una hora.
+// Se lee en CADA request (no se cachea en el modulo) para que el umbral y el
+// mensaje de error no se puedan desincronizar, y para poder cambiarla sin
+// redeploy de codigo.
+const ANTICIPACION_MINIMA_DEFAULT = 60;
+
+function anticipacionMinimaMinutos() {
+  const valor = Number(process.env.ANTICIPACION_MINIMA_MINUTOS ?? ANTICIPACION_MINIMA_DEFAULT);
+  // Un valor basura (NaN) o negativo se ignora: sin este guard, NaN haria que
+  // TODA comparacion diera false y no se pudiera crear ningun viaje.
+  if (!Number.isFinite(valor) || valor < 0) return ANTICIPACION_MINIMA_DEFAULT;
+  return valor;
+}
+
 const schemaCrear = z.object({
   ...camposBase,
-  fecha_programada: z.string().refine(
-    (val) => {
-      const date = new Date(val);
-      return !isNaN(date.getTime()) && date > new Date(Date.now() + 60 * 60 * 1000);
-    },
-    { message: 'fecha_programada debe ser una fecha ISO futura (al menos 1 hora desde ahora)' }
-  ),
+  fecha_programada: z.string().superRefine((val, ctx) => {
+    const minutos = anticipacionMinimaMinutos();
+    const date = new Date(val);
+    // El piso es "futura" y no depende de la variable: con la anticipacion en 0
+    // el minimo queda en `ahora` y la comparacion estricta (<=) igual rechaza el
+    // presente y el pasado. Por eso anticipacionMinimaMinutos() nunca devuelve
+    // un negativo: correria el minimo hacia atras y dejaria pasar fechas pasadas.
+    const minimo = new Date(Date.now() + minutos * 60 * 1000);
+    if (isNaN(date.getTime()) || date <= minimo) {
+      ctx.addIssue({
+        code: 'custom',
+        message: `fecha_programada debe ser una fecha ISO futura (al menos ${minutos} minutos desde ahora)`,
+      });
+    }
+  }),
   condiciones_requeridas: z
     .array(z.enum(CONDICIONES))
     .optional()
@@ -479,6 +477,13 @@ export async function cancelarViajeConductor(req, res) {
     },
   });
 
+  // El viaje VUELVE a estar reservado (fecha_reserva se reinicia arriba), asi
+  // que le corresponde un timeout nuevo. Con el poller esto salia gratis — hoy
+  // hay que programarlo a mano o el viaje se quedaria reservado para siempre.
+  if (esDeEmpresa) {
+    programarTimeoutReserva(io, id_viaje);
+  }
+
   // Cleanup del estado activo del viaje (corta el emisor de ETA y borra TODAS
   // las keys gps:{id_viaje}:*). Idempotente. Mismo helper que la cancelacion por
   // cliente.
@@ -581,6 +586,11 @@ export async function cancelarViajeCliente(req, res) {
     }),
   ]);
 
+  // Defensivo: hoy ESTADOS_CANCELABLES no incluye RESERVADO_POR_EMPRESA, asi que
+  // aca nunca hay un timer de reserva vivo. Se cancela igual — es idempotente y
+  // gratis — para que el dia que esa lista crezca no quede un timer huerfano.
+  cancelarTimeoutReserva(id_viaje);
+
   // Fuera de la transaccion: cleanup del estado activo. Si estaba en
   // CONDUCTOR_ASIGNADO, esto corta el emisor de ETA y borra las keys GPS. Si
   // estaba en BUSCANDO_CONDUCTOR, limpiarViajeActivo es idempotente (no hay ETA
@@ -661,35 +671,9 @@ export async function obtenerCostoAcumulado(req, res) {
 
 // ─── Fase 5 ───────────────────────────────────────────────────────────────────
 
-export async function obtenerQRParadas(req, res) {
-  const id_viaje = Number(req.params.id);
-
-  const viaje = await prisma.viaje.findUnique({
-    where: { id_viaje },
-    include: {
-      cliente: true,
-      paradas: { orderBy: { orden: 'asc' } },
-    },
-  });
-
-  if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
-  if (viaje.cliente.id_usuario !== req.usuario.id_usuario) {
-    return res.status(403).json({ error: 'Sin acceso a este viaje' });
-  }
-
-  const qrs = viaje.paradas.map((p) => ({
-    id_parada: p.id_parada,
-    orden: p.orden,
-    direccion: p.direccion,
-    qr_firmado: firmarQR({ id_parada: p.id_parada, id_viaje, orden: p.orden }),
-  }));
-
-  return res.status(200).json(qrs);
-}
-
 export async function confirmarParada(req, res) {
   const schema = z.object({
-    qr_firmado: z.string(),
+    id_parada: z.number().int().positive(),
     lat: z.number(),
     lng: z.number(),
   });
@@ -697,12 +681,8 @@ export async function confirmarParada(req, res) {
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
 
-  const { qr_firmado, lat, lng } = parsed.data;
+  const { id_parada, lat, lng } = parsed.data;
   const id_viaje = Number(req.params.id);
-
-  const payload = verificarQR(qr_firmado);
-  if (!payload) return res.status(400).json({ error: 'QR invalido o firma incorrecta' });
-  if (payload.id_viaje !== id_viaje) return res.status(400).json({ error: 'El QR no corresponde a este viaje' });
 
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },
@@ -712,26 +692,38 @@ export async function confirmarParada(req, res) {
     },
   });
 
+  // Orden de validaciones fijado por contrato (mismo orden en API.md): primero
+  // lo que identifica al recurso y a quien lo pide, despues el estado, y la
+  // proximidad al final — es la unica que necesita las coordenadas del body.
   if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
   if (!viaje.conductor || viaje.conductor.id_usuario !== req.usuario.id_usuario) {
     return res.status(403).json({ error: 'No sos el conductor de este viaje' });
   }
+
+  // 400 y no 404: la parada puede existir perfectamente, solo que no es de este
+  // viaje. El recurso de la URL (el viaje) si existe.
+  const parada = viaje.paradas.find((p) => p.id_parada === id_parada);
+  if (!parada) return res.status(400).json({ error: 'La parada no pertenece a este viaje' });
+  if (parada.fecha_entrega !== null) {
+    return res.status(400).json({ error: 'La parada ya fue confirmada' });
+  }
+
   if (viaje.estado !== 'EN_RUTA' && viaje.estado !== 'DESCARGANDO') {
     return res.status(400).json({ error: 'El viaje debe estar en estado EN_RUTA o DESCARGANDO' });
   }
 
-  const parada = viaje.paradas.find((p) => p.id_parada === payload.id_parada);
-  if (!parada) return res.status(404).json({ error: 'Parada no encontrada' });
-  if (parada.estado === 'ENTREGADO') return res.status(400).json({ error: 'La parada ya fue confirmada' });
-
+  // Confirmacion por proximidad: reemplaza al QR firmado. El radio es
+  // configurable porque 50m es agresivo para GPS urbano con edificios altos y
+  // puede necesitar ajuste sin redeploy de codigo.
+  const radio_metros = parseFloat(process.env.RADIO_CONFIRMACION_METROS || '50');
   const distancia_metros = turf.distance(
     turf.point([lng, lat]),
     turf.point([parada.longitud, parada.latitud]),
     { units: 'meters' }
   );
-  if (distancia_metros > 200) {
+  if (distancia_metros > radio_metros) {
     return res.status(400).json({
-      error: `Estas a ${Math.round(distancia_metros)}m de la parada. Debes estar a menos de 200m`,
+      error: `Estas a ${Math.round(distancia_metros)}m de la parada. Debes estar a menos de ${radio_metros}m`,
     });
   }
 

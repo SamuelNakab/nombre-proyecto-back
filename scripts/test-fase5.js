@@ -99,7 +99,7 @@ async function main() {
 
   let clienteToken, conductorToken;
   let sConductor = null, sCliente = null;
-  let id_viaje, qrs, conf2;
+  let id_viaje, paradasOrd, conf2;
 
   // ──────────────────────────────────────────────────────────────────────────
   // PASO 1: Autenticacion
@@ -146,9 +146,9 @@ async function main() {
   const paradas = viajeData.paradas ?? [];
 
   paso(`Viaje creado con id ${id_viaje}`, !!id_viaje, '');
-  paso('Viaje tiene 2 paradas con qr_token',
-    paradas.length === 2 && paradas.every(p => p.qr_token),
-    paradas.map(p => `#${p.id_parada} token=${p.qr_token?.slice(0, 8)}...`).join(' | '));
+  paso('Viaje tiene 2 paradas con id_parada y coordenadas',
+    paradas.length === 2 && paradas.every(p => p.id_parada && p.latitud && p.longitud),
+    paradas.map(p => `#${p.id_parada} orden=${p.orden}`).join(' | '));
 
   // ──────────────────────────────────────────────────────────────────────────
   // PASO 3: Conductor acepta via WebSocket
@@ -247,29 +247,30 @@ async function main() {
   }
 
   // ──────────────────────────────────────────────────────────────────────────
-  // PASO 6: GET /api/viajes/:id/qr-paradas
+  // PASO 6: Paradas del viaje (el conductor las lee del detalle)
   // ──────────────────────────────────────────────────────────────────────────
-  console.log('\n── PASO 6: GET qr-paradas ────────────────────────────────────\n');
+  console.log('\n── PASO 6: Paradas del detalle ───────────────────────────────\n');
 
-  const { status: sqr, data: qrData } = await api(
+  const { status: sdet, data: detData } = await api(
+    'GET', `/api/viajes/${id_viaje}`, null, conductorToken
+  );
+  paso('GET /api/viajes/:id → 200 (conductor asignado)', sdet === 200, sdet !== 200 ? JSON.stringify(detData) : '');
+  if (sdet !== 200) { await cleanup(sConductor, sCliente); process.exit(1); }
+
+  paso('El detalle trae las 2 paradas', Array.isArray(detData.paradas) && detData.paradas.length === 2,
+    `${detData.paradas?.length ?? 0} paradas`);
+  paso('Cada parada tiene id_parada, orden, direccion y coordenadas',
+    detData.paradas.every(p => p.id_parada && p.orden && p.direccion && p.latitud && p.longitud), '');
+
+  paradasOrd = [...detData.paradas].sort((a, b) => a.orden - b.orden);
+  console.log(`  Parada 1 (orden ${paradasOrd[0].orden}): id_parada=${paradasOrd[0].id_parada} ${paradasOrd[0].direccion}`);
+  console.log(`  Parada 2 (orden ${paradasOrd[1].orden}): id_parada=${paradasOrd[1].id_parada} ${paradasOrd[1].direccion}`);
+
+  // El endpoint del QR ya no existe.
+  const { status: sqrViejo } = await api(
     'GET', `/api/viajes/${id_viaje}/qr-paradas`, null, clienteToken
   );
-  paso('GET /api/viajes/:id/qr-paradas → 200', sqr === 200, sqr !== 200 ? JSON.stringify(qrData) : '');
-  if (sqr !== 200) { await cleanup(sConductor, sCliente); process.exit(1); }
-
-  paso('Respuesta tiene 2 QRs', Array.isArray(qrData) && qrData.length === 2, `${qrData?.length ?? 0} QRs`);
-  paso('Cada QR tiene id_parada, orden, direccion y qr_firmado',
-    qrData.every(q => q.id_parada && q.orden && q.direccion && q.qr_firmado), '');
-
-  qrs = qrData.sort((a, b) => a.orden - b.orden);
-  console.log(`  QR parada 1 (orden ${qrs[0].orden}): ${qrs[0].qr_firmado.slice(0, 50)}...`);
-  console.log(`  QR parada 2 (orden ${qrs[1].orden}): ${qrs[1].qr_firmado.slice(0, 50)}...`);
-
-  // Verificar que cliente rechaza a conductor con 403
-  const { status: sqrCond } = await api(
-    'GET', `/api/viajes/${id_viaje}/qr-paradas`, null, conductorToken
-  );
-  paso('GET qr-paradas rechaza al conductor con 403', sqrCond === 403, `status ${sqrCond}`);
+  paso('GET /:id/qr-paradas ya no existe → 404', sqrViejo === 404, `status ${sqrViejo}`);
 
   // ──────────────────────────────────────────────────────────────────────────
   // PASO 7: Confirmar primera parada
@@ -279,7 +280,7 @@ async function main() {
   const { status: sc1, data: conf1 } = await api(
     'POST', `/api/viajes/${id_viaje}/confirmar-parada`,
     {
-      qr_firmado: qrs[0].qr_firmado,
+      id_parada: paradasOrd[0].id_parada,
       lat: PARADA_1.lat,
       lng: PARADA_1.lng,
     },
@@ -292,18 +293,18 @@ async function main() {
     conf1.confirmada === true && conf1.viaje_finalizado === false,
     JSON.stringify(conf1));
 
-  // Verificar que QR invalido da 400
-  const { status: scQRInv } = await api(
+  // Verificar que una parada que no es de este viaje da 400
+  const { status: scAjena } = await api(
     'POST', `/api/viajes/${id_viaje}/confirmar-parada`,
-    { qr_firmado: 'token.invalido', lat: PARADA_1.lat, lng: PARADA_1.lng },
+    { id_parada: 999999999, lat: PARADA_1.lat, lng: PARADA_1.lng },
     conductorToken
   );
-  paso('QR invalido rechazado con 400', scQRInv === 400, `status ${scQRInv}`);
+  paso('Parada ajena al viaje rechazada con 400', scAjena === 400, `status ${scAjena}`);
 
   // Verificar que reconfirmar la misma parada da 400
   const { status: scDup } = await api(
     'POST', `/api/viajes/${id_viaje}/confirmar-parada`,
-    { qr_firmado: qrs[0].qr_firmado, lat: PARADA_1.lat, lng: PARADA_1.lng },
+    { id_parada: paradasOrd[0].id_parada, lat: PARADA_1.lat, lng: PARADA_1.lng },
     conductorToken
   );
   paso('Reconfirmar parada ya ENTREGADO rechazado con 400', scDup === 400, `status ${scDup}`);
@@ -316,7 +317,7 @@ async function main() {
   const { status: sc2, data: conf2Data } = await api(
     'POST', `/api/viajes/${id_viaje}/confirmar-parada`,
     {
-      qr_firmado: qrs[1].qr_firmado,
+      id_parada: paradasOrd[1].id_parada,
       lat: PARADA_2.lat,
       lng: PARADA_2.lng,
     },

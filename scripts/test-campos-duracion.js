@@ -172,14 +172,14 @@ async function completarViaje({ paradas, clienteToken, conductorToken, sConducto
   await api('PATCH', `/api/viajes/${id_viaje}/estado`, { estado: 'CARGANDO' }, conductorToken);
   await api('PATCH', `/api/viajes/${id_viaje}/estado`, { estado: 'EN_RUTA' }, conductorToken);
 
-  const { data: qrs } = await api('GET', `/api/viajes/${id_viaje}/qr-paradas`, null, clienteToken);
-  const ordenados = [...qrs].sort((a, b) => a.orden - b.orden);
+  const { data: det } = await api('GET', `/api/viajes/${id_viaje}`, null, clienteToken);
+  const ordenados = [...det.paradas].sort((a, b) => a.orden - b.orden);
 
   for (let i = 0; i < ordenados.length; i++) {
     const { status, data } = await api(
       'POST',
       `/api/viajes/${id_viaje}/confirmar-parada`,
-      { qr_firmado: ordenados[i].qr_firmado, lat: paradas[i].lat, lng: paradas[i].lng },
+      { id_parada: ordenados[i].id_parada, lat: paradas[i].lat, lng: paradas[i].lng },
       conductorToken
     );
     if (status !== 200) {

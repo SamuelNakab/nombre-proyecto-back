@@ -1,5 +1,6 @@
 import { io } from 'socket.io-client';
 import redis from '../src/config/redis.js';
+import { conServer } from './_server-efimero.js';
 import prisma from '../src/config/prisma.js';
 
 const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
@@ -36,8 +37,10 @@ async function getToken(email, password) {
   return data.idToken;
 }
 
-async function api(method, path, body, token) {
-  const res = await fetch(`${BASE}${path}`, {
+// `base` alterna: el CASO 8 corre contra un server efimero propio, con otro
+// RESERVA_TIMEOUT_MINUTOS. El resto de los casos usan el default (:3000).
+async function api(method, path, body, token, base = BASE) {
+  const res = await fetch(`${base}${path}`, {
     method,
     headers: {
       'Content-Type': 'application/json',
@@ -55,9 +58,9 @@ async function api(method, path, body, token) {
   return { status: res.status, data };
 }
 
-function conectar(token) {
+function conectar(token, base = BASE) {
   return new Promise((resolve, reject) => {
-    const s = io(BASE, { auth: { token: 'Bearer ' + token } });
+    const s = io(base, { auth: { token: 'Bearer ' + token } });
     s.on('connect', () => resolve(s));
     s.on('connect_error', (e) => reject(new Error(`Socket connect_error: ${e.message}`)));
     setTimeout(() => reject(new Error('Timeout al conectar socket (8s)')), 8000);
@@ -87,20 +90,21 @@ async function crearVehiculoPropioSiNoExiste(token, patente) {
   );
 }
 
-async function crearViaje(clienteToken, condiciones = []) {
+async function crearViaje(clienteToken, condiciones = [], base = BASE) {
   const fecha = new Date(Date.now() + 2 * HORA).toISOString();
   const { status, data } = await api(
     'POST',
     '/api/viajes',
     { zona: 'CABA', fecha_programada: fecha, condiciones_requeridas: condiciones, paradas: [PARADA_1, PARADA_2] },
-    clienteToken
+    clienteToken,
+    base
   );
   if (status !== 201) throw new Error(`crearViaje fallo (${status}): ${JSON.stringify(data)}`);
   return data.id_viaje;
 }
 
-const reservar = (token, id_viaje, id_empresa) =>
-  api('POST', `/api/viajes/${id_viaje}/reservar`, { id_empresa }, token);
+const reservar = (token, id_viaje, id_empresa, base = BASE) =>
+  api('POST', `/api/viajes/${id_viaje}/reservar`, { id_empresa }, token, base);
 const asignar = (token, id_viaje, id_conductor, id_vehiculo) =>
   api('POST', `/api/viajes/${id_viaje}/asignar`, { id_conductor, id_vehiculo }, token);
 const reasignar = (token, id_viaje, id_conductor, id_vehiculo) =>
@@ -280,23 +284,48 @@ async function main() {
   paso('CASO 7b: conductor inicia otro viaje → iniciado_por=CONDUCTOR', i7cd.iniciado_por === 'CONDUCTOR' && i7cd.estado === 'EN_CAMINO_A_ORIGEN', `iniciado_por=${i7cd.iniciado_por}`);
 
   // ── CASO 8: timeout de reserva → BUSCANDO_CONDUCTOR + republicacion ────────
+  //
+  // El timeout ya no lo dispara un job que pollea la DB, sino un setTimeout que
+  // se programa AL RESERVAR con el RESERVA_TIMEOUT_MINUTOS del proceso. O sea:
+  // envejecer fecha_reserva a mano ya no dispara nada, y el server de :3000
+  // (10 min de timeout) no sirve para esperarlo. Este caso levanta su propio
+  // server con timeout de 6 segundos y espera al timer de verdad — mismo patron
+  // que test-anticipacion.js.
+  //
+  // El viaje se crea, se reserva y se escucha TODO contra ese server efimero: no
+  // hay adapter de Redis en socket.io, asi que los eventos que emite ese proceso
+  // no llegan a los sockets conectados a :3000.
+  //
+  // RESERVA_BARRIDO_ARRANQUE=0: la DB de Neon esta COMPARTIDA con produccion y un
+  // barrido con timeout de 6 s liberaria al arrancar toda reserva de mas de 6 s,
+  // incluidas las reales. El barrido tiene su propio test en
+  // scripts/test-timeout-reserva.js (CASO 4), ahi si con el timeout por defecto.
   console.log('\n── CASO 8: timeout de reserva → republica a un tardio ────────\n');
-  const v8 = await crearViaje(clienteToken);
-  await esperar(1200);
-  await reservar(gerenteToken, v8, empId);
-  await esperar(600);
-  // "conector tardio": socket nuevo que NO estaba en el room al reservar
-  const sTarde = await conectar(condBToken);
-  const dispTarde = new Map();
-  sTarde.on('viaje:disponible', (d) => dispTarde.set(d.id_viaje, d));
-  await esperar(1000);
-  // forzar fecha_reserva vieja y esperar que el job del server la libere
-  await prisma.viaje.update({ where: { id_viaje: v8 }, data: { fecha_reserva: new Date(Date.now() - 60 * MIN) } });
-  await esperar(6000); // el server corre con RESERVA_CHECK_INTERVAL_MS corto
-  const v8Db = await estadoDe(v8);
-  paso('CASO 8a: el job libera la reserva → BUSCANDO_CONDUCTOR, sin empresa', v8Db.estado === 'BUSCANDO_CONDUCTOR' && v8Db.id_empresa === null && v8Db.fecha_reserva === null, `estado=${v8Db.estado} id_empresa=${v8Db.id_empresa}`);
-  paso('CASO 8b: el conector tardio (post-reserva) recibe viaje:disponible', dispTarde.has(v8), dispTarde.has(v8) ? 'ok' : 'NO recibido');
-  sTarde.disconnect();
+  await conServer(
+    { RESERVA_TIMEOUT_MINUTOS: '0.1', RESERVA_BARRIDO_ARRANQUE: '0' },
+    3210,
+    async (base8) => {
+      const v8 = await crearViaje(clienteToken, [], base8);
+      await esperar(1200);
+      await reservar(gerenteToken, v8, empId, base8);
+      await esperar(600);
+      // "conector tardio": socket nuevo que NO estaba en el room al reservar
+      const sTarde = await conectar(condBToken, base8);
+      const dispTarde = new Map();
+      sTarde.on('viaje:disponible', (d) => dispTarde.set(d.id_viaje, d));
+      await esperar(1000);
+
+      const v8Res = await estadoDe(v8);
+      paso('CASO 8a: reservar → RESERVADO_POR_EMPRESA (timer de 6s armado)', v8Res.estado === 'RESERVADO_POR_EMPRESA' && v8Res.id_empresa === empId, `estado=${v8Res.estado} id_empresa=${v8Res.id_empresa}`);
+
+      // Esperar a que venza el timer de la reserva (6s) con margen.
+      await esperar(9000);
+      const v8Db = await estadoDe(v8);
+      paso('CASO 8b: el timer libera la reserva → BUSCANDO_CONDUCTOR, sin empresa', v8Db.estado === 'BUSCANDO_CONDUCTOR' && v8Db.id_empresa === null && v8Db.fecha_reserva === null, `estado=${v8Db.estado} id_empresa=${v8Db.id_empresa}`);
+      paso('CASO 8c: el conector tardio (post-reserva) recibe viaje:disponible', dispTarde.has(v8), dispTarde.has(v8) ? 'ok' : 'NO recibido');
+      sTarde.disconnect();
+    }
+  );
 
   // ── CASO 9: reasignacion A → B antes de iniciar ────────────────────────────
   console.log('\n── CASO 9: reasignar conductor A → B (sin iniciar) ───────────\n');
@@ -433,12 +462,12 @@ async function main() {
   await api('PATCH', `/api/viajes/${v18}/estado`, { estado: 'CARGANDO' }, condAToken);
   const { status: er18 } = await api('PATCH', `/api/viajes/${v18}/estado`, { estado: 'EN_RUTA' }, condAToken);
 
-  const { data: qrs18 } = await api('GET', `/api/viajes/${v18}/qr-paradas`, null, clienteToken);
-  const ord = qrs18.sort((a, b) => a.orden - b.orden);
-  await api('POST', `/api/viajes/${v18}/confirmar-parada`, { qr_firmado: ord[0].qr_firmado, lat: PARADA_1.lat, lng: PARADA_1.lng }, condAToken);
-  const { data: conf18 } = await api('POST', `/api/viajes/${v18}/confirmar-parada`, { qr_firmado: ord[1].qr_firmado, lat: PARADA_2.lat, lng: PARADA_2.lng }, condAToken);
+  const { data: det18 } = await api('GET', `/api/viajes/${v18}`, null, clienteToken);
+  const ord = [...det18.paradas].sort((a, b) => a.orden - b.orden);
+  await api('POST', `/api/viajes/${v18}/confirmar-parada`, { id_parada: ord[0].id_parada, lat: PARADA_1.lat, lng: PARADA_1.lng }, condAToken);
+  const { data: conf18 } = await api('POST', `/api/viajes/${v18}/confirmar-parada`, { id_parada: ord[1].id_parada, lat: PARADA_2.lat, lng: PARADA_2.lng }, condAToken);
   const v18Db = await estadoDe(v18);
-  paso('CASO 18b: pings + CARGANDO→EN_RUTA + QR ambas paradas → FINALIZADO con remito', er18 === 200 && conf18.viaje_finalizado === true && typeof conf18.remito_url === 'string' && conf18.remito_url.startsWith('http') && v18Db.estado === 'FINALIZADO' && typeof v18Db.precio_real === 'number', `enruta=${er18} finalizado=${conf18.viaje_finalizado} estado=${v18Db.estado} remito=${conf18.remito_url ? 'si' : 'no'}`);
+  paso('CASO 18b: pings + CARGANDO→EN_RUTA + confirmar ambas paradas → FINALIZADO con remito', er18 === 200 && conf18.viaje_finalizado === true && typeof conf18.remito_url === 'string' && conf18.remito_url.startsWith('http') && v18Db.estado === 'FINALIZADO' && typeof v18Db.precio_real === 'number', `enruta=${er18} finalizado=${conf18.viaje_finalizado} estado=${v18Db.estado} remito=${conf18.remito_url ? 'si' : 'no'}`);
 
   // ── RESUMEN ────────────────────────────────────────────────────────────────
   await cleanup([sCliente, sGerente, sA, sB]);

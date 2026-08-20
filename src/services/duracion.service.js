@@ -22,9 +22,9 @@ export function horasAMinutos(horas) {
 // Duracion REAL del viaje, en minutos. Se calcula en el read — no hay columna.
 //
 // Fin del viaje = la ultima fecha_entrega de sus paradas. Se usa max() y NO la
-// parada de mayor `orden` a proposito: las paradas se confirman escaneando un QR
-// y nada garantiza que se confirmen en orden, asi que la de mayor orden puede no
-// ser la ultima en el tiempo. Confirmar la ultima parada pendiente es lo que
+// parada de mayor `orden` a proposito: el conductor confirma cada parada por
+// proximidad y nada valida el orden, asi que la de mayor orden puede no ser la
+// ultima en el tiempo. Confirmar la ultima parada pendiente es lo que
 // dispara cerrarViaje, asi que ese maximo ES el momento del cierre.
 //
 // null si el viaje no arranco (sin fecha_inicio) o todavia no termino (estado

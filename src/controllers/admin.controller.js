@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import prisma from '../config/prisma.js';
 import { limpiarViajeActivo } from '../services/cancelacion.service.js';
+import { cancelarTimeoutReserva } from '../services/reserva.service.js';
 import { io } from '../sockets/index.js';
 
 // ─── Constantes ──────────────────────────────────────────────────────────────
@@ -422,6 +423,11 @@ export async function cancelarViaje(req, res) {
       },
     }),
   ]);
+
+  // El admin puede cancelar desde CUALQUIER estado no terminal, incluido
+  // RESERVADO_POR_EMPRESA: si el viaje tenia una reserva viva, su timer ya no
+  // aplica. Idempotente en los demas estados.
+  cancelarTimeoutReserva(id_viaje);
 
   // Si habia (o hubo) tracking activo — CONDUCTOR_ASIGNADO en adelante — cortar
   // el emisor de ETA y limpiar todas las keys gps:{id_viaje}:*. En

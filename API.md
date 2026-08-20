@@ -2876,7 +2876,7 @@ Body: `{ "codigo_afiliacion": "string" }`. → `201` con la afiliación. `404` c
 > nunca quedan dos conductores creyéndose asignados al mismo viaje. Un `409` acá no es un error a
 > reintentar: significa que alguien más ya resolvió ese viaje, y lo correcto es refrescar su estado.
 
-**POST /api/viajes/:id/cancelar-reserva** — suelta una reserva: `RESERVADO_POR_EMPRESA` → `BUSCANDO_CONDUCTOR`, limpia `id_empresa`/`fecha_reserva`, y **republica el viaje de cero** (re-corre elegibilidad de conductores + gerentes y los suma al room, así un conector que llega después también recibe `viaje:disponible`). Emite `viaje:reserva_cancelada`. También ocurre **automáticamente por timeout** (`RESERVA_TIMEOUT_MINUTOS`, default 10) vía un job periódico.
+**POST /api/viajes/:id/cancelar-reserva** — suelta una reserva: `RESERVADO_POR_EMPRESA` → `BUSCANDO_CONDUCTOR`, limpia `id_empresa`/`fecha_reserva`, y **republica el viaje de cero** (re-corre elegibilidad de conductores + gerentes y los suma al room, así un conector que llega después también recibe `viaje:disponible`). Emite `viaje:reserva_cancelada`. También ocurre **automáticamente por timeout** (`RESERVA_TIMEOUT_MINUTOS`, default 10) vía un temporizador por reserva.
 
 **GET /api/viajes/asignados** (rol `CONDUCTOR`) — viajes en `CONDUCTOR_ASIGNADO` donde soy el conductor asignado. Devuelve paradas (origen/destino), `fecha_programada` y el vehículo asignado.
 

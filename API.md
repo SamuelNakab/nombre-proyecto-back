@@ -2869,14 +2869,22 @@ Body: `{ "codigo_afiliacion": "string" }`. → `201` con la afiliación. `404` c
 
 **POST /api/viajes/:id/reasignar** — reemplaza conductor y/o vehículo de un viaje `CONDUCTOR_ASIGNADO` **que todavía no arrancó** (`fecha_inicio` null). Mismas validaciones que asignar; re-emite `viaje:asignado`. `400` si el viaje ya arrancó según la lectura previa; **`409 "El viaje ya no se puede reasignar (cambio de estado o ya arranco)"`** si cambió de estado o arrancó entre la validación y la escritura.
 
-> **Garantía de concurrencia.** `reservar`, `asignar` y `reasignar` escriben con un `UPDATE ... WHERE`
-> condicionado por el estado esperado (el mismo patrón atómico que el `viaje:aceptar` del conductor),
-> no con un update plano sobre una lectura previa. Consecuencia para el front: ante un doble-submit
-> o dos gerentes/pestañas compitiendo, **exactamente una request devuelve `200` y la otra `409`** —
-> nunca quedan dos conductores creyéndose asignados al mismo viaje. Un `409` acá no es un error a
-> reintentar: significa que alguien más ya resolvió ese viaje, y lo correcto es refrescar su estado.
+> **Garantía de concurrencia.** `reservar`, `asignar`, `reasignar` y `cancelar-reserva` escriben con un
+> `UPDATE ... WHERE` condicionado por el estado esperado (el mismo patrón atómico que el `viaje:aceptar`
+> del conductor), no con un update plano sobre una lectura previa. Consecuencia para el front: ante un
+> doble-submit o dos gerentes/pestañas compitiendo, **exactamente una request devuelve `200` y la otra
+> `409`** — nunca quedan dos conductores creyéndose asignados al mismo viaje. Un `409` acá no es un
+> error a reintentar: significa que alguien más ya resolvió ese viaje, y lo correcto es refrescar su
+> estado.
+>
+> En `cancelar-reserva` la carrera típica es contra `asignar`: soltar la reserva justo cuando otra
+> pestaña le asigna conductor. Devuelve **`409 "El viaje ya no esta en RESERVADO_POR_EMPRESA"`** y la
+> asignación queda en pie — antes ese caso respondía `200` y devolvía al mercado un viaje que ya tenía
+> conductor. Ese mismo `UPDATE ... WHERE` es lo que vuelve inofensivo al temporizador de timeout de la
+> reserva cuando dispara sobre un viaje que ya salió de `RESERVADO_POR_EMPRESA` (asignado, cancelado o
+> soltado a mano): no toca la fila ni republica el viaje.
 
-**POST /api/viajes/:id/cancelar-reserva** — suelta una reserva: `RESERVADO_POR_EMPRESA` → `BUSCANDO_CONDUCTOR`, limpia `id_empresa`/`fecha_reserva`, y **republica el viaje de cero** (re-corre elegibilidad de conductores + gerentes y los suma al room, así un conector que llega después también recibe `viaje:disponible`). Emite `viaje:reserva_cancelada`. También ocurre **automáticamente por timeout** (`RESERVA_TIMEOUT_MINUTOS`, default 10) vía un temporizador por reserva.
+**POST /api/viajes/:id/cancelar-reserva** — suelta una reserva: `RESERVADO_POR_EMPRESA` → `BUSCANDO_CONDUCTOR`, limpia `id_empresa`/`fecha_reserva`, y **republica el viaje de cero** (re-corre elegibilidad de conductores + gerentes y los suma al room, así un conector que llega después también recibe `viaje:disponible`). Emite `viaje:reserva_cancelada`. **`409 "El viaje ya no esta en RESERVADO_POR_EMPRESA"`** si el viaje salió de ese estado entre la validación y la escritura (ver *Garantía de concurrencia* arriba). También ocurre **automáticamente por timeout** (`RESERVA_TIMEOUT_MINUTOS`, default 10) vía un temporizador por reserva.
 
 **GET /api/viajes/asignados** (rol `CONDUCTOR`) — viajes en `CONDUCTOR_ASIGNADO` donde soy el conductor asignado. Devuelve paradas (origen/destino), `fecha_programada` y el vehículo asignado.
 

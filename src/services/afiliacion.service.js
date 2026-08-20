@@ -2,6 +2,7 @@ import { randomInt } from 'crypto';
 import prisma from '../config/prisma.js';
 import { validarTransicion } from './estado-viaje.service.js';
 import { io } from '../sockets/index.js';
+import { programarTimeoutReserva } from './reserva.service.js';
 
 // ─── Codigo de afiliacion ────────────────────────────────────────────────────
 
@@ -82,6 +83,15 @@ export async function ejecutarDesafiliacion(id_conductor, id_empresa) {
       data: { fecha_baja: new Date() },
     });
   });
+
+  // Cada viaje devuelto RE-ENTRA a RESERVADO_POR_EMPRESA con fecha_reserva nueva
+  // (ver el update de arriba), asi que le corresponde un timeout propio. Con el
+  // viejo job periodico esto salia gratis; con timers hay que programarlo, o el
+  // viaje se quedaria reservado indefinidamente esperando una reasignacion que
+  // el gerente puede no hacer nunca.
+  for (const viaje of asignados) {
+    programarTimeoutReserva(io, viaje.id_viaje);
+  }
 
   // Ya commiteada la baja: avisar al gerente que cada viaje devuelto necesita
   // reasignacion. Es un evento propio, distinto del timeout / cancelacion manual

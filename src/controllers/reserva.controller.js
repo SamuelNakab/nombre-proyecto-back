@@ -1,7 +1,12 @@
 import { z } from 'zod';
 import prisma from '../config/prisma.js';
 import { validarTransicion } from '../services/estado-viaje.service.js';
-import { validarConductorYVehiculo, liberarReserva } from '../services/reserva.service.js';
+import {
+  validarConductorYVehiculo,
+  liberarReserva,
+  programarTimeoutReserva,
+  cancelarTimeoutReserva,
+} from '../services/reserva.service.js';
 import { io } from '../sockets/index.js';
 
 // ─── Schemas ─────────────────────────────────────────────────────────────────
@@ -117,6 +122,11 @@ export async function reservarViaje(req, res) {
     return res.status(409).json({ error: 'El viaje ya no esta disponible para reservar' });
   }
 
+  // Timeout de la reserva: un setTimeout propio de ESTE viaje, programado recien
+  // ahora que sabemos que la reserva se gano. Reemplaza al viejo job periodico
+  // que polleaba la DB buscando vencidas.
+  programarTimeoutReserva(io, id_viaje);
+
   // Sacar el viaje del pool del resto (conductores y otros gerentes del room).
   if (io) {
     io.to(`viaje:${id_viaje}`).emit('viaje:reservado', { id_viaje, id_empresa });
@@ -180,6 +190,12 @@ export async function asignarViaje(req, res) {
   if (resultado.count === 0) {
     return res.status(409).json({ error: 'El viaje ya no esta en RESERVADO_POR_EMPRESA' });
   }
+
+  // La reserva dejo de estar activa: el viaje ya tiene conductor. Sin esto, el
+  // timer quedaria huerfano y dispararia sobre un viaje YA asignado (el
+  // updateMany condicionado de liberarReserva lo frenaria igual, pero no
+  // dependemos de eso: el camino correcto es cancelarlo).
+  cancelarTimeoutReserva(id_viaje);
 
   notificarAsignacion(req.usuario.id_usuario, viaje, val.conductor, val.vehiculo);
 
@@ -277,7 +293,15 @@ export async function cancelarReserva(req, res) {
   const duenio = await verificarGerenteDeEmpresa(viaje.id_empresa, req.usuario.id_usuario);
   if (duenio.error) return res.status(duenio.status).json({ error: duenio.error });
 
-  await liberarReserva(io, id_viaje, viaje.estado);
+  // liberarReserva escribe con updateMany condicionado al estado. Si entre el
+  // findUnique de arriba y la escritura el viaje salio de RESERVADO_POR_EMPRESA
+  // (una asignacion concurrente del mismo gerente, tipicamente), devuelve false
+  // y no toca nada. Antes era un update plano: esa carrera pisaba un viaje ya
+  // asignado y lo mandaba de vuelta al mercado con conductor y todo.
+  const liberado = await liberarReserva(io, id_viaje, viaje.estado);
+  if (!liberado) {
+    return res.status(409).json({ error: 'El viaje ya no esta en RESERVADO_POR_EMPRESA' });
+  }
 
   return res.status(200).json({
     mensaje: 'Reserva cancelada, viaje devuelto al mercado',

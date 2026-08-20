@@ -17,6 +17,8 @@ MVP: CABA + GBA.
 - Deteccion de zona por poligono COMPLETA
 - Duraciones (estimada / real) y guard atomico en asignar COMPLETOS
 - Confirmacion de paradas por proximidad (reemplazo del QR) COMPLETA
+- Timeout de reservas por temporizador (se saco el poller que mantenia
+  despierta la DB de Neon) COMPLETO
 
 ## Stack
 - Node.js 22, ES Modules (NUNCA require()). Async/await siempre.
@@ -183,13 +185,80 @@ RADIO_CONFIRMACION_METROS de esa parada.
   revirtiendo el guard: sin el, CASO C se pone en rojo con ganadores=2.
 - Si tarda mas de RESERVA_TIMEOUT_MINUTOS sin asignar → se cancela la
   reserva automaticamente y vuelve a BUSCANDO_CONDUCTOR. Tambien puede
-  soltarlo el gerente a mano (cancelar-reserva).
-- IMPORTANTE: cancelar-reserva y el job de timeout NO alcanzan con emitir al
+  soltarlo el gerente a mano (cancelar-reserva). Ver "Timeout de reservas".
+- IMPORTANTE: cancelar-reserva y el timeout NO alcanzan con emitir al
   room viejo: republican el viaje DE CERO — re-corren la elegibilidad de
   conductores independientes + obtenerGerentesElegibles y suman a esa gente al
   room, reusando publicarViajeAConductoresElegibles (la MISMA funcion que la
   cancelacion de un conductor independiente). Asi, alguien que se conecto
   DESPUES de la reserva original tambien recibe viaje:disponible.
+
+### Timeout de reservas — un timer por reserva (NO hay poller)
+
+Antes era un setInterval en reserva.service que cada RESERVA_CHECK_INTERVAL_MS
+(default 60s) pegaba un SELECT a la DB buscando reservas vencidas. Corria
+SIEMPRE, hubiera o no reservas: ~1440 queries por dia por instancia, que
+mantenian despierta la base de Neon 24/7 y se comieron la cuota de CU-horas.
+Era el UNICO poller permanente del backend (el emisor de ETA arranca con los
+pings GPS y se corta al cerrar el viaje o por su watchdog de inactividad).
+
+Ahora cada reserva programa su propio setTimeout. Cero reservas, cero timers,
+cero queries. Verificado con prisma:query: 1 sola query en 40s de server idle.
+
+- programarTimeoutReserva(io, id_viaje, msRestantes?) / cancelarTimeoutReserva
+  (id_viaje), sobre un Map id_viaje → Timeout en reserva.service.js. Mismo
+  patron que tenia el MATCHING_TIMEOUT que se saco.
+- Se PROGRAMA timer en los TRES caminos que ENTRAN a RESERVADO_POR_EMPRESA, no
+  solo al reservar:
+  * POST /api/viajes/:id/reservar
+  * POST /api/viajes/:id/cancelar-conductor de un viaje de EMPRESA (reinicia
+    fecha_reserva y el viaje vuelve a la empresa)
+  * ejecutarDesafiliacion (los CONDUCTOR_ASIGNADO vuelven a RESERVADO)
+  Los dos ultimos con el poller salian gratis; sin programarlos a mano esos
+  viajes se quedarian reservados para siempre.
+- Se CANCELA el timer en TODOS los caminos que SACAN el viaje de
+  RESERVADO_POR_EMPRESA: asignar, cancelar-reserva (dentro de liberarReserva),
+  cancelacion por admin, y cancelacion por cliente (defensivo: hoy
+  ESTADOS_CANCELABLES no incluye RESERVADO_POR_EMPRESA, ver PENDIENTE abajo).
+  reasignar NO cancela nada: va de CONDUCTOR_ASIGNADO a CONDUCTOR_ASIGNADO y el
+  timer ya lo habia matado el asignar.
+- Un timer que dispara DE MAS es INOFENSIVO: liberarReserva escribe con
+  updateMany condicionado (where { id_viaje, estado: 'RESERVADO_POR_EMPRESA' })
+  y devuelve si libero de verdad. Si el viaje ya salio de ese estado, matchea 0
+  filas, no toca nada y no republica. Ese guard es nuevo: antes era un update
+  plano sobre la lectura del poller (TOCTOU).
+- Efecto colateral del guard: cancelar-reserva puede devolver 409 si pierde una
+  carrera contra una asignacion concurrente. Antes devolvia 200 y pisaba un
+  viaje ya asignado, devolviendolo al mercado con conductor y todo.
+- La liberacion sigue republicando DE CERO con
+  publicarViajeAConductoresElegibles, igual que antes.
+
+### Barrido de arranque
+Los timers viven en MEMORIA, asi que un reinicio los pierde. Al levantar,
+app.js corre barridoInicialReservas: UNA sola consulta (no un poller) que busca
+los RESERVADO_POR_EMPRESA y, por cada uno:
+- ya vencido (mientras el proceso estaba caido) → lo libera ahora;
+- todavia vigente → le programa el timer por el tiempo RESTANTE, contado desde
+  su fecha_reserva y no desde el arranque (si no, cada deploy le regalaria el
+  timeout completo de nuevo).
+Loguea cuantas encontro, cuantas libero y cuantas reprogramo. La liberacion es
+SECUENCIAL a proposito: cada una emite sockets y re-corre elegibilidad, y no
+queremos una tormenta de queries justo en el arranque.
+
+### LIMITACION CONOCIDA — un solo proceso
+El Map de timers vive en la memoria de UNA instancia: solo conoce las reservas
+que ella misma atendio. Con mas de una instancia, una reserva atendida por A no
+tiene timer en B, y si A se cae nadie la libera hasta el proximo arranque de A.
+Hoy no importa porque se corre una sola instancia. El dia que se escale hay que
+mover esto a una cola persistente — BullMQ sobre el Redis que ya usamos — en
+vez de setTimeout en memoria. El barrido de arranque cubre el reinicio, NO el
+multi-instancia.
+
+### PENDIENTE (aparte, no es de este cambio)
+CLAUDE.md y API.md dicen "RESERVADO_POR_EMPRESA → CANCELADO: Cliente / admin",
+pero ESTADOS_CANCELABLES en cancelarViajeCliente es solo
+['BUSCANDO_CONDUCTOR', 'CONDUCTOR_ASIGNADO']: el cliente NO puede cancelar un
+viaje reservado, le da 400. El admin si. Bug real de contrato vs codigo.
 
 ### Visibilidad del gerente
 - Ademas del push por socket (viaje:disponible), el gerente descubre viajes
@@ -357,8 +426,18 @@ viaje:reserva_cancelada (ese es "vuelve al mercado abierto"). Payload
 - Cancelacion del conductor de un viaje de empresa (motivo: "conductor_cancelo").
 
 ## Variables de entorno
-RESERVA_TIMEOUT_MINUTOS=10        (default en codigo si no esta en .env)
-RESERVA_CHECK_INTERVAL_MS=60000   (cada cuanto corre el job de timeout)
+RESERVA_TIMEOUT_MINUTOS=10        (default en codigo si no esta en .env;
+                                   acepta FRACCIONARIOS: se lee con parseFloat
+                                   + guarda, no parseInt. Los tests usan 0.1
+                                   (= 6 segundos). Con parseInt, '0.1' daba 0,
+                                   falsy, y caia al default 10 en silencio)
+RESERVA_BARRIDO_ARRANQUE=1        (SOLO para tests: =0 desactiva el barrido de
+                                   arranque. La DB de Neon esta COMPARTIDA con
+                                   produccion, asi que un server efimero con
+                                   RESERVA_TIMEOUT_MINUTOS chico barreria al
+                                   levantar toda reserva de mas de unos
+                                   segundos, incluidas las reales. En
+                                   produccion NO se setea nunca)
 RADIO_CONFIRMACION_METROS=50      (default en codigo si no esta en .env;
                                    antes el radio estaba fijo en 200)
 ANTICIPACION_MINIMA_MINUTOS=60    (default en codigo si no esta en .env;
@@ -427,10 +506,20 @@ node scripts/stress/test-cierre-exhaustivo.js (cierre + calificacion + remito +
                                             roto meses por no correrse — sin
                                             dotenv para Redis y sin POST
                                             /:id/iniciar tras el boton nuevo)
+node scripts/test-timeout-reserva.js       (timers de reserva: vence y republica,
+                                            asignar antes del timeout, cancelar
+                                            -reserva a mano, y el barrido de
+                                            arranque. NO usa el server de :3000
+                                            para los casos de timer — levanta
+                                            uno propio por caso en 3201-3204 con
+                                            RESERVA_TIMEOUT_MINUTOS=0.1)
 
-El CASO 8 de test-jerarquia necesita el server corriendo con
-RESERVA_CHECK_INTERVAL_MS=3000 (el default de 60s no llega a disparar el job
-dentro de la ventana del test).
+scripts/_server-efimero.js es el helper compartido que levanta src/app.js en un
+puerto propio con el env que se le pida. Lo usan el CASO 8 de test-jerarquia
+(puerto 3210) y test-timeout-reserva. test-anticipacion tiene su propia copia
+inline, anterior a la extraccion. OJO: no hay adapter de Redis en socket.io, o
+sea que un socket conectado a :3000 NO recibe los eventos que emite un server
+efimero — los tests que verifican eventos conectan sus sockets al puerto efimero.
 
 Nota de entorno: si el repo esta en una carpeta sincronizada por OneDrive,
 node --watch (npm run dev) se reinicia solo cuando OneDrive toca node_modules y

@@ -10,7 +10,7 @@ import empresasRoutes from './routes/empresas.routes.js';
 import afiliacionesRoutes from './routes/afiliaciones.routes.js';
 import adminRoutes from './routes/admin.routes.js';
 import { inicializarSockets } from './sockets/index.js';
-import { iniciarJobTimeoutReservas } from './services/reserva.service.js';
+import { barridoInicialReservas } from './services/reserva.service.js';
 
 const app = express();
 
@@ -32,8 +32,13 @@ app.use('/api/admin', adminRoutes);
 const httpServer = createServer(app);
 const io = inicializarSockets(httpServer);
 
-// Job periodico que libera reservas de empresa vencidas (RESERVA_TIMEOUT_MINUTOS).
-iniciarJobTimeoutReservas(io);
+// Barrido UNICO al arrancar (NO hay poller): reconstruye los timers de las
+// reservas vivas y libera las que vencieron mientras el proceso estaba caido.
+// Ver programarTimeoutReserva en reserva.service.js — el timeout de cada reserva
+// es un setTimeout propio, no un setInterval que pollea la DB.
+barridoInicialReservas(io).catch((e) =>
+  console.error('[reserva-timeout] barrido de arranque fallo:', e.message)
+);
 
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => {

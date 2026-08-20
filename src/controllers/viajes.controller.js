@@ -8,6 +8,10 @@ import { obtenerAcumulado } from '../services/gps.service.js';
 import { cerrarViaje } from '../services/cierre.service.js';
 import { recalcularEtaInmediato } from '../services/eta-emisor.js';
 import { limpiarViajeActivo } from '../services/cancelacion.service.js';
+import {
+  programarTimeoutReserva,
+  cancelarTimeoutReserva,
+} from '../services/reserva.service.js';
 import { calcularYGuardarRuta, obtenerRutaPlaneada } from '../services/ruta.service.js';
 import { validarTransicion } from '../services/estado-viaje.service.js';
 import { repartirPorZona } from '../services/zona.service.js';
@@ -473,6 +477,13 @@ export async function cancelarViajeConductor(req, res) {
     },
   });
 
+  // El viaje VUELVE a estar reservado (fecha_reserva se reinicia arriba), asi
+  // que le corresponde un timeout nuevo. Con el poller esto salia gratis — hoy
+  // hay que programarlo a mano o el viaje se quedaria reservado para siempre.
+  if (esDeEmpresa) {
+    programarTimeoutReserva(io, id_viaje);
+  }
+
   // Cleanup del estado activo del viaje (corta el emisor de ETA y borra TODAS
   // las keys gps:{id_viaje}:*). Idempotente. Mismo helper que la cancelacion por
   // cliente.
@@ -574,6 +585,11 @@ export async function cancelarViajeCliente(req, res) {
       data: { estado: 'CANCELADO' },
     }),
   ]);
+
+  // Defensivo: hoy ESTADOS_CANCELABLES no incluye RESERVADO_POR_EMPRESA, asi que
+  // aca nunca hay un timer de reserva vivo. Se cancela igual — es idempotente y
+  // gratis — para que el dia que esa lista crezca no quede un timer huerfano.
+  cancelarTimeoutReserva(id_viaje);
 
   // Fuera de la transaccion: cleanup del estado activo. Si estaba en
   // CONDUCTOR_ASIGNADO, esto corta el emisor de ETA y borra las keys GPS. Si

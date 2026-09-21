@@ -3,6 +3,7 @@ import { obtenerAcumulado, limpiarGPS } from './gps.service.js';
 import { generarRemito } from './remito.service.js';
 import { detenerEmisorEta } from './eta-emisor.js';
 import { repartirPorZona } from './zona.service.js';
+import { cancelarAvisoVencimiento } from './vencimiento.service.js';
 
 export async function cerrarViaje(id_viaje, io) {
   const viaje = await prisma.viaje.findUnique({
@@ -69,6 +70,10 @@ export async function cerrarViaje(id_viaje, io) {
   }
 
   detenerEmisorEta(id_viaje);
+  // Defensivo: para llegar a FINALIZADO el viaje paso por iniciarViaje, que ya
+  // cancelo el aviso. Se cancela igual — es idempotente y gratis — con el mismo
+  // criterio que el cancelarTimeoutReserva defensivo de cancelarViajeCliente.
+  cancelarAvisoVencimiento(id_viaje);
   await limpiarGPS(id_viaje);
 
   return { precio_real, desglose, remito_url };

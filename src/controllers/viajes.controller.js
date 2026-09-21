@@ -17,6 +17,11 @@ import { validarTransicion } from '../services/estado-viaje.service.js';
 import { repartirPorZona } from '../services/zona.service.js';
 import { horasAMinutos, calcularDuracionRealMinutos } from '../services/duracion.service.js';
 import {
+  esViajeVencido,
+  programarAvisoVencimiento,
+  cancelarAvisoVencimiento,
+} from '../services/vencimiento.service.js';
+import {
   puedeVerViaje,
   puedeVerViajeDisponible,
   INCLUDE_ACCESO_VIAJE,
@@ -175,11 +180,24 @@ export async function crearViaje(req, res) {
     console.error(`[crearViaje] No se pudo calcular la ruta planeada para viaje ${viaje.id_viaje}:`, err.message);
   }
 
+  // Aviso de vencimiento: un setTimeout propio de ESTE viaje que dispara en su
+  // fecha_programada y, si para entonces el viaje sigue colgado, emite
+  // viaje:vencido. Es el UNICO lugar donde se programa (fuera del barrido de
+  // arranque): fecha_programada no cambia nunca, asi que el aviso no se mueve.
+  programarAvisoVencimiento(io, viaje.id_viaje, viaje.fecha_programada);
+
   if (io) {
     await publicarViajeAConductoresElegibles(io, viaje, req.usuario.id_usuario);
   }
 
-  return res.status(201).json({ ...viaje, ruta_planeada, desglose_estimado: resultado.desglose });
+  return res.status(201).json({
+    ...viaje,
+    ruta_planeada,
+    // Siempre false aca (la fecha tiene que ser futura para poder crear el
+    // viaje). Se devuelve igual para que el contrato sea uniforme.
+    vencido: esViajeVencido(viaje),
+    desglose_estimado: resultado.desglose,
+  });
 }
 
 export async function listarViajesDisponibles(req, res) {
@@ -230,7 +248,12 @@ export async function listarViajesDisponibles(req, res) {
     );
   });
 
-  return res.status(200).json(viajesElegibles);
+  // vencido es siempre false aca: el where de arriba filtra por
+  // fecha_programada > ahora, asi que un viaje vencido nunca entra a esta lista
+  // (decision explicita, ver CLAUDE.md). Se devuelve para uniformar el contrato.
+  return res.status(200).json(
+    viajesElegibles.map((viaje) => ({ ...viaje, vencido: esViajeVencido(viaje) }))
+  );
 }
 
 export async function obtenerViaje(req, res) {
@@ -287,6 +310,8 @@ export async function obtenerViaje(req, res) {
   return res.status(200).json({
     ...viaje,
     duracion_estimada: horasAMinutos(viaje.duracion_estimada_horas),
+    // Calculado en el read, igual que duracion_real: no hay columna.
+    vencido: esViajeVencido(viaje),
     ruta_planeada,
   });
 }
@@ -412,6 +437,11 @@ export async function iniciarViaje(req, res) {
       iniciado_por,
     },
   });
+
+  // El viaje arranco: ya no puede vencer. Es la salida de CONDUCTOR_ASIGNADO
+  // mas facil de olvidar — el update de arriba es plano (el estado se chequeo en
+  // memoria, no en el WHERE) y hasta aca no habia ninguna cancelacion de timers.
+  cancelarAvisoVencimiento(id_viaje);
 
   if (io) {
     io.to('usuario:' + viaje.cliente.id_usuario).emit('viaje:iniciado', {
@@ -590,6 +620,9 @@ export async function cancelarViajeCliente(req, res) {
   // aca nunca hay un timer de reserva vivo. Se cancela igual — es idempotente y
   // gratis — para que el dia que esa lista crezca no quede un timer huerfano.
   cancelarTimeoutReserva(id_viaje);
+
+  // CANCELADO es terminal: el viaje ya no puede vencer.
+  cancelarAvisoVencimiento(id_viaje);
 
   // Fuera de la transaccion: cleanup del estado activo. Si estaba en
   // CONDUCTOR_ASIGNADO, esto corta el emisor de ETA y borra las keys GPS. Si
@@ -846,6 +879,7 @@ export async function listarMisViajes(req, res) {
     viajes.map((viaje) => ({
       ...viaje,
       duracion_real: calcularDuracionRealMinutos(viaje),
+      vencido: esViajeVencido(viaje),
     }))
   );
 }
@@ -901,7 +935,9 @@ export async function listarMisViajesConductor(req, res) {
     orderBy: { creado_en: 'desc' },
   });
 
-  return res.status(200).json(viajes);
+  return res.status(200).json(
+    viajes.map((viaje) => ({ ...viaje, vencido: esViajeVencido(viaje) }))
+  );
 }
 
 // GET /api/viajes/asignados — pestaña "asignados" del conductor: viajes que un
@@ -948,5 +984,9 @@ export async function listarViajesAsignados(req, res) {
     orderBy: { fecha_programada: 'asc' },
   });
 
-  return res.status(200).json(viajes);
+  // Pestaña "asignados" del conductor: es su canal para enterarse de que un
+  // viaje que tiene que arrancar ya paso su hora.
+  return res.status(200).json(
+    viajes.map((viaje) => ({ ...viaje, vencido: esViajeVencido(viaje) }))
+  );
 }

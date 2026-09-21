@@ -19,6 +19,7 @@ MVP: CABA + GBA.
 - Confirmacion de paradas por proximidad (reemplazo del QR) COMPLETA
 - Timeout de reservas por temporizador (se saco el poller que mantenia
   despierta la DB de Neon) COMPLETO
+- Viajes vencidos: flag `vencido` en el read + evento viaje:vencido COMPLETO
 
 ## Stack
 - Node.js 22, ES Modules (NUNCA require()). Async/await siempre.
@@ -357,6 +358,149 @@ Regla sin excepciones, para no mezclar unidades en una misma respuesta:
   del viaje. El nombre lleva la unidad; la regla de minutos aplica a los campos
   derivados.
 
+## Viajes vencidos — src/services/vencimiento.service.js
+
+Un viaje que llega a su fecha_programada sin que nadie lo tome
+(BUSCANDO_CONDUCTOR) o sin que nadie lo inicie (CONDUCTOR_ASIGNADO) queda
+COLGADO. DECISION DE PRODUCTO: NO se auto-cancela y NO cambia de estado — quien
+decide cancelar es el cliente. Lo unico que se hace es que deje de ser
+invisible, por dos canales con jerarquia explicita:
+- `vencido`, el flag calculado en el read. Es la FUENTE DE VERDAD durable: se ve
+  apenas el front carga sus viajes y sobrevive a cualquier caida del proceso.
+- `viaje:vencido`, el evento de socket. Es el aviso EN VIVO y es BEST-EFFORT: si
+  nadie esta conectado en ese instante se pierde. El front NO debe depender solo
+  del evento.
+
+Sin cambios de schema (no se corrio db push) y sin variables de entorno nuevas.
+
+### El flag `vencido`
+- esViajeVencido(viaje) -> bool. Criterio:
+  fecha_programada < ahora Y estado en ESTADOS_VENCIBLES.
+- ESTADOS_VENCIBLES = ['BUSCANDO_CONDUCTOR', 'CONDUCTOR_ASIGNADO']. La MISMA
+  lista la usan el flag y el evento, para que no se puedan desincronizar.
+- Se calcula en el read, no se persiste (mismo criterio que duracion_real).
+- TIRA error si el viaje no trae estado o fecha_programada, igual que
+  calcularDuracionRealMinutos con paradas y puedeVerViaje con sus relaciones: un
+  select al que se le olvido un campo devolveria vencido:false en silencio.
+- Lo devuelven los ONCE endpoints que serializan un viaje: POST /api/viajes,
+  GET /api/viajes/disponibles, GET /api/viajes/:id, GET /api/viajes/mis-viajes,
+  GET /api/viajes/mis-viajes-conductor, GET /api/viajes/asignados,
+  GET /api/empresas/:id/viajes, GET /api/empresas/:id/viajes-disponibles,
+  GET /api/admin/viajes (los DOS return: la rama de cantidad_paradas tambien),
+  GET /api/admin/viajes/:id, y los historiales ANIDADOS de
+  GET /api/admin/usuarios/:id (detalle.cliente.viajes y detalle.conductor.viajes
+  — el lugar mas facil de olvidar). Ninguno necesito tocar su include/select:
+  estado y fecha_programada ya estaban en los once.
+- NO lo llevan las respuestas parciales tipo { mensaje, id_viaje, estado } de
+  reservar / asignar / reasignar / cancelar-* / iniciar / confirmar-parada: no
+  son objetos viaje.
+
+### DECISION: el filtro fecha_programada > ahora NO se toca
+Los tres lugares que filtran el mercado abierto por fecha futura se quedan como
+estan: viajes.controller (GET /api/viajes/disponibles), empresas.controller
+(GET /api/empresas/:id/viajes-disponibles) y sockets/index.js
+(unirseARoomsDisponibles, al conectarse un conductor).
+
+Que un viaje vencido DESAPAREZCA de la oferta a conductores es el comportamiento
+CORRECTO, no un bug. "Dejar de ser invisible" aplica al cliente, al gerente y al
+conductor ya asignado — no al mercado abierto. Consecuencia: en los dos
+endpoints de disponibles `vencido` es siempre false. Se devuelve igual para que
+el contrato sea uniforme, y API.md lo aclara. NO lo "arregles" despues.
+
+### El evento viaje:vencido
+Payload { id_viaje, estado, fecha_programada }, siempre al room personal
+usuario:{id_usuario}. Destinatarios segun el estado al vencer:
+
+| Estado al vencer                | Quienes lo reciben                   |
+|---------------------------------|--------------------------------------|
+| BUSCANDO_CONDUCTOR              | cliente                              |
+| CONDUCTOR_ASIGNADO sin empresa  | cliente + conductor                  |
+| CONDUCTOR_ASIGNADO con empresa  | cliente + conductor + gerente        |
+
+En BUSCANDO_CONDUCTOR no hay conductor, y tampoco gerente: id_empresa se setea
+recien al reservar. OJO: para el conductor el room va por su id_usuario, NO por
+id_conductor (mismo cuidado que viaje:asignado).
+
+El conductor esta en la lista porque en CONDUCTOR_ASIGNADO es el UNICO que puede
+destrabarlo apretando "Iniciar viaje".
+
+### Timers — un aviso por viaje, armado al crearlo
+Mismo patron que los timers de reserva (un setTimeout por viaje, cero pollers,
+barrido al arrancar), con dos diferencias deliberadas.
+
+- programarAvisoVencimiento(io, id_viaje, fechaProgramada) /
+  cancelarAvisoVencimiento(id_viaje), sobre un Map id_viaje → Timeout.
+- Se PROGRAMA en UN SOLO lugar: crearViaje (mas el barrido de arranque). Alcanza
+  con eso porque fecha_programada es INMUTABLE — el unico write en todo src/ es
+  el create de crearViaje, no hay endpoint de reprogramacion. Por eso, a
+  diferencia de las reservas (donde fecha_reserva se reinicia y habia que
+  reprogramar en tres caminos), el aviso no se mueve nunca. Si algun dia se
+  agrega un endpoint de reprogramacion, TIENE que volver a llamar a
+  programarAvisoVencimiento.
+- DIFERENCIA 1 — el clamp no puede disparar de mas. setTimeout desborda arriba
+  de 2^31-1 ms (~24.8 dias). En reservas clampear degrada a "muy tarde" y es
+  inofensivo; aca un viaje programado a mas de 24.8 dias dispararia ANTES de
+  tiempo y emitiria un viaje:vencido FALSO. Por eso el handler, al disparar,
+  RELEE el viaje: si fecha_programada todavia no llego, se RE-ARMA por lo que
+  reste y no emite. El mismo guard cubre un reloj corrido.
+- Esa relectura es tambien la segunda capa de defensa: si el estado ya no esta
+  en ESTADOS_VENCIBLES no se emite nada. Es el equivalente al updateMany
+  condicionado de liberarReserva — un timer que sobrevivio de mas es INOFENSIVO.
+  Reusa INCLUDE_ACCESO_VIAJE (acceso-viaje.service), que ya trae exactamente
+  cliente.id_usuario, conductor.id_usuario y empresa.id_gerente.
+- Disparo UNICO por viaje: despues de emitir, el timer no se re-arma.
+
+### Donde se CANCELA el aviso — y donde NO
+Hay 13 escrituras a la tabla Viaje en todo src/. Solo CUATRO cancelan:
+- iniciarViaje (→ EN_CAMINO_A_ORIGEN). La mas facil de olvidar: es un update
+  plano (el estado se chequea en memoria, no en el WHERE) y hasta ahora no tenia
+  ninguna cancelacion de timers.
+- cancelarViajeCliente (→ CANCELADO), al lado del cancelarTimeoutReserva.
+- cancelarViaje de admin (→ CANCELADO), idem.
+- cerrarViaje (→ FINALIZADO). Defensivo: es inalcanzable sin pasar por
+  iniciarViaje, que ya cancelo. Mismo criterio que el cancelarTimeoutReserva
+  defensivo de cancelarViajeCliente.
+
+Las otras NUEVE no cancelan, y cada una por su razon:
+- aceptar (matching.socket) y asignar → CONDUCTOR_ASIGNADO: sigue siendo
+  vencible.
+- reservar → RESERVADO_POR_EMPRESA: no es vencible, pero el viaje puede VOLVER a
+  BUSCANDO_CONDUCTOR antes de su hora (timeout de la reserva, cancelar-reserva),
+  y ahi el aviso tiene que seguir vivo. Por eso ESTADOS_PRE_INICIO lo incluye.
+- liberarReserva → BUSCANDO_CONDUCTOR, cancelar-conductor (las dos ramas) y
+  ejecutarDesafiliacion → RESERVADO_POR_EMPRESA: siguen pre-inicio.
+- reasignar: no cambia de estado, y el handler relee el conductor al disparar
+  (no lo tiene cacheado), asi que el aviso le llega al conductor correcto.
+- PATCH /:id/estado: validarTransicion hace IMPOSIBLE llegar ahi desde los dos
+  estados vencibles, asi que nunca es una salida.
+
+### Barrido de arranque
+app.js corre barridoInicialVencimientos al lado de barridoInicialReservas: UNA
+consulta (no un poller) de los viajes en ESTADOS_PRE_INICIO con
+fecha_programada FUTURA, y le programa el timer a cada uno por el tiempo
+RESTANTE. Loguea "[viaje-vencido] barrido de arranque: N viajes pre-inicio con
+aviso programado".
+
+- Los viajes cuya hora paso MIENTRAS el proceso estaba caido NO entran en la
+  query y NO se avisan: emitir al arrancar seria tirar el evento al vacio
+  (todavia no hay nadie conectado). Esos los cubre el flag `vencido`.
+- DIFERENCIA 2 — este barrido NO lleva kill-switch tipo
+  RESERVA_BARRIDO_ARRANQUE. Aquel lo necesita porque ESCRIBE en la DB de Neon
+  compartida con produccion (libera reservas reales); este solo LEE y arma
+  timers en memoria del proceso. Un server efimero de test que llegue a emitir
+  viaje:vencido de un viaje real lo emite a sus propios rooms, y como no hay
+  adapter de Redis nadie del lado de :3000 lo recibe.
+- OJO al tocar el texto del log: test-timeout-reserva busca su linea por el
+  prefijo COMPLETO "[reserva-timeout] barrido de arranque" justamente porque
+  ahora hay DOS lineas de "barrido de arranque" en el arranque.
+
+### LIMITACION CONOCIDA — un solo proceso
+La misma que los timers de reserva: el Map vive en la memoria de UNA instancia.
+Con mas de una instancia, una solo conoce los viajes que ella misma creo. Hoy se
+corre una sola. El dia que se escale, esto va a una cola persistente (BullMQ
+sobre el Redis que ya usamos). El barrido de arranque cubre el reinicio, NO el
+multi-instancia.
+
 ## Deteccion de zona (CABA / PROVINCIA / MIXTO)
 
 La zona de un viaje la calcula SIEMPRE el servidor. El campo `zona` del body de
@@ -413,6 +557,7 @@ recorrido con clasificarParada y acumulando por tramo) queda para mas adelante.
 | viaje:asignado  | Room personal del conductor (usuario:{id})     |
 | viaje:reserva_cancelada | Room viaje:{id} (vuelve al mercado)    |
 | viaje:requiere_reasignacion | Room personal del gerente (usuario:{id_gerente}) |
+| viaje:vencido   | Rooms personales del cliente, del conductor asignado y del gerente (usuario:{id_usuario}) |
 
 Nota: viaje:asignado le puede llegar al mismo conductor desde varias
 empresas donde trabaje — no asumir una sola empresa por conductor.
@@ -424,6 +569,11 @@ viaje:reserva_cancelada (ese es "vuelve al mercado abierto"). Payload
 - Desafiliacion de un conductor con viajes CONDUCTOR_ASIGNADO de esa empresa
   (motivo: "conductor_desafiliado").
 - Cancelacion del conductor de un viaje de empresa (motivo: "conductor_cancelo").
+
+viaje:vencido avisa que un viaje llego a su fecha_programada SIN avanzar. El
+viaje no cambia de estado. Payload { id_viaje, estado, fecha_programada }. Es
+BEST-EFFORT: la fuente de verdad es el flag `vencido` del read. Los
+destinatarios dependen del estado — ver "Viajes vencidos".
 
 ## Variables de entorno
 RESERVA_TIMEOUT_MINUTOS=10        (default en codigo si no esta en .env;
@@ -506,6 +656,18 @@ node scripts/stress/test-cierre-exhaustivo.js (cierre + calificacion + remito +
                                             roto meses por no correrse — sin
                                             dotenv para Redis y sin POST
                                             /:id/iniciar tras el boton nuevo)
+node scripts/test-viajes-vencidos.js       (flag vencido + evento viaje:vencido:
+                                            los 3 destinatarios, los negativos
+                                            (iniciado / cancelado antes de su
+                                            hora), RESERVADO_POR_EMPRESA que no
+                                            vence, y el barrido de arranque. NO
+                                            usa el server de :3000 para los
+                                            casos de timer — levanta uno propio
+                                            por caso en 3301-3307 con
+                                            ANTICIPACION_MINIMA_MINUTOS=0.
+                                            Acepta numeros de caso para correr
+                                            solo esos: `... vencidos.js 3 4`,
+                                            util para el protocolo de reversion)
 node scripts/test-timeout-reserva.js       (timers de reserva: vence y republica,
                                             asignar antes del timeout, cancelar
                                             -reserva a mano, y el barrido de
@@ -516,7 +678,7 @@ node scripts/test-timeout-reserva.js       (timers de reserva: vence y republica
 
 scripts/_server-efimero.js es el helper compartido que levanta src/app.js en un
 puerto propio con el env que se le pida. Lo usan el CASO 8 de test-jerarquia
-(puerto 3210) y test-timeout-reserva. test-anticipacion tiene su propia copia
+(puerto 3210), test-timeout-reserva y test-viajes-vencidos. test-anticipacion tiene su propia copia
 inline, anterior a la extraccion. OJO: no hay adapter de Redis en socket.io, o
 sea que un socket conectado a :3000 NO recibe los eventos que emite un server
 efimero — los tests que verifican eventos conectan sus sockets al puerto efimero.

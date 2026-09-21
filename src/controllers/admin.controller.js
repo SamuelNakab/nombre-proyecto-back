@@ -2,6 +2,7 @@ import { z } from 'zod';
 import prisma from '../config/prisma.js';
 import { limpiarViajeActivo } from '../services/cancelacion.service.js';
 import { cancelarTimeoutReserva } from '../services/reserva.service.js';
+import { esViajeVencido, cancelarAvisoVencimiento } from '../services/vencimiento.service.js';
 import { io } from '../sockets/index.js';
 
 // ─── Constantes ──────────────────────────────────────────────────────────────
@@ -68,6 +69,10 @@ const schemaCancelar = z.object({
   motivo: z.string().optional(),
 });
 
+// Agrega el flag calculado a una lista de viajes. Lo usan tanto los listados de
+// viajes como los historiales anidados en el detalle de un usuario.
+const conVencido = (viajes) => viajes.map((v) => ({ ...v, vencido: esViajeVencido(v) }));
+
 // ─── 1. GET /api/admin/usuarios ──────────────────────────────────────────────
 
 export async function listarUsuarios(req, res) {
@@ -129,7 +134,7 @@ export async function obtenerUsuario(req, res) {
         },
       },
     });
-    detalle.cliente = cliente; // .viajes = historial de viajes creados
+    detalle.cliente = cliente && { ...cliente, viajes: conVencido(cliente.viajes) }; // .viajes = historial de viajes creados
   } else if (base.rol === 'CONDUCTOR') {
     const conductor = await prisma.conductor.findUnique({
       where: { id_usuario },
@@ -145,7 +150,7 @@ export async function obtenerUsuario(req, res) {
         ...conductor.vehiculos_propios,
         ...conductor.conductor_vehiculos.map((cv) => cv.vehiculo),
       ];
-      detalle.conductor = { ...conductor, vehiculos };
+      detalle.conductor = { ...conductor, vehiculos, viajes: conVencido(conductor.viajes) };
     } else {
       detalle.conductor = null;
     }
@@ -206,7 +211,12 @@ export async function listarViajes(req, res) {
     });
     const filtrados = todos.filter((v) => v._count.paradas === cantidad_paradas);
     const viajes = filtrados.slice(skip, skip + limit);
-    return res.status(200).json({ total: filtrados.length, page, limit, viajes });
+    return res.status(200).json({
+      total: filtrados.length,
+      page,
+      limit,
+      viajes: conVencido(viajes),
+    });
   }
 
   const [total, viajes] = await Promise.all([
@@ -220,7 +230,12 @@ export async function listarViajes(req, res) {
     }),
   ]);
 
-  return res.status(200).json({ total, page, limit, viajes });
+  return res.status(200).json({
+    total,
+    page,
+    limit,
+    viajes: conVencido(viajes),
+  });
 }
 
 // ─── 4. GET /api/admin/viajes/:id ────────────────────────────────────────────
@@ -258,7 +273,7 @@ export async function obtenerViaje(req, res) {
       ? `${process.env.R2_PUBLIC_URL}/remitos/${viaje.id_viaje}.pdf`
       : null;
 
-  return res.status(200).json({ ...viaje, fee, remito_url });
+  return res.status(200).json({ ...viaje, fee, remito_url, vencido: esViajeVencido(viaje) });
 }
 
 // ─── 5. GET /api/admin/estadisticas ──────────────────────────────────────────
@@ -428,6 +443,10 @@ export async function cancelarViaje(req, res) {
   // RESERVADO_POR_EMPRESA: si el viaje tenia una reserva viva, su timer ya no
   // aplica. Idempotente en los demas estados.
   cancelarTimeoutReserva(id_viaje);
+
+  // CANCELADO es terminal: el viaje ya no puede vencer. El admin cancela desde
+  // cualquier estado no terminal, incluidos los dos vencibles.
+  cancelarAvisoVencimiento(id_viaje);
 
   // Si habia (o hubo) tracking activo — CONDUCTOR_ASIGNADO en adelante — cortar
   // el emisor de ETA y limpiar todas las keys gps:{id_viaje}:*. En

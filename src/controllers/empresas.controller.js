@@ -2,6 +2,7 @@ import { z } from 'zod';
 import prisma from '../config/prisma.js';
 import { generarCodigoUnico, ejecutarDesafiliacion } from '../services/afiliacion.service.js';
 import { conductorEsElegible } from '../services/elegibilidad.service.js';
+import { esViajeVencido } from '../services/vencimiento.service.js';
 
 const TIPOS_CONDICION = ['FRAGIL', 'REFRIGERADO', 'CARGA_PESADA', 'PELIGROSO', 'VOLUMINOSO'];
 
@@ -329,7 +330,12 @@ export async function listarViajesEmpresa(req, res) {
     orderBy: { creado_en: 'desc' },
   });
 
-  return res.status(200).json(viajes);
+  // Canal del gerente para ver que un viaje de su empresa quedo colgado.
+  // Excepcion aparte: duracion_estimada_horas de este endpoint sale en HORAS
+  // porque serializa la fila cruda; vencido es un booleano y no tiene unidad.
+  return res.status(200).json(
+    viajes.map((viaje) => ({ ...viaje, vencido: esViajeVencido(viaje) }))
+  );
 }
 
 // ─── GET /api/empresas/:id/viajes-disponibles ────────────────────────────────
@@ -375,5 +381,9 @@ export async function listarViajesDisponiblesEmpresa(req, res) {
     )
   );
 
-  return res.status(200).json(elegibles);
+  // vencido es siempre false aca, igual que en GET /api/viajes/disponibles: el
+  // where filtra por fecha_programada > ahora. Se devuelve para uniformar.
+  return res.status(200).json(
+    elegibles.map((viaje) => ({ ...viaje, vencido: esViajeVencido(viaje) }))
+  );
 }

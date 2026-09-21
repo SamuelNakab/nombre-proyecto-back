@@ -84,6 +84,20 @@ unitarios y E2E hayan pasado.
   conductores sin ningún vehículo registrado vieran viajes disponibles que
   después no podían aceptar.
 
+- **Unitario — `esViajeVencido(viaje)`**: valida el criterio que marca un
+  viaje como "colgado" (llegó a su `fecha_programada` sin que nadie lo tome
+  o sin que nadie lo inicie), usado tanto por el campo `vencido` que expone
+  la API como por el evento de socket `viaje:vencido`. Cubre: fecha pasada
+  con el viaje en `BUSCANDO_CONDUCTOR` o `CONDUCTOR_ASIGNADO` (vencido),
+  fecha pasada en cualquier otro estado —incluido `RESERVADO_POR_EMPRESA`,
+  que queda deliberadamente afuera— (no vencido), fecha futura (no vencido),
+  y que la fecha se acepte tanto como `Date` como string ISO. También prueba
+  que la función **tire un error explícito** si el viaje no trae `estado` o
+  `fecha_programada`, en vez de devolver `false` en silencio: mismo criterio
+  defensivo que `puedeVerViaje` y `calcularDuracionRealMinutos`, para que un
+  `select` de Prisma al que se le olvidó un campo falle ruidosamente en vez
+  de esconder viajes vencidos sin que nadie se entere.
+
 - **E2E — login y creación de viaje**: simula el flujo crítico completo de
   un cliente real. Autentica contra Firebase con credenciales de un usuario
   de prueba, obtiene el token JWT, y usa ese token para crear un viaje real

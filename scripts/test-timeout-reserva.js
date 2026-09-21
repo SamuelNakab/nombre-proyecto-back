@@ -413,7 +413,11 @@ async function main() {
     );
 
     const log = leerLog();
-    const linea = log.split('\n').find((l) => l.includes('barrido de arranque')) ?? '';
+    // El prefijo completo importa: desde que existe el barrido de avisos de
+    // vencimiento hay DOS lineas de 'barrido de arranque' en el log.
+    const linea =
+      log.split('\n').find((l) => l.includes('[reserva-timeout] barrido de arranque')) ??
+      '';
     const m = linea.match(
       /(\d+) reservas activas, (\d+) liberadas por vencimiento, (\d+) con timer reprogramado/
     );

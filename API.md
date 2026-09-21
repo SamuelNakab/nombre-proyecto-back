@@ -319,6 +319,55 @@ al cerrarlo.
 
 ---
 
+<a id="viajes-vencidos"></a>
+### Viajes vencidos — el campo `vencido`
+
+Un viaje que llega a su `fecha_programada` sin que nadie lo tome
+(`BUSCANDO_CONDUCTOR`) o sin que nadie lo inicie (`CONDUCTOR_ASIGNADO`) queda **colgado**.
+El backend **no lo cancela ni le cambia el estado** — quién decide cancelar es el cliente.
+Lo único que hace es dejar de ocultarlo, por dos canales:
+
+| Canal | Qué es | Garantía |
+|-------|--------|----------|
+| **`vencido`** (campo calculado) | `true` en cada viaje que devuelve la API | **Fuente de verdad.** Se calcula en el read, se ve apenas el front carga sus viajes, sobrevive a cualquier caída del backend |
+| **`viaje:vencido`** (evento socket) | El aviso en tiempo real | **Best-effort.** Si el destinatario no está conectado en ese instante, se pierde |
+
+> **El front no debe depender solo del evento.** Si el usuario tenía la app cerrada cuando
+> el viaje venció, el evento no le llega nunca; el flag sí. Ver
+> [Evento: viaje:vencido](#evento-viajevencido).
+
+**Criterio:** `vencido = fecha_programada < ahora && estado ∈ { BUSCANDO_CONDUCTOR, CONDUCTOR_ASIGNADO }`.
+
+- Se calcula **en el momento de la lectura**; **no** es una columna de la base (mismo criterio
+  que `duracion_real`).
+- Es `false` en cualquier otro estado, aunque la fecha haya pasado: un viaje que ya arrancó,
+  que terminó o que se canceló no está colgado.
+- `RESERVADO_POR_EMPRESA` queda **deliberadamente afuera**: mientras está reservado el viaje lo
+  tiene una empresa, y de eso se ocupa el
+  [timeout de la reserva](#reserva-y-asignación-rol-gerente), que lo devuelve al mercado. Recién
+  ahí puede contar como vencido.
+
+**Dónde aparece:** en **todos** los endpoints que devuelven uno o más viajes —
+[`POST /api/viajes`](#post-apiviajes),
+[`GET /api/viajes/disponibles`](#get-apiviajesdisponibles),
+[`GET /api/viajes/:id`](#get-apiviajesid),
+[`GET /api/viajes/mis-viajes`](#get-apiviajesmis-viajes),
+[`GET /api/viajes/mis-viajes-conductor`](#get-apiviajesmis-viajes-conductor),
+`GET /api/viajes/asignados`,
+[`GET /api/empresas/:id/viajes`](#get-apiempresasidviajes),
+[`GET /api/empresas/:id/viajes-disponibles`](#get-apiempresasidviajes-disponibles),
+[`GET /api/admin/viajes`](#get-apiadminviajes),
+[`GET /api/admin/viajes/:id`](#get-apiadminviajesid) y los historiales de viajes anidados en
+[`GET /api/admin/usuarios/:id`](#get-apiadminusuariosid).
+
+En los dos endpoints de **disponibles** es **siempre `false`**, y eso es a propósito: ambos
+filtran por `fecha_programada > ahora`, así que un viaje vencido no entra en esas listas. **Que
+un viaje vencido desaparezca de la oferta a conductores es el comportamiento buscado**, no un
+bug: "dejar de ser invisible" aplica al cliente, al gerente y al conductor ya asignado, no al
+mercado abierto. El campo se devuelve igual para que el contrato sea uniforme.
+
+---
+
 ### POST /api/viajes/estimar-costo
 
 Calcula el costo estimado de un viaje sin crearlo.
@@ -446,6 +495,7 @@ Las tarifas se calculan automáticamente según la zona y si la `fecha_programad
   "fecha_programada": "2026-07-01T10:00:00.000Z",
   "descripcion": "Carga frágil, llamar al llegar, portón azul",
   "estado": "BUSCANDO_CONDUCTOR",
+  "vencido": false,
   "fecha_inicio": null,
   "puntualidad_inicio": null,
   "precio_estimado": 4500,
@@ -537,6 +587,7 @@ elegible para ningún viaje, tenga o no condiciones requeridas.
     "fecha_programada": "2026-07-01T10:00:00.000Z",
     "descripcion": "Carga frágil, llamar al llegar, portón azul",
     "estado": "BUSCANDO_CONDUCTOR",
+    "vencido": false,
     "paradas": [
       {
         "orden": 1,
@@ -585,6 +636,7 @@ Devuelve todos los viajes del cliente autenticado, del más reciente al más ant
     "precio_estimado": 2500,
     "precio_real": 2610,
     "estado": "FINALIZADO",
+    "vencido": false,
     "fecha_programada": "2026-07-01T10:00:00.000Z",
     "fecha_inicio": "2026-07-01T10:04:00.000Z",
     "puntualidad_inicio": "A_TIEMPO",
@@ -639,6 +691,7 @@ del viaje), del más reciente al más antiguo. Es el equivalente de `mis-viajes`
     "precio_estimado": 2500,
     "precio_real": null,
     "estado": "CONDUCTOR_ASIGNADO",
+    "vencido": false,
     "fecha_programada": "2026-07-01T10:00:00.000Z",
     "descripcion": "Carga frágil, llamar al llegar, portón azul",
     "creado_en": "2026-05-09T12:00:00.000Z",
@@ -709,6 +762,7 @@ rol a nivel de ruta: la validación real es la tabla de arriba.
   "precio_real": null,
   "descripcion": "Carga frágil, llamar al llegar, portón azul",
   "estado": "CONDUCTOR_ASIGNADO",
+  "vencido": false,
   "fecha_programada": "2026-07-01T10:00:00.000Z",
   "fecha_inicio": null,
   "puntualidad_inicio": null,
@@ -1050,6 +1104,58 @@ socket.on('viaje:iniciado', (data) => {
 
 > Se emite al room **personal** del cliente (no al room del viaje): le llega aunque no esté
 > siguiendo el mapa en ese momento.
+
+---
+
+<a id="evento-viajevencido"></a>
+### Evento: viaje:vencido
+
+**Dirección:** servidor → cliente
+
+Se emite cuando un viaje **llega a su `fecha_programada` sin haber avanzado**: sigue en
+`BUSCANDO_CONDUCTOR` (nadie lo tomó) o en `CONDUCTOR_ASIGNADO` (nadie lo inició). El viaje
+**no cambia de estado y no se cancela**: el evento es solo un aviso.
+
+**Destinatarios** — siempre al room **personal** `usuario:{id_usuario}`:
+
+| Estado al vencer | Quiénes lo reciben |
+|------------------|--------------------|
+| `BUSCANDO_CONDUCTOR` | El **cliente**. No hay conductor todavía, y tampoco gerente: `id_empresa` se setea recién al reservar |
+| `CONDUCTOR_ASIGNADO` sin empresa | El **cliente** y el **conductor asignado** |
+| `CONDUCTOR_ASIGNADO` con empresa | El **cliente**, el **conductor asignado** y el **gerente** de la empresa |
+
+El payload es el mismo para los tres; cada front lo interpreta según su rol. El conductor es
+quien puede destrabarlo apretando "Iniciar viaje".
+
+**Payload:**
+```json
+{
+  "id_viaje": 42,
+  "estado": "CONDUCTOR_ASIGNADO",
+  "fecha_programada": "2026-07-01T10:00:00.000Z"
+}
+```
+
+**Escuchar:**
+```js
+socket.on('viaje:vencido', (data) => {
+  console.log(`El viaje ${data.id_viaje} pasó su hora y sigue en ${data.estado}`);
+});
+```
+
+**Cuándo NO se emite:**
+- El viaje **arrancó** antes de su hora (`EN_CAMINO_A_ORIGEN` en adelante).
+- El viaje se **canceló** antes de su hora.
+- El viaje estaba en `RESERVADO_POR_EMPRESA` en ese momento (ver
+  [Viajes vencidos](#viajes-vencidos)).
+- El viaje ya venció y el aviso **ya se emitió una vez**: es un disparo único por viaje, no se
+  repite.
+
+> **Es best-effort.** El aviso se dispara una sola vez, en el momento exacto, y solo lo reciben
+> los sockets conectados en ese instante. Si el usuario tenía la app cerrada, el evento se
+> pierde y **no se reenvía al reconectar**. La fuente de verdad durable es el campo `vencido`
+> del REST — ver [Viajes vencidos](#viajes-vencidos). Un reinicio del backend reprograma los
+> avisos **todavía pendientes**, pero no emite los que vencieron mientras estuvo caído.
 
 ---
 
@@ -2358,7 +2464,7 @@ Detalle de un usuario, con include **condicional según su rol**:
     "vehiculos_propios": [ "..." ],
     "conductor_vehiculos": [ "..." ],
     "viajes": [
-      { "id_viaje": 42, "estado": "FINALIZADO", "precio_real": 1750, "creado_en": "2026-05-09T12:00:00.000Z" }
+      { "id_viaje": 42, "estado": "FINALIZADO", "vencido": false, "precio_real": 1750, "creado_en": "2026-05-09T12:00:00.000Z" }
     ]
   }
 }
@@ -2399,6 +2505,7 @@ Lista paginada de viajes con filtros. Cada viaje trae sus datos básicos + `clie
       "id_viaje": 42,
       "zona": "CABA",
       "estado": "BUSCANDO_CONDUCTOR",
+      "vencido": false,
       "precio_estimado": 2500,
       "precio_real": null,
       "fecha_programada": "2026-07-01T10:00:00.000Z",
@@ -2438,6 +2545,7 @@ real (`precio_real * FEE_PORCENTAJE / 100`, `null` si aún no hay precio), `remi
   "id_viaje": 42,
   "zona": "CABA",
   "estado": "FINALIZADO",
+  "vencido": false,
   "precio_estimado": 2500,
   "precio_real": 1750,
   "fee": 175,
@@ -2690,6 +2798,7 @@ todos los campos que devuelve, sin recortar:
     "fecha_programada": "2026-08-14T01:32:04.298Z",
     "descripcion": null,
     "estado": "CONDUCTOR_ASIGNADO",
+    "vencido": false,
     "fecha_inicio": null,
     "puntualidad_inicio": null,
     "fecha_reserva": "2026-08-13T23:32:06.136Z",
@@ -2813,6 +2922,7 @@ desincronizar.
     "fecha_programada": "2026-07-01T10:00:00.000Z",
     "descripcion": "Carga frágil, llamar al llegar, portón azul",
     "estado": "BUSCANDO_CONDUCTOR",
+    "vencido": false,
     "paradas": [
       {
         "orden": 1,
@@ -2886,7 +2996,7 @@ Body: `{ "codigo_afiliacion": "string" }`. → `201` con la afiliación. `404` c
 
 **POST /api/viajes/:id/cancelar-reserva** — suelta una reserva: `RESERVADO_POR_EMPRESA` → `BUSCANDO_CONDUCTOR`, limpia `id_empresa`/`fecha_reserva`, y **republica el viaje de cero** (re-corre elegibilidad de conductores + gerentes y los suma al room, así un conector que llega después también recibe `viaje:disponible`). Emite `viaje:reserva_cancelada`. **`409 "El viaje ya no esta en RESERVADO_POR_EMPRESA"`** si el viaje salió de ese estado entre la validación y la escritura (ver *Garantía de concurrencia* arriba). También ocurre **automáticamente por timeout** (`RESERVA_TIMEOUT_MINUTOS`, default 10) vía un temporizador por reserva.
 
-**GET /api/viajes/asignados** (rol `CONDUCTOR`) — viajes en `CONDUCTOR_ASIGNADO` donde soy el conductor asignado. Devuelve paradas (origen/destino), `fecha_programada` y el vehículo asignado.
+**GET /api/viajes/asignados** (rol `CONDUCTOR`) — viajes en `CONDUCTOR_ASIGNADO` donde soy el conductor asignado. Devuelve paradas (origen/destino), `fecha_programada`, el vehículo asignado y [`vencido`](#viajes-vencidos) (el viaje pasó su hora y todavía no arrancó).
 
 ---
 
@@ -2898,8 +3008,10 @@ Body: `{ "codigo_afiliacion": "string" }`. → `201` con la afiliación. `404` c
 | `viaje:asignado` | room personal del conductor `usuario:{id_usuario}` | `{ id_viaje, id_empresa, fecha_programada, vehiculo, paradas }` |
 | `viaje:reserva_cancelada` | room `viaje:{id}` (vuelve al mercado) | `{ id_viaje }` |
 | `viaje:requiere_reasignacion` | room personal del gerente `usuario:{id_gerente}` | `{ id_viaje, id_empresa, motivo }` |
+| `viaje:vencido` | rooms personales `usuario:{id_usuario}` del cliente, del conductor asignado y del gerente (según el estado) | `{ id_viaje, estado, fecha_programada }` |
 
 - `viaje:asignado` le puede llegar al mismo conductor desde **varias empresas** — no asumir una sola empresa por conductor.
+- `viaje:vencido` avisa que un viaje llegó a su `fecha_programada` **sin avanzar**. El viaje no cambia de estado. Es **best-effort**: la fuente de verdad es el campo `vencido` del REST. Ver [Evento: viaje:vencido](#evento-viajevencido) y [Viajes vencidos](#viajes-vencidos).
 - `viaje:requiere_reasignacion` avisa que un viaje **ya asignado** volvió a `RESERVADO_POR_EMPRESA` y necesita reasignarse. `motivo`: `"conductor_desafiliado"` o `"conductor_cancelo"`. Es distinto de `viaje:reserva_cancelada` (ese es "vuelve al mercado abierto").
 
 ---
@@ -2912,6 +3024,7 @@ Body: `{ "codigo_afiliacion": "string" }`. → `201` con la afiliación. `404` c
 - En el viaje: `id_conductor`/`id_vehiculo` son `null` hasta que se asigna (por aceptación o por el gerente). `id_empresa` y `fecha_reserva` se setean cuando un gerente **reserva** el viaje (`RESERVADO_POR_EMPRESA`), antes de que haya conductor. `iniciado_por` (`"CONDUCTOR"`/`"GERENTE"`) se setea al iniciar.
 - El campo `vehiculo` en `viaje:conductor_asignado` siempre es un objeto no nulo — si el conductor no tiene vehículo elegible el servidor emite `error` antes de asignar el viaje (detalle en [el evento](#evento-viajeconductor_asignado)). En cambio el `vehiculo` de `GET /api/viajes/:id` **sí** puede ser `null`: ahí el viaje puede todavía no tener conductor.
 - **Unidades de tiempo:** todo campo `duracion_*` sin sufijo va en **minutos enteros** (`duracion_real`, `duracion_estimada`); todo campo `tiempo_*` y todo `*_horas` van en **horas float** (`tiempo_horas`, `tiempo_capital`, `duracion_estimada_horas`). Ver [Unidades de duración](#unidades-de-duracion).
+- **`vencido`**: booleano calculado **en el read** (nunca se persiste) que marca los viajes que pasaron su `fecha_programada` sin avanzar. Lo devuelven todos los endpoints que serializan un viaje. El evento `viaje:vencido` es el aviso en vivo y es best-effort; **el flag es la fuente de verdad**. Ver [Viajes vencidos](#viajes-vencidos).
 - Estados del viaje: `BUSCANDO_CONDUCTOR`, `RESERVADO_POR_EMPRESA`, `CONDUCTOR_ASIGNADO`, `EN_CAMINO_A_ORIGEN`, `CARGANDO`, `EN_RUTA`, `DESCARGANDO`, `FINALIZADO`, `CANCELADO` (ver [Máquina de estados](#maquina-de-estados))
 - **`qr_token` en las paradas: campo muerto, ignorarlo.** Las respuestas que serializan la fila
   cruda de la parada todavía lo incluyen, pero desde que la confirmación pasó a ser por

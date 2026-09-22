@@ -4,8 +4,16 @@ import { generarRemito } from './remito.service.js';
 import { detenerEmisorEta } from './eta-emisor.js';
 import { repartirPorZona } from './zona.service.js';
 import { cancelarAvisoVencimiento } from './vencimiento.service.js';
+import {
+  registrarCambioEstado,
+  INCLUDE_HISTORIAL,
+} from './historial-estado.service.js';
+import { calcularMetricasViaje } from './duracion.service.js';
 
-export async function cerrarViaje(id_viaje, io) {
+// `actor` = { id_usuario, origen } de quien disparo el cierre. cerrarViaje no
+// puede saberlo por su cuenta: lo recibe de confirmarParada, que es su unico
+// caller (el conductor que confirma la ultima parada).
+export async function cerrarViaje(id_viaje, io, actor = {}) {
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },
     select: {
@@ -47,7 +55,34 @@ export async function cerrarViaje(id_viaje, io) {
     },
   });
 
+  // SITIO 11/12 del historial. Va ANTES de calcular las metricas: la fila
+  // FINALIZADO es justamente el cierre de la etapa de descarga, asi que sin
+  // ella duracion_descarga saldria null en el evento que emitimos abajo.
+  await registrarCambioEstado({
+    id_viaje,
+    estado: 'FINALIZADO',
+    id_usuario: actor.id_usuario ?? null,
+    origen: actor.origen ?? null,
+  });
+
   const remito_url = await generarRemito(id_viaje);
+
+  // Relectura: el select de arriba no trae ni el historial ni los escalares que
+  // necesitan las metricas. Es una query extra, una sola vez por viaje, en el
+  // unico momento en que el cuadro completo (aproximacion, carga, descarga,
+  // duracion real y puntualidad) existe entero.
+  const viajeCompleto = await prisma.viaje.findUnique({
+    where: { id_viaje },
+    select: {
+      estado: true,
+      fecha_programada: true,
+      fecha_inicio: true,
+      fecha_llegada_origen: true,
+      paradas: { select: { fecha_entrega: true } },
+      ...INCLUDE_HISTORIAL,
+    },
+  });
+  const metricas = calcularMetricasViaje(viajeCompleto);
 
   const desglose = {
     precio_por_tiempo,
@@ -61,11 +96,14 @@ export async function cerrarViaje(id_viaje, io) {
   };
 
   if (io) {
+    // Canal 6/6 de las metricas por etapa. Van en el MISMO evento que ya
+    // llevaba tiempo_capital y distancia_provincia — no se duplica el evento.
     io.to(`viaje:${id_viaje}`).emit('viaje:finalizado', {
       id_viaje,
       precio_real,
       desglose,
       remito_url,
+      ...metricas,
     });
   }
 
@@ -76,5 +114,5 @@ export async function cerrarViaje(id_viaje, io) {
   cancelarAvisoVencimiento(id_viaje);
   await limpiarGPS(id_viaje);
 
-  return { precio_real, desglose, remito_url };
+  return { precio_real, desglose, remito_url, ...metricas };
 }

@@ -1,5 +1,6 @@
 import prisma from '../config/prisma.js';
 import { obtenerRutaPlaneada } from '../services/ruta.service.js';
+import { registrarCambioEstado } from '../services/historial-estado.service.js';
 
 export function manejarAceptarViaje(socket, io) {
   socket.on('viaje:aceptar', async (payload) => {
@@ -149,6 +150,15 @@ export function manejarAceptarViaje(socket, io) {
       }
 
       // count === 1 → este conductor gano. Continua el flujo de asignacion.
+
+      // SITIO 2/12 del historial. Va DESPUES del count === 0: solo el ganador
+      // cambio el estado, el perdedor no tiene nada que registrar.
+      await registrarCambioEstado({
+        id_viaje,
+        estado: 'CONDUCTOR_ASIGNADO',
+        id_usuario: socket.data.usuario.id_usuario,
+        origen: 'CONDUCTOR',
+      });
 
       // Ruta planeada (calculada al crear el viaje) para que el front la dibuje
       // apenas se asigna el conductor. Mismo formato [[lng, lat], ...].

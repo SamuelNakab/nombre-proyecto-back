@@ -20,6 +20,8 @@ MVP: CABA + GBA.
 - Timeout de reservas por temporizador (se saco el poller que mantenia
   despierta la DB de Neon) COMPLETO
 - Viajes vencidos: flag `vencido` en el read + evento viaje:vencido COMPLETO
+- Historial de estados del viaje, metricas por etapa (tiempo de peon),
+  puntualidad medida en la LLEGADA al origen y guard atomico en iniciar COMPLETO
 
 ## Stack
 - Node.js 22, ES Modules (NUNCA require()). Async/await siempre.
@@ -49,6 +51,9 @@ que tira error si la transicion no esta permitida. La usan:
 - Todos los endpoints de la estructura jerarquica que cambian estado.
 PENDIENTE: matching.service, cierre.service y cancelacion.service todavia
 setean un estado fijo directo, sin validarTransicion. Se migran despues.
+OJO: esos caminos SI registran historial de estados — justamente por eso el
+historial NO se centralizo dentro de validarTransicion, que no los ve. Ver
+"Historial de estados".
 
 Transiciones validas:
 | Desde                  | Hacia                    | Quien / trigger                          |
@@ -334,7 +339,8 @@ Regla sin excepciones, para no mezclar unidades en una misma respuesta:
 - En la BASE y en el calculo de precio, el tiempo va en HORAS (float):
   Viaje.duracion_estimada_horas, desglose.tiempo_horas, tiempo_capital.
 - En la API, toda duracion se expone en MINUTOS (entero redondeado):
-  duracion_estimada y duracion_real.
+  duracion_estimada, duracion_real, duracion_carga, duracion_descarga y
+  duracion_aproximacion_origen.
 - Nomenclatura: `duracion_*` sin sufijo = minutos enteros. `tiempo_*` y
   `*_horas` = horas float.
 
@@ -346,17 +352,209 @@ Regla sin excepciones, para no mezclar unidades en una misma respuesta:
   creacion y no habia forma de recuperarlo (en PROVINCIA tarifa_hora es null y
   en MIXTO el precio mezcla los dos ejes, asi que NO es derivable del precio).
 - duracion_real: NO hay columna, se calcula en el read con
-  calcularDuracionRealMinutos(viaje) = max(paradas.fecha_entrega) − fecha_inicio.
+  calcularDuracionRealMinutos(viaje) = max(paradas.fecha_entrega) − fecha de la
+  fila EN_RUTA del historial.
+  CAMBIO DE SEMANTICA: antes se medida desde fecha_inicio, que es cuando el
+  conductor arranca HACIA el origen, antes de cargar. duracion_estimada solo
+  suma los tramos de manejo entre paradas, asi que los dos numeros median cosas
+  distintas y no se podian comparar. Ahora se mide desde la SALIDA DEL ORIGEN
+  (la transicion CARGANDO -> EN_RUTA).
   Se usa max() y NO la parada de mayor `orden`: nada garantiza que las paradas
   se confirmen en orden (no se valida el orden de confirmacion). null si el
-  viaje no esta FINALIZADO o no tiene fecha_inicio.
-- Lo consumen: GET /api/viajes/mis-viajes (duracion_real) y GET /api/viajes/:id
-  (duracion_estimada). El detalle ademas incluye el vehiculo asignado (null
-  mientras no hay conductor).
+  viaje no esta FINALIZADO, o si no tiene fila EN_RUTA — que es el caso de TODOS
+  los viajes anteriores a este cambio. Devolver el numero viejo seria devolver
+  algo que ya no significa lo mismo.
+- duracion_carga = EN_RUTA − CARGANDO, y duracion_descarga = FINALIZADO −
+  DESCARGANDO. Son las dos mitades del "tiempo de peon". null si la transicion
+  no ocurrio.
+- duracion_aproximacion_origen = fecha_llegada_origen − fecha_inicio. Es el
+  tramo que antes quedaba metido adentro de duracion_real; se expone aparte para
+  no perder el dato. NO depende del historial: le alcanzan dos escalares.
+- calcularMetricasViaje(viaje) devuelve las CINCO juntas (las cuatro duraciones
+  + puntualidad_inicio). Existe para que los seis canales que las exponen no
+  repitan el mismo bloque y no se puedan desincronizar.
+- Los consumen los SEIS canales: GET /api/viajes/:id, GET /api/viajes/mis-viajes,
+  GET /api/viajes/mis-viajes-conductor, GET /api/admin/viajes/:id,
+  GET /api/empresas/:id/viajes y el evento viaje:finalizado. El detalle ademas
+  incluye duracion_estimada y el vehiculo asignado (null si no hay conductor).
 - Excepcion documentada: GET /api/empresas/:id/viajes devuelve
   duracion_estimada_horas en HORAS, porque ese endpoint serializa la fila cruda
   del viaje. El nombre lleva la unidad; la regla de minutos aplica a los campos
   derivados.
+
+## Historial de estados — src/services/historial-estado.service.js
+
+Tabla `historial_estado_viaje` (modelo HistorialEstadoViaje): UNA fila por CADA
+cambio de estado, con id_viaje, estado, fecha, id_usuario y origen
+(CLIENTE | CONDUCTOR | GERENTE | ADMIN | SISTEMA). Es aditiva; la back-relation
+en Viaje NO agrega columna a la tabla viajes. Sin FK a Usuario a proposito:
+evita tocar el modelo Usuario y evita una constraint que trabe borrados.
+
+De estas filas salen duracion_carga, duracion_descarga y duracion_real.
+
+### POR QUE NO se centralizo en validarTransicion
+Es la opcion comoda y es una trampa:
+- Solo 6 de los 12 sitios la llaman. Quedan afuera matching.socket (aceptar),
+  cierre.service, iniciarViaje, cancelarViajeCliente y el cancelar de admin —
+  los tres ultimos ni siquiera estaban en la lista de pendientes de este archivo.
+  El historial quedaria con agujeros SILENCIOSOS.
+- Corre ANTES de la escritura, y la escritura puede no ocurrir: los updateMany
+  condicionados devuelven count === 0 -> 409. Registrarian transiciones que
+  nunca pasaron.
+- Ni siquiera sabe de que viaje habla: su firma es (estadoActual, destino).
+
+Tampoco se uso una extension de Prisma (`$extends` sobre viaje.update): es el
+unico mecanismo del que ningun caller se puede olvidar, pero no conoce al actor
+(el timer y el barrido no tienen request), updateMany devuelve solo { count }, y
+crearViaje ni pasa estado en el data (sale del @default).
+
+Se escribe en CADA caller. Lo que reemplaza a la centralizacion es esta tabla +
+el CASO 1 de test-historial-estados.js, que recorre un flujo completo y exige
+una fila por transicion.
+
+### Los 12 sitios que cambian estado
+Hay 13 escrituras a la tabla Viaje en src/; 12 cambian estado. reasignarViaje es
+la excepcion: escribe el viaje pero va de CONDUCTOR_ASIGNADO a
+CONDUCTOR_ASIGNADO, asi que NO genera fila.
+
+| #  | Funcion                 | Archivo                   | Transicion                                    | origen            |
+|----|-------------------------|---------------------------|-----------------------------------------------|-------------------|
+| 1  | crearViaje              | viajes.controller.js      | — -> BUSCANDO_CONDUCTOR (via @default)        | CLIENTE           |
+| 2  | manejarAceptarViaje     | matching.socket.js        | BUSCANDO -> CONDUCTOR_ASIGNADO                | CONDUCTOR         |
+| 3  | cambiarEstado           | viajes.controller.js      | -> CARGANDO / EN_RUTA / DESCARGANDO           | CONDUCTOR         |
+| 4  | iniciarViaje            | viajes.controller.js      | CONDUCTOR_ASIGNADO -> EN_CAMINO_A_ORIGEN      | CONDUCTOR/GERENTE |
+| 5  | cancelarViajeConductor  | viajes.controller.js      | -> RESERVADO_POR_EMPRESA o BUSCANDO_CONDUCTOR | CONDUCTOR         |
+| 6  | cancelarViajeCliente    | viajes.controller.js      | -> CANCELADO                                  | CLIENTE           |
+| 7  | cancelarViaje (admin)   | admin.controller.js       | -> CANCELADO                                  | ADMIN             |
+| 8  | reservarViaje           | reserva.controller.js     | BUSCANDO -> RESERVADO_POR_EMPRESA             | GERENTE           |
+| 9  | asignarViaje            | reserva.controller.js     | RESERVADO -> CONDUCTOR_ASIGNADO               | GERENTE           |
+| 10 | liberarReserva          | reserva.service.js        | RESERVADO -> BUSCANDO_CONDUCTOR               | GERENTE o SISTEMA |
+| 11 | cerrarViaje             | cierre.service.js         | DESCARGANDO -> FINALIZADO                     | CONDUCTOR         |
+| 12 | ejecutarDesafiliacion   | afiliacion.service.js     | CONDUCTOR_ASIGNADO -> RESERVADO_POR_EMPRESA   | GERENTE o CONDUCTOR |
+| —  | reasignarViaje          | reserva.controller.js     | SIN cambio de estado -> SIN fila              | —                 |
+
+Tres de ellos no conocen al actor y lo reciben por parametro:
+- liberarReserva(io, id_viaje, estadoActual, actor): gerente en cancelar-reserva,
+  SISTEMA en el timer y en el barrido de arranque.
+- cerrarViaje(id_viaje, io, actor): el conductor que confirma la ultima parada.
+- ejecutarDesafiliacion(id_conductor, id_empresa, actor): GERENTE si lo echa la
+  empresa, CONDUCTOR si se va solo.
+
+### Reglas de llamada
+- Siempre DESPUES de que la escritura del estado haya tenido exito. En los
+  updateMany condicionados, recien despues de verificar count > 0: si matcheo 0
+  filas no hubo cambio y no hay nada que registrar.
+- Siempre FUERA de la `$transaction` (sitios 6, 7 y 12). Adentro, un fallo del
+  historial haria rollback del cambio de estado.
+
+### Si falla el insert, el cambio de estado ocurre IGUAL
+registrarCambioEstado NUNCA tira: todo el cuerpo va en try/catch, loguea
+"[historial-estado] no se pudo registrar ..." y devuelve false. Como no puede
+tirar, ninguno de los 12 callers que la await-ean se puede romper por un fallo
+del historial. Preferimos un historial con un hueco antes que un viaje que no se
+puede cancelar porque la tabla de auditoria esta caida. Cubierto por el CASO 5
+de test-historial-estados.js.
+
+### fechaDeEstado y el guard defensivo
+fechaDeEstado(viaje, estado) devuelve la PRIMERA aparicion del estado, o null.
+TIRA si el viaje no viene con historial_estados incluido (INCLUDE_HISTORIAL),
+mismo idiom que esViajeVencido y puedeVerViaje: un select al que se le olvido el
+include devolveria null en silencio y todas las metricas por etapa saldrian
+vacias sin que nadie se entere.
+
+INCLUDE_HISTORIAL ordena por [fecha asc, id_historial asc]. El desempate por
+id_historial no es decorativo: dos filas del mismo milisegundo ordenarian
+ambiguo solo por fecha.
+
+### Viajes anteriores al cambio
+Los 845 viajes que ya existian no tienen ni una fila, y NO hay backfill: un
+numero con la definicion vieja es peor que null. Los 159 FINALIZADO devuelven
+duracion_real / duracion_carga / duracion_descarga en null para siempre. Los que
+estaban a mitad de viaje se quedan con lo que alcancen a registrar de ahi en
+adelante (p. ej. uno que estaba en EN_RUTA SI consigue duracion_descarga, porque
+sus dos transiciones ocurren despues; pero no duracion_real, porque su fila
+EN_RUTA ya no se va a escribir).
+
+## Llegada al origen y puntualidad — src/services/puntualidad.service.js
+
+### La confirmacion de la primera parada NO sirve como señal de llegada
+confirmarParada exige estado EN_RUTA o DESCARGANDO. La parada #1 ES el origen
+(orden 1; la ruta va de la primera a la ultima), asi que confirmarla es
+estructuralmente imposible en EN_CAMINO_A_ORIGEN o CARGANDO: recien se puede
+confirmar DESPUES de cargar y salir. Esta validada por proximidad, si, pero
+llega tarde por construccion. NO existe como señal de llegada.
+
+### La señal que SI existe: el primer ping GPS dentro del radio
+gps.socket solo rechaza pings en BUSCANDO_CONDUCTOR y CONDUCTOR_ASIGNADO, o sea
+que ACEPTA pings en EN_CAMINO_A_ORIGEN y ya trae viaje.paradas en el mismo
+findUnique. Se toma el PRIMER ping dentro de RADIO_CONFIRMACION_METROS de la
+parada de orden 1 mientras el viaje sigue yendo hacia alla, y se guarda en
+Viaje.fecha_llegada_origen.
+
+- Hora del SERVIDOR, no el timestamp del ping: el ping lo manda el celular y es
+  falsificable, y esto alimenta una metrica de desempeño del conductor.
+  confirmarParada usa hora de servidor por lo mismo.
+- DOS guards redundantes a proposito: el chequeo en memoria
+  (fecha_llegada_origen === null) y el WHERE del updateMany. Verificado
+  quitandolos: sacando CUALQUIERA de los dos el test sigue verde (el otro
+  alcanza); sacando LOS DOS se pone rojo. El del WHERE es el que cubre la
+  carrera entre dos pings simultaneos.
+- NO es un estado nuevo ni una fila del historial: es un evento de GPS, no una
+  transicion formal.
+- RESPALDO de ultimo recurso: si el viaje llega a CARGANDO sin que ningun ping
+  haya registrado la llegada (sin señal, GPS apagado), cambiarEstado la rellena
+  con ese instante. Es la señal peor — el conductor marca CARGANDO cuando
+  EMPIEZA A CARGAR, no cuando llega, asi que una demora del cliente en la carga
+  lo perjudica — pero es mejor que no tener nada.
+- distanciaMetros vive en parada.service.js y la usan confirmarParada Y la
+  deteccion de llegada: es la MISMA funcion, no se escribio una nueva.
+  RADIO_CONFIRMACION_METROS se usa en esos DOS lugares y en ninguno mas;
+  verificarParadaSospechosa comparte la funcion pero mantiene su propio 150m,
+  para que los dos radios puedan cambiar por separado.
+
+### Por que esta señal SI necesito columna nueva
+Es la unica excepcion a "se calcula en el read". duracion_real y vencido se
+derivan de timestamps ya persistidos para siempre (fecha_inicio,
+Parada.fecha_entrega). El GPS es EFIMERO: vive en Redis y limpiarGPS lo borra al
+cerrar el viaje. Si la llegada no se persiste en el instante en que ocurre, se
+pierde para siempre. La columna es aditiva y nullable, mismo patron seguro que
+duracion_estimada_horas y fecha_reserva.
+
+### CUIDADO: hay DOS cosas distintas llamadas puntualidad_inicio
+- La COLUMNA Viaje.puntualidad_inicio esta MUERTA. Nadie la escribe ni la lee.
+  Sus 254 valores viejos se calcularon midiendo la SALIDA hacia el origen y no
+  son comparables con nada. Queda en el schema por el mismo motivo que
+  Parada.qr_token: la DB de Neon esta compartida con produccion y dropear
+  columnas ahi es destructivo. Se limpia cuando se separen las DBs.
+- El CAMPO puntualidad_inicio de las respuestas de la API es OTRA COSA: se
+  calcula en el read con calcularPuntualidadInicio(viaje), midiendo la LLEGADA
+  al origen contra fecha_programada, con los mismos umbrales de siempre
+  (PUNTUALIDAD_TARDE_MINUTOS, PUNTUALIDAD_MUY_TARDE_MINUTOS). Si
+  fecha_llegada_origen es null devuelve null, SIN IMPORTAR lo que diga la
+  columna vieja.
+
+No confundirlas. Como el campo calculado tiene que pisar a la columna muerta,
+se aplica en los DIEZ endpoints que spreadean la fila cruda del viaje, siempre
+DESPUES del spread — no solo en los seis canales de las metricas. Sin eso, el
+admin veria A_TIEMPO en la lista y null en el detalle del MISMO viaje.
+mis-viajes-conductor y asignados usan select explicito, asi que ahi la columna
+muerta nunca se filtro. Solo necesita dos escalares, por eso no requiere include.
+
+### iniciarViaje ya no calcula puntualidad
+Su trabajo se redujo a validar la ventana, setear fecha_inicio e iniciado_por,
+cancelar el aviso de vencimiento y emitir. El evento viaje:iniciado y la
+respuesta del endpoint ya NO llevan puntualidad_inicio.
+
+### GUARD ATOMICO en iniciarViaje
+Era un update plano sobre la lectura previa: el estado se chequeaba en memoria y
+no en el WHERE. Como el endpoint autoriza al conductor asignado Y al gerente de
+la empresa, dos POST concurrentes devolvian los DOS 200 y fecha_inicio /
+iniciado_por quedaban last-write-wins. Ahora es un updateMany con
+where { id_viaje, estado: 'CONDUCTOR_ASIGNADO' }; count === 0 -> 409.
+El chequeo en memoria se CONSERVA: sigue dando el 400 descriptivo de siempre en
+el caso secuencial (doble inicio normal), y el 409 queda para la carrera real.
+Cubierto por el CASO 3 de test-historial-estados.js, verificado revirtiendo el
+guard: sin el, el caso se pone en rojo con ganadores=2.
 
 ## Viajes vencidos — src/services/vencimiento.service.js
 
@@ -589,7 +787,21 @@ RESERVA_BARRIDO_ARRANQUE=1        (SOLO para tests: =0 desactiva el barrido de
                                    segundos, incluidas las reales. En
                                    produccion NO se setea nunca)
 RADIO_CONFIRMACION_METROS=50      (default en codigo si no esta en .env;
-                                   antes el radio estaba fijo en 200)
+                                   antes el radio estaba fijo en 200. Se usa en
+                                   DOS lugares y en ninguno mas: confirmar-parada
+                                   y la deteccion de llegada al origen)
+
+VENTANA_INICIO_MINUTOS            (default 30 EN CODIGO, pero .env y
+                                   .env.example locales estan en 120. OJO: los
+                                   tests no pueden asumir el default —
+                                   test-iniciar-viaje lo LEE del entorno, porque
+                                   con un valor fijo su CASO 2 ("demasiado
+                                   temprano") daba 200 sin que hubiera bug)
+
+PUNTUALIDAD_TARDE_MINUTOS=30      (mismos umbrales de siempre, pero ahora se
+PUNTUALIDAD_MUY_TARDE_MINUTOS=120  aplican al retraso de la LLEGADA al origen,
+                                   no al de la salida. Se leen en CADA lectura,
+                                   no se cachean)
 ANTICIPACION_MINIMA_MINUTOS=60    (default en codigo si no esta en .env;
                                    antes estaba hardcodeado en 1 hora dentro
                                    del .refine de fecha_programada)
@@ -668,6 +880,17 @@ node scripts/test-viajes-vencidos.js       (flag vencido + evento viaje:vencido:
                                             Acepta numeros de caso para correr
                                             solo esos: `... vencidos.js 3 4`,
                                             util para el protocolo de reversion)
+node scripts/test-historial-estados.js     (historial de estados: una fila por
+                                            transicion, puntualidad medida en la
+                                            llegada, doble iniciar concurrente,
+                                            llegada por GPS y su respaldo, el
+                                            fallo del historial que no tumba el
+                                            cambio de estado, viajes sin
+                                            historial y los 6 canales. NO usa el
+                                            server de :3000 — levanta uno propio
+                                            por caso en 3401-3407 con
+                                            ANTICIPACION_MINIMA_MINUTOS=0.
+                                            Acepta numeros de caso: `... 3`)
 node scripts/test-timeout-reserva.js       (timers de reserva: vence y republica,
                                             asignar antes del timeout, cancelar
                                             -reserva a mano, y el barrido de

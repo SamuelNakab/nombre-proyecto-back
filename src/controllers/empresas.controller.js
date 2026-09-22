@@ -3,6 +3,9 @@ import prisma from '../config/prisma.js';
 import { generarCodigoUnico, ejecutarDesafiliacion } from '../services/afiliacion.service.js';
 import { conductorEsElegible } from '../services/elegibilidad.service.js';
 import { esViajeVencido } from '../services/vencimiento.service.js';
+import { calcularPuntualidadInicio } from '../services/puntualidad.service.js';
+import { calcularMetricasViaje } from '../services/duracion.service.js';
+import { INCLUDE_HISTORIAL } from '../services/historial-estado.service.js';
 
 const TIPOS_CONDICION = ['FRAGIL', 'REFRIGERADO', 'CARGA_PESADA', 'PELIGROSO', 'VOLUMINOSO'];
 
@@ -217,7 +220,11 @@ export async function desafiliarConductor(req, res) {
     return res.status(404).json({ error: 'El conductor no esta afiliado a esta empresa' });
   }
 
-  const resultado = await ejecutarDesafiliacion(id_conductor, id_empresa);
+  // El gerente echa al conductor: el actor del historial es el gerente.
+  const resultado = await ejecutarDesafiliacion(id_conductor, id_empresa, {
+    id_usuario: req.usuario.id_usuario,
+    origen: 'GERENTE',
+  });
   if (!resultado.ok) {
     return res.status(400).json({ error: resultado.error });
   }
@@ -326,6 +333,9 @@ export async function listarViajesEmpresa(req, res) {
       vehiculo: { include: { condiciones: true } },
       cliente: { include: { usuario: { select: { nombre: true, apellido: true, telefono: true } } } },
       conductor: { include: { usuario: { select: { nombre: true, apellido: true, telefono: true } } } },
+      // Canal 5/6 de las metricas por etapa. Es el canal donde MAS importan:
+      // el tiempo de peon de la flota es la metrica operativa que la PyME mira.
+      ...INCLUDE_HISTORIAL,
     },
     orderBy: { creado_en: 'desc' },
   });
@@ -333,8 +343,13 @@ export async function listarViajesEmpresa(req, res) {
   // Canal del gerente para ver que un viaje de su empresa quedo colgado.
   // Excepcion aparte: duracion_estimada_horas de este endpoint sale en HORAS
   // porque serializa la fila cruda; vencido es un booleano y no tiene unidad.
+  // Las duraciones calculadas SI salen en minutos, como en toda la API.
   return res.status(200).json(
-    viajes.map((viaje) => ({ ...viaje, vencido: esViajeVencido(viaje) }))
+    viajes.map((viaje) => ({
+      ...viaje,
+      ...calcularMetricasViaje(viaje),
+      vencido: esViajeVencido(viaje),
+    }))
   );
 }
 
@@ -383,7 +398,14 @@ export async function listarViajesDisponiblesEmpresa(req, res) {
 
   // vencido es siempre false aca, igual que en GET /api/viajes/disponibles: el
   // where filtra por fecha_programada > ahora. Se devuelve para uniformar.
+  //
+  // puntualidad_inicio es siempre null aca (viajes sin conductor), pero se
+  // calcula igual para pisar a la columna MUERTA que viene en el spread.
   return res.status(200).json(
-    elegibles.map((viaje) => ({ ...viaje, vencido: esViajeVencido(viaje) }))
+    elegibles.map((viaje) => ({
+      ...viaje,
+      puntualidad_inicio: calcularPuntualidadInicio(viaje),
+      vencido: esViajeVencido(viaje),
+    }))
   );
 }

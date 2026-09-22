@@ -1,5 +1,4 @@
 import { z } from 'zod';
-import * as turf from '@turf/turf';
 import prisma from '../config/prisma.js';
 import { estimarCosto as estimarCostoService } from '../services/costo.service.js';
 import { conductorEsElegible } from '../services/elegibilidad.service.js';
@@ -15,7 +14,13 @@ import {
 import { calcularYGuardarRuta, obtenerRutaPlaneada } from '../services/ruta.service.js';
 import { validarTransicion } from '../services/estado-viaje.service.js';
 import { repartirPorZona } from '../services/zona.service.js';
-import { horasAMinutos, calcularDuracionRealMinutos } from '../services/duracion.service.js';
+import { horasAMinutos, calcularMetricasViaje } from '../services/duracion.service.js';
+import { calcularPuntualidadInicio } from '../services/puntualidad.service.js';
+import {
+  registrarCambioEstado,
+  INCLUDE_HISTORIAL,
+} from '../services/historial-estado.service.js';
+import { distanciaMetros } from '../services/parada.service.js';
 import {
   esViajeVencido,
   programarAvisoVencimiento,
@@ -170,6 +175,16 @@ export async function crearViaje(req, res) {
     },
   });
 
+  // SITIO 1/12 del historial. El estado no va en el `data` del create: sale del
+  // @default(BUSCANDO_CONDUCTOR) del schema. Es igual de real que los demas y
+  // es el unico origen de la primera fila de todo viaje.
+  await registrarCambioEstado({
+    id_viaje: viaje.id_viaje,
+    estado: viaje.estado,
+    id_usuario: req.usuario.id_usuario,
+    origen: 'CLIENTE',
+  });
+
   // Calcular la ruta planeada ahora, al crear el viaje. Si Google Maps falla,
   // no bloqueamos la creacion: ruta_planeada queda null y se reintenta en el
   // primer ping GPS (fallback en gps.socket.js).
@@ -193,6 +208,9 @@ export async function crearViaje(req, res) {
   return res.status(201).json({
     ...viaje,
     ruta_planeada,
+    // Siempre null aca (el viaje ni arranco). Pisa a la columna MUERTA del
+    // mismo nombre que viene en el spread — ver puntualidad.service.js.
+    puntualidad_inicio: calcularPuntualidadInicio(viaje),
     // Siempre false aca (la fecha tiene que ser futura para poder crear el
     // viaje). Se devuelve igual para que el contrato sea uniforme.
     vencido: esViajeVencido(viaje),
@@ -251,8 +269,15 @@ export async function listarViajesDisponibles(req, res) {
   // vencido es siempre false aca: el where de arriba filtra por
   // fecha_programada > ahora, asi que un viaje vencido nunca entra a esta lista
   // (decision explicita, ver CLAUDE.md). Se devuelve para uniformar el contrato.
+  //
+  // puntualidad_inicio es siempre null aca (son viajes sin conductor), pero se
+  // calcula igual para pisar a la columna MUERTA que viene en el spread.
   return res.status(200).json(
-    viajesElegibles.map((viaje) => ({ ...viaje, vencido: esViajeVencido(viaje) }))
+    viajesElegibles.map((viaje) => ({
+      ...viaje,
+      puntualidad_inicio: calcularPuntualidadInicio(viaje),
+      vencido: esViajeVencido(viaje),
+    }))
   );
 }
 
@@ -280,6 +305,9 @@ export async function obtenerViaje(req, res) {
       },
       empresa: { select: { id_empresa: true, nombre: true, id_gerente: true } },
       calificacion: true,
+      // Canal 1/6 de las metricas por etapa (tiempo de peon, duracion real,
+      // aproximacion y puntualidad). Ver calcularMetricasViaje.
+      ...INCLUDE_HISTORIAL,
     },
   });
 
@@ -310,7 +338,10 @@ export async function obtenerViaje(req, res) {
   return res.status(200).json({
     ...viaje,
     duracion_estimada: horasAMinutos(viaje.duracion_estimada_horas),
-    // Calculado en el read, igual que duracion_real: no hay columna.
+    // Las cinco metricas del historial. puntualidad_inicio va aca adentro y
+    // pisa a la columna MUERTA del mismo nombre que trae el spread.
+    ...calcularMetricasViaje(viaje),
+    // Calculado en el read, igual que las duraciones: no hay columna.
     vencido: esViajeVencido(viaje),
     ruta_planeada,
   });
@@ -345,7 +376,31 @@ export async function cambiarEstado(req, res) {
   }
 
   const estado_anterior = viaje.estado;
-  await prisma.viaje.update({ where: { id_viaje }, data: { estado } });
+
+  // RESPALDO DE ULTIMO RECURSO de la llegada al origen: si el viaje llego a
+  // CARGANDO sin que ningun ping GPS haya registrado la llegada (sin señal, GPS
+  // apagado), se usa este instante. Es la señal PEOR de las dos — el conductor
+  // marca CARGANDO cuando EMPIEZA A CARGAR, no cuando llega, asi que una demora
+  // del cliente en la carga lo perjudica — pero es mejor que no tener nada.
+  //
+  // Solo rellena si sigue null: un ping que ya la registro nunca se pisa.
+  const rellenaLlegada = estado === 'CARGANDO' && viaje.fecha_llegada_origen === null;
+
+  await prisma.viaje.update({
+    where: { id_viaje },
+    data: {
+      estado,
+      ...(rellenaLlegada ? { fecha_llegada_origen: new Date() } : {}),
+    },
+  });
+
+  // SITIO 3/12 del historial.
+  await registrarCambioEstado({
+    id_viaje,
+    estado,
+    id_usuario: req.usuario.id_usuario,
+    origen: 'CONDUCTOR',
+  });
 
   if (io) {
     io.to(`viaje:${id_viaje}`).emit('viaje:estado_cambiado', {
@@ -413,41 +468,48 @@ export async function iniciarViaje(req, res) {
     });
   }
 
-  // Puntualidad: retraso (en minutos) del inicio real vs la fecha programada.
-  // Iniciar antes de hora da retraso negativo → A_TIEMPO.
-  const PUNTUALIDAD_TARDE_MINUTOS = Number(process.env.PUNTUALIDAD_TARDE_MINUTOS ?? 30);
-  const PUNTUALIDAD_MUY_TARDE_MINUTOS = Number(process.env.PUNTUALIDAD_MUY_TARDE_MINUTOS ?? 120);
-  const retrasoMinutos = (ahora.getTime() - viaje.fecha_programada.getTime()) / 60000;
-
-  let puntualidad_inicio;
-  if (retrasoMinutos <= PUNTUALIDAD_TARDE_MINUTOS) {
-    puntualidad_inicio = 'A_TIEMPO';
-  } else if (retrasoMinutos <= PUNTUALIDAD_MUY_TARDE_MINUTOS) {
-    puntualidad_inicio = 'TARDE';
-  } else {
-    puntualidad_inicio = 'MUY_TARDE';
-  }
-
-  const actualizado = await prisma.viaje.update({
-    where: { id_viaje },
+  // GUARD ATOMICO. Antes esto era un update plano sobre la lectura de arriba: el
+  // estado se chequeaba en memoria (paso 3) y no en el WHERE, asi que dos POST
+  // concurrentes pasaban los dos el chequeo y devolvian los DOS 200, con
+  // fecha_inicio e iniciado_por last-write-wins. No es teorico: el endpoint
+  // autoriza al conductor asignado Y al gerente de la empresa, o sea que hay dos
+  // personas distintas que pueden apretar el boton al mismo tiempo.
+  //
+  // Mismo patron que reservar, asignar y liberarReserva. El chequeo en memoria
+  // del paso 3 se CONSERVA: sigue dando el 400 descriptivo de siempre en el caso
+  // secuencial (doble inicio normal), y este 409 queda para la carrera real.
+  const actualizado = await prisma.viaje.updateMany({
+    where: { id_viaje, estado: 'CONDUCTOR_ASIGNADO' },
     data: {
       estado: 'EN_CAMINO_A_ORIGEN',
       fecha_inicio: ahora,
-      puntualidad_inicio,
       iniciado_por,
     },
   });
+  if (actualizado.count === 0) {
+    return res.status(409).json({ error: 'El viaje ya fue iniciado por otra persona' });
+  }
+
+  // SITIO 4/12 del historial. iniciado_por y el origen son lo mismo aca: quien
+  // apreto el boton.
+  await registrarCambioEstado({
+    id_viaje,
+    estado: 'EN_CAMINO_A_ORIGEN',
+    id_usuario: req.usuario.id_usuario,
+    origen: iniciado_por,
+  });
 
   // El viaje arranco: ya no puede vencer. Es la salida de CONDUCTOR_ASIGNADO
-  // mas facil de olvidar — el update de arriba es plano (el estado se chequeo en
-  // memoria, no en el WHERE) y hasta aca no habia ninguna cancelacion de timers.
+  // mas facil de olvidar.
   cancelarAvisoVencimiento(id_viaje);
 
+  // OJO: ya NO se calcula ni se persiste la puntualidad aca. Se medida en la
+  // SALIDA hacia el origen, que no es llegar: ahora se calcula en el read desde
+  // fecha_llegada_origen. Ver puntualidad.service.js.
   if (io) {
     io.to('usuario:' + viaje.cliente.id_usuario).emit('viaje:iniciado', {
       id_viaje,
-      fecha_inicio: actualizado.fecha_inicio,
-      puntualidad_inicio,
+      fecha_inicio: ahora,
     });
   }
 
@@ -455,8 +517,7 @@ export async function iniciarViaje(req, res) {
     mensaje: 'Viaje iniciado',
     id_viaje,
     estado: 'EN_CAMINO_A_ORIGEN',
-    fecha_inicio: actualizado.fecha_inicio,
-    puntualidad_inicio,
+    fecha_inicio: ahora,
     iniciado_por,
   });
 }
@@ -505,6 +566,15 @@ export async function cancelarViajeConductor(req, res) {
       // Reinicia la ventana de reserva para el timeout cuando vuelve a la empresa.
       ...(esDeEmpresa ? { fecha_reserva: new Date() } : {}),
     },
+  });
+
+  // SITIO 5/12 del historial. Las DOS ramas (a empresa o al mercado) generan
+  // fila: el estado cambio en las dos.
+  await registrarCambioEstado({
+    id_viaje,
+    estado: nuevoEstado,
+    id_usuario: req.usuario.id_usuario,
+    origen: 'CONDUCTOR',
   });
 
   // El viaje VUELVE a estar reservado (fecha_reserva se reinicia arriba), asi
@@ -615,6 +685,16 @@ export async function cancelarViajeCliente(req, res) {
       data: { estado: 'CANCELADO' },
     }),
   ]);
+
+  // SITIO 6/12 del historial. FUERA de la $transaction a proposito: adentro, un
+  // fallo del insert haria rollback de la cancelacion, que es exactamente lo
+  // contrario de lo que queremos (el cambio de estado tiene que ocurrir igual).
+  await registrarCambioEstado({
+    id_viaje,
+    estado: 'CANCELADO',
+    id_usuario: req.usuario.id_usuario,
+    origen: 'CLIENTE',
+  });
 
   // Defensivo: hoy ESTADOS_CANCELABLES no incluye RESERVADO_POR_EMPRESA, asi que
   // aca nunca hay un timer de reserva vivo. Se cancela igual — es idempotente y
@@ -749,11 +829,9 @@ export async function confirmarParada(req, res) {
   // configurable porque 50m es agresivo para GPS urbano con edificios altos y
   // puede necesitar ajuste sin redeploy de codigo.
   const radio_metros = parseFloat(process.env.RADIO_CONFIRMACION_METROS || '50');
-  const distancia_metros = turf.distance(
-    turf.point([lng, lat]),
-    turf.point([parada.longitud, parada.latitud]),
-    { units: 'meters' }
-  );
+  // Misma funcion de distancia que usa la deteccion de llegada al origen en
+  // gps.socket.js — estaba inline aca y se extrajo para que no haya dos.
+  const distancia_metros = distanciaMetros(lat, lng, parada);
   if (distancia_metros > radio_metros) {
     return res.status(400).json({
       error: `Estas a ${Math.round(distancia_metros)}m de la parada. Debes estar a menos de ${radio_metros}m`,
@@ -775,7 +853,12 @@ export async function confirmarParada(req, res) {
     return res.status(200).json({ confirmada: true, viaje_finalizado: false });
   }
 
-  const { precio_real, remito_url } = await cerrarViaje(id_viaje, io);
+  // cerrarViaje no conoce al actor: se lo pasamos. El conductor que confirma la
+  // ultima parada es quien dispara el FINALIZADO (sitio 11/12 del historial).
+  const { precio_real, remito_url } = await cerrarViaje(id_viaje, io, {
+    id_usuario: req.usuario.id_usuario,
+    origen: 'CONDUCTOR',
+  });
   return res.status(200).json({ confirmada: true, viaje_finalizado: true, precio_real, remito_url });
 }
 
@@ -868,17 +951,21 @@ export async function listarMisViajes(req, res) {
     include: {
       paradas: true,
       conductor: { include: { usuario: true } },
+      // Canal 2/6 de las metricas por etapa.
+      ...INCLUDE_HISTORIAL,
     },
     orderBy: { creado_en: 'desc' },
   });
 
-  // duracion_real se calcula en el read a partir de fecha_inicio y la ultima
-  // fecha_entrega de las paradas — no hay columna. En MINUTOS, como todas las
-  // duraciones de la API. null mientras el viaje no este FINALIZADO.
+  // Las duraciones y la puntualidad se calculan en el read — no hay columnas.
+  // En MINUTOS, como todas las duraciones de la API. duracion_real se mide
+  // desde la SALIDA del origen (la fila EN_RUTA del historial), no desde
+  // fecha_inicio: null mientras el viaje no este FINALIZADO, y null tambien en
+  // los viajes anteriores a este cambio, que no tienen historial.
   return res.status(200).json(
     viajes.map((viaje) => ({
       ...viaje,
-      duracion_real: calcularDuracionRealMinutos(viaje),
+      ...calcularMetricasViaje(viaje),
       vencido: esViajeVencido(viaje),
     }))
   );
@@ -922,6 +1009,11 @@ export async function listarMisViajesConductor(req, res) {
       fecha_programada: true,
       descripcion: true,
       creado_en: true,
+      // Los tres escalares que necesitan las metricas por etapa. Este endpoint
+      // usa select explicito (no spread de la fila cruda), asi que hay que
+      // pedirlos a mano o calcularMetricasViaje tira.
+      fecha_inicio: true,
+      fecha_llegada_origen: true,
       paradas: {
         select: { orden: true, direccion: true, estado: true, fecha_entrega: true },
         orderBy: { orden: 'asc' },
@@ -931,12 +1023,18 @@ export async function listarMisViajesConductor(req, res) {
           usuario: { select: { nombre: true, apellido: true, telefono: true } },
         },
       },
+      // Canal 3/6: el conductor ve su propio tiempo de peon en su historial.
+      ...INCLUDE_HISTORIAL,
     },
     orderBy: { creado_en: 'desc' },
   });
 
   return res.status(200).json(
-    viajes.map((viaje) => ({ ...viaje, vencido: esViajeVencido(viaje) }))
+    viajes.map((viaje) => ({
+      ...viaje,
+      ...calcularMetricasViaje(viaje),
+      vencido: esViajeVencido(viaje),
+    }))
   );
 }
 

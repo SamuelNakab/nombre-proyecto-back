@@ -368,6 +368,81 @@ mercado abierto. El campo se devuelve igual para que el contrato sea uniforme.
 
 ---
 
+### Duraciones por etapa y el "tiempo de peón"
+
+Cada cambio de estado de un viaje queda registrado en un **historial de estados**
+(una fila por transición, con quién la disparó). De ahí salen cuatro duraciones,
+todas **calculadas en el read** —no hay columnas— y todas en **minutos enteros**,
+como el resto de las duraciones de la API.
+
+| Campo | Qué mide | `null` cuando |
+|-------|----------|---------------|
+| `duracion_aproximacion_origen` | De `fecha_inicio` (el conductor arranca hacia el origen) a `fecha_llegada_origen` (llegó). | El viaje no arrancó, o no se registró la llegada. |
+| `duracion_carga` | De `CARGANDO` a `EN_RUTA`. Mitad del **tiempo de peón**. | Alguna de las dos transiciones no ocurrió. |
+| `duracion_real` | De `EN_RUTA` (la **salida del origen**) a la última `fecha_entrega`. | El viaje no está `FINALIZADO`, o no tiene fila `EN_RUTA`. |
+| `duracion_descarga` | De `DESCARGANDO` a `FINALIZADO`. La otra mitad del tiempo de peón. | Alguna de las dos transiciones no ocurrió. |
+
+> **CAMBIO DE CONTRATO — `duracion_real` cambió de significado.**
+> Antes se medía desde `fecha_inicio`, que es cuando el conductor arranca **hacia**
+> el origen, antes de cargar. `duracion_estimada` sólo suma los tramos de manejo
+> entre paradas, así que los dos números medían cosas distintas y no se podían
+> comparar. Ahora `duracion_real` se mide desde la **salida del origen**
+> (`CARGANDO → EN_RUTA`), y el tramo de aproximación se expone aparte en
+> `duracion_aproximacion_origen`.
+
+**Viajes anteriores a este cambio:** no tienen historial, así que `duracion_real`,
+`duracion_carga` y `duracion_descarga` devuelven `null` — **no** el número viejo,
+que ya no significa lo mismo. No hay backfill. Un viaje que estaba a mitad de
+camino cuando se desplegó esto sí consigue las etapas cuyas **dos** transiciones
+ocurrieron después (por ejemplo, uno que estaba en `EN_RUTA` obtiene
+`duracion_descarga`, pero no `duracion_real`).
+
+**Dónde aparecen (seis canales):** `GET /api/viajes/:id`,
+`GET /api/viajes/mis-viajes`, `GET /api/viajes/mis-viajes-conductor`,
+`GET /api/admin/viajes/:id`, `GET /api/empresas/:id/viajes` y el evento
+`viaje:finalizado`.
+
+---
+
+### Puntualidad y llegada al origen
+
+`puntualidad_inicio` clasifica el retraso de la **llegada al origen** respecto de
+`fecha_programada`:
+
+| Valor | Condición |
+|-------|-----------|
+| `A_TIEMPO` | retraso ≤ `PUNTUALIDAD_TARDE_MINUTOS` (default `30`). Incluye llegar **antes** de hora (retraso negativo). |
+| `TARDE` | `PUNTUALIDAD_TARDE_MINUTOS` < retraso ≤ `PUNTUALIDAD_MUY_TARDE_MINUTOS` (default `120`) |
+| `MUY_TARDE` | retraso > `PUNTUALIDAD_MUY_TARDE_MINUTOS` (default `120`) |
+| `null` | El viaje todavía no llegó al origen, o es anterior a este cambio. |
+
+> **CAMBIO DE CONTRATO — `puntualidad_inicio` cambió de significado y dejó de persistirse.**
+> Antes se calculaba al apretar **Iniciar viaje**, que pone `EN_CAMINO_A_ORIGEN`:
+> empezar a manejar hacia el origen, no llegar. Con eso, casi todos los viajes
+> salían `A_TIEMPO` aunque el conductor llegara tarde. Ahora se mide en la
+> **llegada** y se calcula en el read.
+>
+> **Los viajes anteriores devuelven `null`**, aunque tengan un valor guardado: ese
+> valor se midió con otra definición y no es comparable.
+
+**Cómo se detecta la llegada.** El primer ping GPS (`conductor:ubicacion`) que cae
+dentro de `RADIO_CONFIRMACION_METROS` de la parada de orden 1 mientras el viaje
+está en `EN_CAMINO_A_ORIGEN` registra el momento de llegada. Se usa la hora del
+**servidor**, no el `timestamp` del ping, porque el ping lo manda el celular y
+esto alimenta una métrica de desempeño del conductor.
+
+Si el viaje llega a `CARGANDO` sin que ningún ping haya registrado la llegada
+(sin señal, GPS apagado), esa transición la rellena como **respaldo de último
+recurso**. Es la señal peor de las dos: el conductor marca `CARGANDO` cuando
+*empieza a cargar*, no cuando llega, así que una demora del cliente en la carga lo
+perjudica.
+
+> La confirmación de la primera parada **no** sirve como señal de llegada:
+> `POST /api/viajes/:id/confirmar-parada` exige `EN_RUTA` o `DESCARGANDO`, así que
+> el origen recién se puede confirmar **después** de cargar y salir.
+
+---
+
 ### POST /api/viajes/estimar-costo
 
 Calcula el costo estimado de un viaje sin crearlo.
@@ -765,9 +840,14 @@ rol a nivel de ruta: la validación real es la tabla de arriba.
   "vencido": false,
   "fecha_programada": "2026-07-01T10:00:00.000Z",
   "fecha_inicio": null,
+  "fecha_llegada_origen": null,
   "puntualidad_inicio": null,
   "duracion_estimada": 30,
   "duracion_estimada_horas": 0.5,
+  "duracion_real": null,
+  "duracion_carga": null,
+  "duracion_descarga": null,
+  "duracion_aproximacion_origen": null,
   "creado_en": "2026-05-09T12:00:00.000Z",
   "paradas": [
     {
@@ -822,6 +902,11 @@ rol a nivel de ruta: la validación real es la tabla de arriba.
 >
 > | Campo | Unidad | Para qué sirve |
 > |-------|--------|----------------|
+> Las cuatro `duracion_*` calculadas y `puntualidad_inicio` salen del historial de estados
+> y de la llegada al origen — ver [Duraciones por etapa](#duraciones-por-etapa-y-el-tiempo-de-peón)
+> y [Puntualidad y llegada al origen](#puntualidad-y-llegada-al-origen). En el ejemplo son
+> `null` porque el viaje todavía no arrancó.
+>
 > | `duracion_estimada` | **minutos**, entero | Mostrarle la duración al usuario |
 > | `duracion_estimada_horas` | **horas**, float | La columna cruda; es el input del cálculo de precio |
 > | `desglose_estimado.tiempo_horas` (en `POST /api/viajes`) | **horas**, float | El mismo valor que `duracion_estimada_horas` |
@@ -1226,6 +1311,9 @@ inicio automático por primer ping GPS **ya no existe**. Registra el momento rea
    (`viaje.id_empresa`). Si no es ninguno → `403`.
 3. El viaje está en estado `CONDUCTOR_ASIGNADO`. Cualquier otro estado → `400`.
 4. Ventana de tiempo (ver abajo). Demasiado temprano → `400`.
+5. **Guard atómico**: la escritura va con el estado esperado en el `WHERE`. Si otra
+   persona ganó la carrera (el endpoint autoriza al conductor asignado **y** al gerente,
+   así que puede haber dos apretando el botón a la vez) → `409`.
 
 `iniciado_por` queda en `"CONDUCTOR"` si lo inició el conductor asignado, o `"GERENTE"` si lo
 inició el gerente.
@@ -1237,14 +1325,11 @@ programada ya haya pasado, sin importar cuánto. Si intenta iniciar antes de que
 → `400`, con la hora de apertura en hora local de Argentina (`America/Argentina/Buenos_Aires`),
 formato `HH:MM`.
 
-**Puntualidad (`puntualidad_inicio`):**
-Se calcula con el retraso en minutos entre el momento del inicio y la `fecha_programada`.
-
-| Valor | Condición (retraso respecto de `fecha_programada`) |
-|-------|----------------------------------------------------|
-| `A_TIEMPO` | retraso ≤ `PUNTUALIDAD_TARDE_MINUTOS` (default `30`). Incluye iniciar **antes** de hora (retraso negativo). |
-| `TARDE` | `PUNTUALIDAD_TARDE_MINUTOS` < retraso ≤ `PUNTUALIDAD_MUY_TARDE_MINUTOS` (default `120`) |
-| `MUY_TARDE` | retraso > `PUNTUALIDAD_MUY_TARDE_MINUTOS` (default `120`) |
+> **CAMBIO DE CONTRATO — este endpoint ya NO devuelve `puntualidad_inicio`.**
+> La puntualidad se medía acá, en la **salida** hacia el origen, que no es
+> llegar. Ahora se mide en la **llegada al origen** y se calcula en el read
+> (ver [Puntualidad y llegada al origen](#puntualidad-y-llegada-al-origen)).
+> Este endpoint tampoco persiste ya la columna `puntualidad_inicio`.
 
 **Respuesta exitosa — 200:**
 ```json
@@ -1253,15 +1338,18 @@ Se calcula con el retraso en minutos entre el momento del inicio y la `fecha_pro
   "id_viaje": 42,
   "estado": "EN_CAMINO_A_ORIGEN",
   "fecha_inicio": "2026-07-14T21:51:39.023Z",
-  "puntualidad_inicio": "A_TIEMPO",
   "iniciado_por": "GERENTE"
 }
 ```
 
 **Efectos secundarios:**
-- El viaje pasa a `EN_CAMINO_A_ORIGEN` y se persisten `fecha_inicio`, `puntualidad_inicio` e `iniciado_por`.
-- Se emite `viaje:iniciado` al room personal del cliente (`usuario:{id_usuario_cliente}`).
+- El viaje pasa a `EN_CAMINO_A_ORIGEN` y se persisten `fecha_inicio` e `iniciado_por`.
+- Se emite `viaje:iniciado` al room personal del cliente (`usuario:{id_usuario_cliente}`),
+  con payload `{ id_viaje, fecha_inicio }` (**sin** `puntualidad_inicio`).
+- Se registra la fila `EN_CAMINO_A_ORIGEN` en el historial de estados.
 - A partir de este momento se aceptan los pings `conductor:ubicacion` de este viaje (siempre desde el conductor).
+  El **primer** ping que caiga dentro de `RADIO_CONFIRMACION_METROS` del origen registra
+  `fecha_llegada_origen`, de donde sale la puntualidad.
 
 **Errores posibles:**
 | Status | Body | Causa |
@@ -1272,6 +1360,7 @@ Se calcula con el retraso en minutos entre el momento del inicio y la `fecha_pro
 | 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol `CONDUCTOR` ni `GERENTE` |
 | 403 | `{ "error": "No autorizado para iniciar este viaje" }` | No es el conductor asignado ni el gerente de la empresa del viaje |
 | 404 | `{ "error": "Viaje no encontrado" }` | No existe viaje con ese id |
+| 409 | `{ "error": "El viaje ya fue iniciado por otra persona" }` | Dos inicios **concurrentes**: este perdió la carrera. El `400` de arriba sigue cubriendo el doble inicio secuencial |
 
 ---
 
@@ -2187,10 +2276,20 @@ en la parada, se sube la variable.
     "tarifa_hora": 3500,
     "tarifa_km": null
   },
-  "remito_url": "https://pub.r2.example.com/remitos/42.pdf"
+  "remito_url": "https://pub.r2.example.com/remitos/42.pdf",
+  "duracion_real": 38,
+  "duracion_carga": 12,
+  "duracion_descarga": 7,
+  "duracion_aproximacion_origen": 21,
+  "puntualidad_inicio": "A_TIEMPO"
 }
 ```
 
+- Las cinco métricas del final son las mismas que devuelven los endpoints de lectura —
+  ver [Duraciones por etapa](#duraciones-por-etapa-y-el-tiempo-de-peón) y
+  [Puntualidad y llegada al origen](#puntualidad-y-llegada-al-origen). Van en **este mismo**
+  evento (no hay uno nuevo): el cierre es el momento en que el cuadro completo existe entero.
+  En minutos enteros, o `null` si la etapa no ocurrió.
 - `tiempo_horas` / `distancia_km`: totales medidos por GPS durante el viaje.
 - `tiempo_capital` / `distancia_provincia`: la parte de esos totales que **efectivamente se
   facturó**, y los dos valores que se persisten en el viaje al cerrarlo. `null` = no se cobra por

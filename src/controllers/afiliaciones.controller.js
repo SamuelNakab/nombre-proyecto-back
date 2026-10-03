@@ -111,7 +111,12 @@ export async function salirDeEmpresa(req, res) {
     return res.status(400).json({ error: 'Ya no estas afiliado a esta empresa' });
   }
 
-  const resultado = await ejecutarDesafiliacion(afiliacion.id_conductor, afiliacion.id_empresa);
+  // El conductor se va por su cuenta: el actor del historial es el conductor.
+  const resultado = await ejecutarDesafiliacion(
+    afiliacion.id_conductor,
+    afiliacion.id_empresa,
+    { id_usuario: req.usuario.id_usuario, origen: 'CONDUCTOR' }
+  );
   if (!resultado.ok) {
     return res.status(400).json({ error: resultado.error });
   }

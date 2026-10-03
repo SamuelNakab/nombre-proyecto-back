@@ -7,6 +7,7 @@ import {
   programarTimeoutReserva,
   cancelarTimeoutReserva,
 } from '../services/reserva.service.js';
+import { registrarCambioEstado } from '../services/historial-estado.service.js';
 import { io } from '../sockets/index.js';
 
 // ─── Schemas ─────────────────────────────────────────────────────────────────
@@ -122,6 +123,15 @@ export async function reservarViaje(req, res) {
     return res.status(409).json({ error: 'El viaje ya no esta disponible para reservar' });
   }
 
+  // SITIO 8/12 del historial. Despues del count === 0: solo el gerente que gano
+  // la reserva cambio el estado.
+  await registrarCambioEstado({
+    id_viaje,
+    estado: 'RESERVADO_POR_EMPRESA',
+    id_usuario: req.usuario.id_usuario,
+    origen: 'GERENTE',
+  });
+
   // Timeout de la reserva: un setTimeout propio de ESTE viaje, programado recien
   // ahora que sabemos que la reserva se gano. Reemplaza al viejo job periodico
   // que polleaba la DB buscando vencidas.
@@ -190,6 +200,14 @@ export async function asignarViaje(req, res) {
   if (resultado.count === 0) {
     return res.status(409).json({ error: 'El viaje ya no esta en RESERVADO_POR_EMPRESA' });
   }
+
+  // SITIO 9/12 del historial.
+  await registrarCambioEstado({
+    id_viaje,
+    estado: 'CONDUCTOR_ASIGNADO',
+    id_usuario: req.usuario.id_usuario,
+    origen: 'GERENTE',
+  });
 
   // La reserva dejo de estar activa: el viaje ya tiene conductor. Sin esto, el
   // timer quedaria huerfano y dispararia sobre un viaje YA asignado (el
@@ -298,7 +316,10 @@ export async function cancelarReserva(req, res) {
   // (una asignacion concurrente del mismo gerente, tipicamente), devuelve false
   // y no toca nada. Antes era un update plano: esa carrera pisaba un viaje ya
   // asignado y lo mandaba de vuelta al mercado con conductor y todo.
-  const liberado = await liberarReserva(io, id_viaje, viaje.estado);
+  const liberado = await liberarReserva(io, id_viaje, viaje.estado, {
+    id_usuario: req.usuario.id_usuario,
+    origen: 'GERENTE',
+  });
   if (!liberado) {
     return res.status(409).json({ error: 'El viaje ya no esta en RESERVADO_POR_EMPRESA' });
   }

@@ -7,7 +7,7 @@ import {
 } from '../services/gps.service.js';
 import { manejarDesvio } from '../services/desvio.service.js';
 import { obtenerRutaPlaneada, calcularYGuardarRuta } from '../services/ruta.service.js';
-import { verificarParadaSospechosa } from '../services/parada.service.js';
+import { verificarParadaSospechosa, distanciaMetros } from '../services/parada.service.js';
 import { iniciarEmisorEta } from '../services/eta-emisor.js';
 
 export function registrarHandlersGPS(socket, io) {
@@ -38,7 +38,10 @@ export function registrarHandlersGPS(socket, io) {
 
       const viaje = await prisma.viaje.findUnique({
         where: { id_viaje },
-        include: { paradas: true },
+        // orderBy para que paradas[0] sea el ORIGEN (orden 1), que es contra lo
+        // que se mide la llegada. verificarParadaSospechosa usa .some(), asi
+        // que el orden no la afecta.
+        include: { paradas: { orderBy: { orden: 'asc' } } },
       });
 
       // B-003: solo el conductor ASIGNADO puede enviar pings de este viaje.
@@ -72,6 +75,38 @@ export function registrarHandlersGPS(socket, io) {
       }
 
       if (viaje.estado === 'FINALIZADO' || viaje.estado === 'CANCELADO') return;
+
+      // LLEGADA AL ORIGEN — la senial de la que sale la puntualidad.
+      //
+      // La confirmacion de la primera parada NO sirve para esto: confirmarParada
+      // exige EN_RUTA o DESCARGANDO, asi que el origen recien se puede confirmar
+      // DESPUES de cargar y salir. Llega tarde por construccion.
+      //
+      // Asi que se toma el PRIMER ping que cae dentro del radio del origen
+      // mientras el viaje sigue yendo hacia alla. Si nunca llega ninguno (sin
+      // señal, GPS apagado), el paso a CARGANDO lo rellena como respaldo de
+      // ultimo recurso (ver cambiarEstado en viajes.controller).
+      //
+      // NO es un estado nuevo ni una fila del historial: es un evento de GPS,
+      // no una transicion formal.
+      if (viaje.estado === 'EN_CAMINO_A_ORIGEN' && viaje.fecha_llegada_origen === null) {
+        const origen = viaje.paradas[0];
+        const radio_metros = parseFloat(process.env.RADIO_CONFIRMACION_METROS || '50');
+
+        if (origen && distanciaMetros(lat, lng, origen) <= radio_metros) {
+          // Hora del SERVIDOR, no el timestamp del ping: el ping lo manda el
+          // celular y es falsificable, y esto alimenta una metrica de desempeño
+          // del conductor. confirmarParada usa hora de servidor por lo mismo.
+          //
+          // updateMany con fecha_llegada_origen null en el WHERE: dos pings
+          // concurrentes no se pisan, gana el primero. Mismo patron de guard
+          // atomico que reservar/asignar/liberarReserva.
+          await prisma.viaje.updateMany({
+            where: { id_viaje, fecha_llegada_origen: null },
+            data: { fecha_llegada_origen: new Date() },
+          });
+        }
+      }
 
       const anterior = await obtenerUltimaCoordenada(id_viaje);
       await guardarCoordenada(id_viaje, lat, lng, timestamp);

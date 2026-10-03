@@ -2,6 +2,7 @@ import prisma from '../config/prisma.js';
 import { validarTransicion } from './estado-viaje.service.js';
 import { limpiarViajeActivo } from './cancelacion.service.js';
 import { publicarViajeAConductoresElegibles } from './matching.service.js';
+import { registrarCambioEstado } from './historial-estado.service.js';
 
 // Minutos que una reserva puede quedar sin conductor asignado antes de volver
 // sola al mercado. Default 10 si no esta en .env (mismo patron que el resto).
@@ -73,7 +74,11 @@ export async function validarConductorYVehiculo(viaje, id_conductor, id_vehiculo
 // lectura previa: ese es el guard que hace que un timer que dispara de mas
 // (viaje ya asignado, ya cancelado, o reservado de nuevo despues) sea
 // INOFENSIVO — matchea 0 filas, no toca nada y no republica.
-export async function liberarReserva(io, id_viaje, estadoActual) {
+// `actor` = { id_usuario, origen } de quien libero. Los TRES caminos que llegan
+// aca son distintos: el gerente que aprieta cancelar-reserva, el timer de la
+// reserva y el barrido de arranque. Los dos ultimos no tienen usuario — pasan
+// origen SISTEMA e id_usuario null.
+export async function liberarReserva(io, id_viaje, estadoActual, actor = {}) {
   validarTransicion(estadoActual, 'BUSCANDO_CONDUCTOR');
 
   // El timer de esta reserva ya no aplica pase lo que pase: si la liberacion
@@ -92,6 +97,16 @@ export async function liberarReserva(io, id_viaje, estadoActual) {
     },
   });
   if (resultado.count === 0) return false;
+
+  // SITIO 10/12 del historial. Despues del count === 0: si el updateMany no
+  // matcheo (un timer que disparo de mas sobre un viaje ya asignado) no hubo
+  // cambio de estado y no hay nada que registrar.
+  await registrarCambioEstado({
+    id_viaje,
+    estado: 'BUSCANDO_CONDUCTOR',
+    id_usuario: actor.id_usuario ?? null,
+    origen: actor.origen ?? 'SISTEMA',
+  });
 
   // Idempotente: si estaba en RESERVADO_POR_EMPRESA no hay ETA/GPS activos, pero
   // limpiarViajeActivo no falla si no encuentra nada.
@@ -163,7 +178,7 @@ export function programarTimeoutReserva(io, id_viaje, msRestantes = null) {
     // El estado que le pasamos es el esperado, no uno leido: la verdad la pone
     // el WHERE del updateMany de liberarReserva. Si el viaje ya salio de
     // RESERVADO_POR_EMPRESA, devuelve false y no hace nada.
-    liberarReserva(io, id_viaje, 'RESERVADO_POR_EMPRESA')
+    liberarReserva(io, id_viaje, 'RESERVADO_POR_EMPRESA', { origen: 'SISTEMA' })
       .then((liberado) => {
         if (liberado) {
           console.log(`[reserva-timeout] viaje ${id_viaje} liberado por timeout`);
@@ -214,7 +229,8 @@ export async function barridoInicialReservas(io) {
       : -1;
 
     if (restante <= 0) {
-      if (await liberarReserva(io, viaje.id_viaje, 'RESERVADO_POR_EMPRESA')) liberadas++;
+      if (await liberarReserva(io, viaje.id_viaje, 'RESERVADO_POR_EMPRESA', { origen: 'SISTEMA' }))
+        liberadas++;
     } else {
       programarTimeoutReserva(io, viaje.id_viaje, restante);
       reprogramadas++;

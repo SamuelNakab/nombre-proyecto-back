@@ -299,7 +299,25 @@ model Viaje {
   descripcion         String?
   estado              EstadoViaje @default(BUSCANDO_CONDUCTOR)
   fecha_inicio        DateTime?
+  // COLUMNA MUERTA. Nadie la escribe ni la lee desde que la puntualidad pasa a
+  // medirse en la LLEGADA al origen y a calcularse en el read (ver
+  // puntualidad.service.js). Las respuestas de la API traen un campo con este
+  // MISMO nombre que es otra cosa: el valor calculado. Los valores viejos de
+  // esta columna se midieron en la SALIDA hacia el origen y no son comparables.
+  // Queda en el schema por el mismo motivo que Parada.qr_token: la DB de Neon
+  // esta compartida con produccion y dropear columnas ahi es destructivo.
   puntualidad_inicio  String?
+  // Momento en que el conductor LLEGO al origen (la parada de orden 1).
+  // Lo setea el primer ping GPS que cae dentro de RADIO_CONFIRMACION_METROS
+  // del origen mientras el viaje esta en EN_CAMINO_A_ORIGEN; si no hubo ningun
+  // ping (sin señal, GPS apagado), lo rellena la transicion a CARGANDO como
+  // respaldo de ultimo recurso. Es la base de la puntualidad.
+  //
+  // Necesita columna propia — a diferencia de duracion_real o vencido, que se
+  // derivan de timestamps ya persistidos — porque el GPS es EFIMERO: vive en
+  // Redis y limpiarGPS lo borra al cerrar el viaje. Si no se persiste en el
+  // instante en que ocurre, se pierde para siempre.
+  fecha_llegada_origen DateTime?
   // Momento en que el gerente reserva el viaje (RESERVADO_POR_EMPRESA).
   fecha_reserva       DateTime?
   // Quien apreto "Iniciar viaje": "CONDUCTOR" | "GERENTE".
@@ -319,8 +337,39 @@ model Viaje {
   transacciones    Transaccion[]
   condiciones_req  CondicionRequerida[]
   calificacion     Calificacion?
+  // Back-relation, NO una columna: no genera DDL sobre la tabla viajes.
+  // La FK vive en historial_estado_viaje.
+  historial_estados HistorialEstadoViaje[]
 
   @@map("viajes")
+}
+
+// ─────────────────────────────────────────────
+// HISTORIAL DE ESTADOS DEL VIAJE
+// Una fila por CADA cambio de estado, escrita por el caller que hizo el cambio.
+// Ver historial-estado.service.js y la tabla de los 12 sitios en CLAUDE.md.
+//
+// Es la base de duracion_carga / duracion_descarga / duracion_real, que se
+// calculan en el read a partir de estas filas.
+// ─────────────────────────────────────────────
+
+model HistorialEstadoViaje {
+  id_historial Int         @id @default(autoincrement())
+  id_viaje     Int
+  estado       EstadoViaje
+  fecha        DateTime    @default(now())
+  // Quien lo disparo, si es identificable. SIN FK a Usuario a proposito: evita
+  // tocar el modelo Usuario y evita una constraint que trabe borrados.
+  // null cuando el cambio lo hizo el sistema (timer de reserva, barrido).
+  id_usuario   Int?
+  // CLIENTE | CONDUCTOR | GERENTE | ADMIN | SISTEMA. String y no enum, mismo
+  // criterio que Viaje.iniciado_por. La lista vive en ORIGENES.
+  origen       String?
+
+  viaje Viaje @relation(fields: [id_viaje], references: [id_viaje])
+
+  @@index([id_viaje, fecha])
+  @@map("historial_estado_viaje")
 }
 
 // ─────────────────────────────────────────────

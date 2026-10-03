@@ -84,6 +84,46 @@ unitarios y E2E hayan pasado.
   conductores sin ningún vehículo registrado vieran viajes disponibles que
   después no podían aceptar.
 
+- **Unitario — `esViajeVencido(viaje)`**: valida el criterio que marca un
+  viaje como "colgado" (llegó a su `fecha_programada` sin que nadie lo tome
+  o sin que nadie lo inicie), usado tanto por el campo `vencido` que expone
+  la API como por el evento de socket `viaje:vencido`. Cubre: fecha pasada
+  con el viaje en `BUSCANDO_CONDUCTOR` o `CONDUCTOR_ASIGNADO` (vencido),
+  fecha pasada en cualquier otro estado —incluido `RESERVADO_POR_EMPRESA`,
+  que queda deliberadamente afuera— (no vencido), fecha futura (no vencido),
+  y que la fecha se acepte tanto como `Date` como string ISO. También prueba
+  que la función **tire un error explícito** si el viaje no trae `estado` o
+  `fecha_programada`, en vez de devolver `false` en silencio: mismo criterio
+  defensivo que `puedeVerViaje` y `calcularDuracionRealMinutos`, para que un
+  `select` de Prisma al que se le olvidó un campo falle ruidosamente en vez
+  de esconder viajes vencidos sin que nadie se entere.
+
+- **Unitario — duraciones por etapa (`duracion.service.js`)**: valida las cuatro
+  duraciones que se calculan en el read a partir del historial de estados del
+  viaje: `duracion_real` (ahora medida desde la **salida del origen**, la
+  transición `CARGANDO → EN_RUTA`, y no desde `fecha_inicio` como antes),
+  `duracion_carga` y `duracion_descarga` —las dos mitades del "tiempo de peón",
+  que es la métrica operativa que una PyME quiere del desempeño de su flota— y
+  `duracion_aproximacion_origen`. Cubre el caso que motivó el cambio de
+  semántica: con un historial completo el valor correcto es 60 minutos, mientras
+  que la fórmula vieja daba 115 porque incluía el viaje **hacia** el origen y la
+  carga. Cubre también que un viaje sin historial —los 845 que ya existían
+  cuando se agregó la tabla— devuelva `null` en vez del número viejo, que ya no
+  significa lo mismo, y que las funciones **tiren un error explícito** si el
+  viaje llega sin la relación `historial_estados` incluida, mismo criterio
+  defensivo que `esViajeVencido` y `puedeVerViaje`.
+
+- **Unitario — `calcularPuntualidadInicio(viaje)`**: valida la clasificación de
+  puntualidad del conductor (`A_TIEMPO` / `TARDE` / `MUY_TARDE`), incluidos los
+  bordes exactos de cada umbral y los umbrales configurados por variable de
+  entorno. El caso importante es el cambio de semántica: la puntualidad se medía
+  en la **salida** hacia el origen —que no es llegar— y por eso casi todo salía
+  `A_TIEMPO` aunque el conductor llegara tarde; en la base de producción había
+  230 `A_TIEMPO` contra 24 tardíos. Ahora se mide en la **llegada al origen**.
+  El test verifica explícitamente que la columna vieja `puntualidad_inicio`
+  —que quedó muerta en el schema— se ignore por completo, para que un valor
+  calculado con la definición anterior nunca se devuelva como si fuera el nuevo.
+
 - **E2E — login y creación de viaje**: simula el flujo crítico completo de
   un cliente real. Autentica contra Firebase con credenciales de un usuario
   de prueba, obtiene el token JWT, y usa ese token para crear un viaje real

@@ -13,6 +13,12 @@ const PARADA_2 = { lat: -34.5895, lng: -58.3974, direccion: 'Recoleta, CABA' };
 const MIN = 60 * 1000;
 const HORA = 60 * MIN;
 
+// La ventana de inicio es configurable y el .env local NO usa el default del
+// codigo (30): hoy esta en 120. El test la lee en vez de asumirla — con un
+// valor fijo, el CASO 2 ("demasiado temprano") daba 200 y fallaba sin que
+// hubiera ningun bug.
+const VENTANA_INICIO_MINUTOS = Number(process.env.VENTANA_INICIO_MINUTOS ?? 30);
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const pasos = [];
@@ -173,13 +179,19 @@ async function main() {
 
   const { status: si1, data: di1 } = await api('POST', `/api/viajes/${v1}/iniciar`, null, conductorAToken);
   const v1Db = await estadoDe(v1, clienteToken);
-  paso('CASO 1: POST iniciar → 200, estado EN_CAMINO_A_ORIGEN, puntualidad A_TIEMPO',
-    si1 === 200 && di1.estado === 'EN_CAMINO_A_ORIGEN' && di1.puntualidad_inicio === 'A_TIEMPO' &&
+  paso('CASO 1: POST iniciar → 200, estado EN_CAMINO_A_ORIGEN, fecha_inicio guardada',
+    si1 === 200 && di1.estado === 'EN_CAMINO_A_ORIGEN' &&
     !!di1.fecha_inicio && di1.mensaje === 'Viaje iniciado',
-    `status=${si1} estado=${di1.estado} puntualidad=${di1.puntualidad_inicio} fecha_inicio=${di1.fecha_inicio}`);
-  paso('CASO 1: en DB estado=EN_CAMINO_A_ORIGEN, fecha_inicio y puntualidad_inicio guardadas',
-    v1Db.estado === 'EN_CAMINO_A_ORIGEN' && !!v1Db.fecha_inicio && v1Db.puntualidad_inicio === 'A_TIEMPO',
-    `estado=${v1Db.estado} fecha_inicio=${v1Db.fecha_inicio} puntualidad=${v1Db.puntualidad_inicio}`);
+    `status=${si1} estado=${di1.estado} fecha_inicio=${di1.fecha_inicio}`);
+  // La puntualidad YA NO se calcula ni se persiste al iniciar: ahora se mide en
+  // la LLEGADA al origen y se calcula en el read. Ver test-historial-estados.js
+  // CASO 2, y puntualidad.service.js.
+  paso('CASO 1: iniciar ya NO devuelve ni persiste puntualidad_inicio',
+    !Object.hasOwn(di1, 'puntualidad_inicio') && v1Db.puntualidad_inicio === null,
+    `en la respuesta=${Object.hasOwn(di1, 'puntualidad_inicio')} en el read=${v1Db.puntualidad_inicio}`);
+  paso('CASO 1: en DB estado=EN_CAMINO_A_ORIGEN con fecha_inicio',
+    v1Db.estado === 'EN_CAMINO_A_ORIGEN' && !!v1Db.fecha_inicio,
+    `estado=${v1Db.estado} fecha_inicio=${v1Db.fecha_inicio}`);
 
   // ── CASO 2: Demasiado temprano (fecha +2h) → 400 ─────────────────────────────
   console.log('\n── CASO 2: Demasiado temprano (fecha +2h) → 400 ───────────────\n');
@@ -187,7 +199,8 @@ async function main() {
   const v2 = await crearViajePublicado(clienteToken);
   await esperar(1200);
   await aceptar(sA, v2);
-  await setFecha(v2, new Date(Date.now() + 2 * HORA));
+  // Mas alla de la ventana configurada + 30 min de margen, sea cual sea su valor.
+  await setFecha(v2, new Date(Date.now() + (VENTANA_INICIO_MINUTOS + 30) * MIN));
 
   const { status: si2, data: di2 } = await api('POST', `/api/viajes/${v2}/iniciar`, null, conductorAToken);
   const v2Db = await estadoDe(v2, clienteToken);
@@ -207,9 +220,11 @@ async function main() {
   await setFecha(v3, new Date(Date.now() - 45 * MIN));
 
   const { status: si3, data: di3 } = await api('POST', `/api/viajes/${v3}/iniciar`, null, conductorAToken);
-  paso('CASO 3: POST iniciar 45min tarde → 200, puntualidad TARDE',
-    si3 === 200 && di3.estado === 'EN_CAMINO_A_ORIGEN' && di3.puntualidad_inicio === 'TARDE',
-    `status=${si3} estado=${di3.estado} puntualidad=${di3.puntualidad_inicio}`);
+  // No hay limite superior: iniciar tarde siempre se puede. La CLASIFICACION de
+  // la puntualidad ya no vive aca (se mide en la llegada).
+  paso('CASO 3: POST iniciar 45min tarde → 200 igual (no hay limite superior)',
+    si3 === 200 && di3.estado === 'EN_CAMINO_A_ORIGEN',
+    `status=${si3} estado=${di3.estado}`);
 
   // ── CASO 4: Inicio muy tarde (fecha -3h) → MUY_TARDE ─────────────────────────
   console.log('\n── CASO 4: Inicio muy tarde (fecha -3h) → MUY_TARDE ───────────\n');
@@ -220,9 +235,9 @@ async function main() {
   await setFecha(v4, new Date(Date.now() - 3 * HORA));
 
   const { status: si4, data: di4 } = await api('POST', `/api/viajes/${v4}/iniciar`, null, conductorAToken);
-  paso('CASO 4: POST iniciar 3h tarde → 200, puntualidad MUY_TARDE',
-    si4 === 200 && di4.estado === 'EN_CAMINO_A_ORIGEN' && di4.puntualidad_inicio === 'MUY_TARDE',
-    `status=${si4} estado=${di4.estado} puntualidad=${di4.puntualidad_inicio}`);
+  paso('CASO 4: POST iniciar 3h tarde → 200 igual',
+    si4 === 200 && di4.estado === 'EN_CAMINO_A_ORIGEN',
+    `status=${si4} estado=${di4.estado}`);
 
   // ── CASO 5: Ping GPS ANTES de iniciar → rechazado, sin efectos ───────────────
   console.log('\n── CASO 5: Ping GPS antes de iniciar → error, sin efecto ──────\n');
@@ -289,9 +304,9 @@ async function main() {
   await esperar(1000);
 
   const ev7 = iniciadosCliente.get(v7);
-  paso('CASO 7: cliente recibe viaje:iniciado con { id_viaje, fecha_inicio, puntualidad_inicio }',
+  paso('CASO 7: cliente recibe viaje:iniciado con { id_viaje, fecha_inicio } (sin puntualidad)',
     ev7 != null && ev7.id_viaje === v7 && !!ev7.fecha_inicio &&
-    ev7.fecha_inicio === di7.fecha_inicio && ev7.puntualidad_inicio === di7.puntualidad_inicio,
+    ev7.fecha_inicio === di7.fecha_inicio && !Object.hasOwn(ev7, 'puntualidad_inicio'),
     ev7 ? JSON.stringify(ev7) : 'evento no recibido');
 
   // ── CASO 8: Doble inicio → 400 (ya no esta en CONDUCTOR_ASIGNADO) ────────────

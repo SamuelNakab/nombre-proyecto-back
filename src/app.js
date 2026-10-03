@@ -11,6 +11,7 @@ import afiliacionesRoutes from './routes/afiliaciones.routes.js';
 import adminRoutes from './routes/admin.routes.js';
 import { inicializarSockets } from './sockets/index.js';
 import { barridoInicialReservas } from './services/reserva.service.js';
+import { barridoInicialVencimientos } from './services/vencimiento.service.js';
 
 const app = express();
 
@@ -48,6 +49,21 @@ if (process.env.RESERVA_BARRIDO_ARRANQUE === '0') {
     console.error('[reserva-timeout] barrido de arranque fallo:', e.message)
   );
 }
+
+// Segundo barrido UNICO al arrancar, mismo patron que el de reservas: los
+// avisos de vencimiento tambien son setTimeout en memoria y un deploy los
+// pierde. Esto los reconstruye para los viajes cuya fecha_programada TODAVIA NO
+// llego, con el tiempo restante contado desde esa fecha.
+//
+// Los que vencieron mientras el proceso estaba caido NO se avisan: emitir al
+// arrancar seria tirar el evento al vacio (nadie conectado todavia). Esos los
+// cubre el flag `vencido` del read. Ver vencimiento.service.js.
+//
+// A diferencia del de reservas, este NO lleva kill-switch: no escribe nada en la
+// DB de Neon compartida con produccion, solo lee y arma timers en memoria.
+barridoInicialVencimientos(io).catch((e) =>
+  console.error('[viaje-vencido] barrido de arranque fallo:', e.message)
+);
 
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => {

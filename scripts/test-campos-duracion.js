@@ -427,25 +427,59 @@ async function main() {
     `estado=${sinFinalizar?.estado} duracion_real=${sinFinalizar?.duracion_real}`
   );
 
+  // CAMBIO DE SEMANTICA: duracion_real ya NO se mide desde fecha_inicio (el
+  // momento en que el conductor arranca HACIA el origen) sino desde la SALIDA
+  // DEL ORIGEN — la transicion CARGANDO -> EN_RUTA, o sea la fila EN_RUTA del
+  // historial de estados. El tiempo de aproximacion al origen se expone aparte,
+  // en duracion_aproximacion_origen.
+  //
   // El flujo del test dura segundos, asi que duracion_real redondea a 0 y no
-  // prueba la aritmetica. Atrasamos fecha_inicio 45 minutos contra la ultima
+  // prueba la aritmetica. Atrasamos la fila EN_RUTA 45 minutos contra la ultima
   // fecha_entrega real y verificamos que el valor sale exacto.
   const paradasCaba = await prisma.parada.findMany({
     where: { id_viaje: rCaba.id_viaje },
     select: { fecha_entrega: true },
   });
   const ultimaEntrega = Math.max(...paradasCaba.map((p) => new Date(p.fecha_entrega).getTime()));
+
+  const filaEnRuta = await prisma.historialEstadoViaje.findFirst({
+    where: { id_viaje: rCaba.id_viaje, estado: 'EN_RUTA' },
+    orderBy: [{ fecha: 'asc' }, { id_historial: 'asc' }],
+  });
+  paso(
+    'CASO 3e-pre: el viaje finalizado tiene su fila EN_RUTA en el historial',
+    filaEnRuta != null,
+    `id_historial=${filaEnRuta?.id_historial}`
+  );
+  await prisma.historialEstadoViaje.update({
+    where: { id_historial: filaEnRuta.id_historial },
+    data: { fecha: new Date(ultimaEntrega - 45 * 60000) },
+  });
+
+  // Mover fecha_inicio NO tiene que cambiar duracion_real: ese es justamente el
+  // dato que dejo de usarse. Lo corremos 3 horas atras para probarlo.
   await prisma.viaje.update({
     where: { id_viaje: rCaba.id_viaje },
-    data: { fecha_inicio: new Date(ultimaEntrega - 45 * 60000) },
+    data: { fecha_inicio: new Date(ultimaEntrega - 3 * 60 * 60000) },
   });
 
   const { data: misViajes2 } = await api('GET', '/api/viajes/mis-viajes', null, clienteToken);
   const finCaba2 = misViajes2.find((v) => v.id_viaje === rCaba.id_viaje);
   paso(
-    'CASO 3e: con fecha_inicio 45 min antes de la ultima entrega → duracion_real = 45',
+    'CASO 3e: con la SALIDA DEL ORIGEN 45 min antes de la ultima entrega → duracion_real = 45',
     finCaba2?.duracion_real === 45,
-    `duracion_real=${finCaba2?.duracion_real} (esperado 45)`
+    `duracion_real=${finCaba2?.duracion_real} (esperado 45; fecha_inicio quedo 3h antes y NO se usa)`
+  );
+
+  paso(
+    'CASO 3e-bis: mis-viajes trae tambien las metricas por etapa',
+    finCaba2 != null &&
+      Object.hasOwn(finCaba2, 'duracion_carga') &&
+      Object.hasOwn(finCaba2, 'duracion_descarga') &&
+      Object.hasOwn(finCaba2, 'duracion_aproximacion_origen') &&
+      Object.hasOwn(finCaba2, 'puntualidad_inicio'),
+    `carga=${finCaba2?.duracion_carga} descarga=${finCaba2?.duracion_descarga} ` +
+      `aprox=${finCaba2?.duracion_aproximacion_origen} puntualidad=${finCaba2?.puntualidad_inicio}`
   );
 
   // La ultima fecha_entrega se toma con max(), no por el orden de la parada:

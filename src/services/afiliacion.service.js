@@ -3,6 +3,7 @@ import prisma from '../config/prisma.js';
 import { validarTransicion } from './estado-viaje.service.js';
 import { io } from '../sockets/index.js';
 import { programarTimeoutReserva } from './reserva.service.js';
+import { registrarCambioEstado } from './historial-estado.service.js';
 
 // ─── Codigo de afiliacion ────────────────────────────────────────────────────
 
@@ -46,7 +47,10 @@ const ESTADOS_EN_CURSO = ['EN_CAMINO_A_ORIGEN', 'CARGANDO', 'EN_RUTA', 'DESCARGA
 //
 // Devuelve { ok: false, error } si hay un viaje en curso (el caller responde
 // 400) o { ok: true, viajes_devueltos: [...] } si se ejecuto la baja.
-export async function ejecutarDesafiliacion(id_conductor, id_empresa) {
+// `actor` = { id_usuario, origen } de quien corto el vinculo: el GERENTE que
+// echa al conductor, o el CONDUCTOR que se va por su cuenta. Los dos caminos
+// terminan aca, asi que el actor viene por parametro.
+export async function ejecutarDesafiliacion(id_conductor, id_empresa, actor = {}) {
   const enCurso = await prisma.viaje.count({
     where: { id_conductor, id_empresa, estado: { in: ESTADOS_EN_CURSO } },
   });
@@ -83,6 +87,17 @@ export async function ejecutarDesafiliacion(id_conductor, id_empresa) {
       data: { fecha_baja: new Date() },
     });
   });
+
+  // SITIO 12/12 del historial. FUERA de la $transaction a proposito: adentro,
+  // un fallo del insert haria rollback de toda la desafiliacion.
+  for (const viaje of asignados) {
+    await registrarCambioEstado({
+      id_viaje: viaje.id_viaje,
+      estado: 'RESERVADO_POR_EMPRESA',
+      id_usuario: actor.id_usuario ?? null,
+      origen: actor.origen ?? null,
+    });
+  }
 
   // Cada viaje devuelto RE-ENTRA a RESERVADO_POR_EMPRESA con fecha_reserva nueva
   // (ver el update de arriba), asi que le corresponde un timeout propio. Con el

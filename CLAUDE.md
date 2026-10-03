@@ -22,6 +22,11 @@ MVP: CABA + GBA.
 - Viajes vencidos: flag `vencido` en el read + evento viaje:vencido COMPLETO
 - Historial de estados del viaje, metricas por etapa (tiempo de peon),
   puntualidad medida en la LLEGADA al origen y guard atomico en iniciar COMPLETO
+- PASO 1 del modelo nuevo — Identidad (PyMEs, miembros, invitaciones por
+  codigo, vinculo PyME-chofer) COMPLETO. Solo agrega: el flujo de viajes,
+  marketplace, gerente, empresas, afiliaciones y calificaciones NO cambio (se
+  reemplaza en el Paso 2). Ver "Identidad — PyMEs, miembros, invitaciones y
+  choferes".
 
 ## Stack
 - Node.js 22, ES Modules (NUNCA require()). Async/await siempre.
@@ -43,6 +48,158 @@ MVP: CABA + GBA.
   ADITIVOS (tablas nuevas, columnas nullable) son seguros. NUNCA dropear
   ni renombrar columnas sin autorizacion explicita.
 - El reemplazo del QR por proximidad NO tuvo cambios de schema.
+- Paso 1 (identidad): 6 enums nuevos y 4 tablas nuevas (organizaciones,
+  miembros_organizacion, invitaciones, vinculos_chofer), con FKs e indices SOLO
+  sobre esas tablas. Las back-relations en Usuario y Conductor no generan DDL.
+  Se reviso con `npx prisma migrate diff --from-schema-datasource
+  prisma/schema.prisma --to-schema-datamodel prisma/schema.prisma --script`
+  antes del db push (ojo: --from-url "$DATABASE_URL" no anda si la variable no
+  esta exportada en el shell; --from-schema-datasource la lee del .env).
+
+## Identidad — PyMEs, miembros, invitaciones y choferes (Paso 1)
+
+Fleter se relanza como app de control y trazabilidad: una PyME registra y sigue
+sus viajes con choferes de confianza. El Paso 1 es SOLO la capa de identidad.
+Todavia no esta conectada a viajes: eso es el Paso 2.
+
+### Cuentas
+- `usuario.rol` ES el tipo de cuenta y no cambia despues del registro (PUT
+  /api/auth/perfil no acepta rol). CLIENTE = usuario de PyME, CONDUCTOR = chofer,
+  ADMIN. GERENTE queda como estaba. Quien es PyME y chofer a la vez usa DOS
+  cuentas.
+- Registro de CLIENTE: empresa y CUIT no son obligatorios (ya no lo eran:
+  Cliente.cuit / nombre_empresa eran String? y el Zod los tenia .optional(); no
+  hizo falta tocar columnas). Si llegan se guardan como campos LEGACY y nada
+  nuevo los usa: la PyME es Organizacion.
+- CLIENTE huerfano (sin membresia activa): en lo nuevo solo puede crear una PyME
+  o canjear un codigo de MIEMBRO. Todo /api/organizaciones/:id/* pasa por
+  requireMiembro -> 403 "No perteneces a esta PyME", exista o no la PyME.
+- CONDUCTOR sin vinculos: solo canjea codigos de CHOFER (GET
+  mis-organizaciones le devuelve []).
+- NO existe endpoint para borrar la cuenta (ni en auth ni en admin), asi que no
+  hubo que bloquearlo para el ultimo responsable. Si se crea, TIENE que negarse
+  mientras el usuario sea el ultimo responsable activo de su PyME (reusar
+  darDeBaja / la cuenta de responsables de organizacion.service.js).
+
+### Modelos (prisma/schema.prisma)
+- Organizacion: nombre, cuit (normalizado, 11 digitos), razon_social?,
+  direccion?, estado TRIAL | ACTIVA | SUSPENDIDA (default TRIAL; las
+  transiciones son del Paso 5, hoy solo existe el campo).
+- MiembroOrganizacion: id_organizacion, id_usuario, rol RESPONSABLE | MIEMBRO
+  (enum que va a crecer), activo, fecha_alta, fecha_baja, motivo_baja
+  (SE_FUE | ELIMINADO), baja_por_id_usuario (sin FK).
+- Invitacion: id_organizacion, tipo MIEMBRO | CHOFER, codigo_hash (@unique),
+  creada_por, fecha_vencimiento, fecha_uso / usada_por, fecha_revocacion /
+  revocada_por.
+- VinculoChofer: id_organizacion, id_conductor, activo, fecha_alta, fecha_baja,
+  desvinculado_por (CHOFER | ORGANIZACION) + desvinculado_por_id_usuario,
+  metodo_cobro (enum con un unico valor, CALCULO_PLATAFORMA) + parametros_cobro
+  (Json?, para metodos futuros), id_invitacion. Nadie puede cambiar el metodo de
+  cobro todavia.
+- Membresias y vinculos NO tienen unique (organizacion, usuario/conductor): irse
+  y volver, o desvincularse y revincularse, crea una fila NUEVA. Cada paso queda
+  en el historial.
+
+### Invariantes y como se sostienen
+Ninguna es un constraint (CUIT por pedido explicito; las otras no son de fila).
+Se sostienen serializando las operaciones con locks dentro de una $transaction
+interactiva (OPCIONES_TX: maxWait 10s, timeout 20s):
+
+| Invariante                                   | Lock                                          | Operaciones                   |
+|----------------------------------------------|-----------------------------------------------|-------------------------------|
+| Una sola PyME activa por usuario (MAX_ORGANIZACIONES_POR_USUARIO, default 1) | SELECT ... FROM usuarios FOR UPDATE (fila del actor) | crear PyME, canjear           |
+| Toda PyME tiene >= 1 RESPONSABLE activo      | SELECT ... FROM organizaciones FOR UPDATE      | cambiar rol, eliminar, irse   |
+| CUIT unico entre PyMEs                       | pg_advisory_xact_lock(hashtext('org-cuit:'+cuit)) | crear, editar              |
+| Un codigo se usa una sola vez                | updateMany condicionado a pendiente, en la MISMA tx que crea la membresia/vinculo | canjear |
+
+- Los dos primeros locks nunca se toman en la misma transaccion: no hay orden
+  que pueda hacer deadlock.
+- Las operaciones sobre miembros RE-chequean adentro de la tx (ya con la PyME
+  bloqueada) que el actor siga siendo RESPONSABLE activo (exigirResponsable): el
+  middleware chequea antes del lock y otro responsable lo pudo haber degradado.
+- Eliminar a OTRO responsable nunca choca con "ultimo responsable" (si el actor
+  es responsable hay al menos dos). El 409 de eliminar solo es alcanzable cuando
+  un responsable se elimina A SI MISMO (cuenta como SE_FUE). Dos responsables
+  eliminandose mutuamente a la vez: gana uno, el otro recibe 403 (ya no es
+  miembro cuando le toca el lock).
+- Cada guard esta VERIFICADO revirtiendolo (protocolo de reversion con
+  test-identidad.js): sin el lock de usuario, CASO 11 da 200,200 y el usuario
+  termina en 2 PyMEs; sin el lock de la PyME, CASO 10 deja la PyME con 0
+  responsables; sin el condicional del canje, CASO 9 da 200,200 con el mismo
+  codigo.
+
+### Permisos
+- Solo RESPONSABLE: generar y revocar codigos de MIEMBRO, eliminar miembros,
+  editar la PyME, cambiar roles (promover / degradar, incluido a si mismo).
+- Cualquier miembro activo: ver la PyME, sus miembros activos y las
+  invitaciones pendientes; generar y revocar codigos de CHOFER; listar choferes
+  y desvincularlos; irse.
+- Cualquier miembro se va solo, salvo el ultimo responsable (409).
+
+### Invitaciones — src/services/invitacion.service.js
+- Codigo de 10 caracteres con crypto.randomInt sobre el alfabeto sin ambiguos
+  (sin 0/O ni 1/I/L; el mismo de codigo_afiliacion, replicado porque
+  afiliacion.service no lo exporta y es del Paso 2). Se muestra XXXXX-XXXXX.
+- En la base SOLO va HMAC-SHA256(codigo normalizado, INVITACION_SECRETO). El
+  codigo en claro se devuelve UNA vez, en la respuesta de creacion. El listado
+  de pendientes no trae ni codigo ni hash.
+- Sin INVITACION_SECRETO el server arranca, loguea "[invitaciones]
+  INVITACION_SECRETO no configurado" y los endpoints de invitaciones (crear,
+  listar, revocar, canjear) responden 503. El secreto se lee en cada request.
+- Vence a las INVITACION_VIGENCIA_HORAS (72), un solo uso, revocable (solo si
+  esta pendiente; si no, 409).
+- Canje: UN endpoint. CLIENTE -> solo MIEMBRO (queda MIEMBRO). CONDUCTOR -> solo
+  CHOFER (queda vinculado). Ignora guiones, espacios y mayusculas.
+- ERRORES, en este orden (es contrato, esta igual en API.md):
+  1. 503 sin secreto.
+  2. 429 rate limit (va ANTES del body: un intento con basura cuenta igual).
+  3. 400 body invalido.
+  4. Estado del usuario, EXPLICITO y antes de buscar el codigo: CLIENTE con PyME
+     activa -> 409 "Ya perteneces a una PyME" (aun con un codigo inexistente).
+  5. Cualquier falla del codigo -> 400 { "error": "Codigo invalido" }, IDENTICO
+     byte a byte: no existe, vencido, usado, revocado, de otro tipo, formato
+     basura, o perdio la carrera contra otro canje.
+  - Matiz: "ya vinculado a ESA PyME" (CONDUCTOR) solo se puede saber con el
+    codigo resuelto, porque es el codigo el que dice de que PyME es. Se chequea
+    recien con un codigo VALIDO -> 409 "Ya estas vinculado a esta PyME", y el
+    codigo NO se consume. No filtra nada: solo se entera quien tiene un codigo
+    bueno.
+- Rate limit (rate-limit-canje.service.js): INVITACION_INTENTOS_MAX (5) cada
+  INVITACION_VENTANA_MINUTOS (15), por usuario Y por IP, contando cada intento.
+  MULTI de SET NX EX + INCR (la clave nunca queda sin TTL; no depende de EXPIRE
+  NX de Redis 7). IP = ultimo valor de X-Forwarded-For (el que agrega el proxy
+  de Railway) o el socket; NO se activo `trust proxy` para no cambiar req.ip en
+  toda la app. Si Redis no esta `ready` o no responde en 1s -> se deja pasar y
+  se loguea "[invitaciones] rate limit sin Redis". Ese chequeo de status existe
+  porque ioredis ENCOLA comandos mientras reconecta: sin el, con Redis caido el
+  request quedaria colgado.
+
+### Vinculo PyME-chofer — src/services/vinculo-chofer.service.js
+- La PyME ve de sus choferes: nombre, apellido, telefono y sus vehiculos
+  PROPIOS (patente, marca, modelo, anio, color, tipo, condiciones). NUNCA a que
+  otras PyMEs esta vinculado, ni la flota de empresas de logistica donde trabaje
+  (conductor_vehiculos: es de otra organizacion).
+- El chofer ve el nombre de sus PyMEs (GET /api/choferes/mis-organizaciones y
+  `organizaciones` en /me).
+- desvincularChofer({ id_organizacion, id_conductor, actor }) es la UNICA
+  funcion que corta un vinculo; la usan los dos endpoints (desde la PyME, origen
+  ORGANIZACION; desde el chofer, origen CHOFER). updateMany condicionado a
+  activo -> 0 filas = 404.
+
+### PENDIENTE para el Paso 2
+- ENGANCHE en desvincularChofer: cancelar TODOS los viajes de ese chofer con
+  esa PyME, INCLUSO uno en curso. Hoy solo cambia el vinculo. Es una sola
+  funcion justamente para que ese agregado no se olvide en uno de los dos
+  caminos.
+- Conectar viajes a Organizacion (hoy Viaje cuelga de Cliente) y reemplazar el
+  marketplace / gerente / empresas / afiliaciones por el modelo PyME + choferes
+  de confianza. Permisos de viajes por membresia.
+- Usar metodo_cobro / parametros_cobro del vinculo en el calculo del precio.
+- Cuando se agregue un endpoint de borrar cuenta: bloquearlo para el ultimo
+  responsable (ver "Cuentas").
+- Transiciones de Organizacion.estado (TRIAL / ACTIVA / SUSPENDIDA): Paso 5.
+- Los campos legacy Cliente.cuit / nombre_empresa / direccion_principal se
+  pueden dejar de pedir en el front; se limpian cuando se separen las DBs.
 
 ## Maquina de estados — src/services/estado-viaje.service.js
 TRANSICIONES como estructura de datos + validarTransicion(actual, destino),
@@ -821,6 +978,18 @@ y debuggearlo sin esperar una hora. Detalles:
 - NO aplica a POST /api/viajes/estimar-costo: ahi fecha_programada es opcional,
   solo define si es hora pico, y acepta cualquier fecha (incluso pasada).
 
+INVITACION_SECRETO                (SIN default: es un secreto. Sin el, el server
+                                   arranca y los endpoints de invitaciones dan
+                                   503. MISMO valor en staging y produccion
+                                   mientras la DB este compartida)
+INVITACION_VIGENCIA_HORAS=72      (vida de un codigo de invitacion)
+INVITACION_INTENTOS_MAX=5         (rate limit del canje, por usuario Y por IP,
+INVITACION_VENTANA_MINUTOS=15      en Redis. Los tests suben el max: todo sale
+                                   de localhost y comparte la key por IP)
+MAX_ORGANIZACIONES_POR_USUARIO=1  (PyMEs activas por cuenta CLIENTE)
+Todas se leen en CADA request (no se cachean), con guarda: un
+valor basura o <= 0 cae al default.
+
 QR_SECRET se SACO de .env.example. Puede seguir en el .env local de cada
 uno, pero ya no lo lee nadie: se elimino junto con firmarQR/verificarQR.
 
@@ -898,6 +1067,28 @@ node scripts/test-timeout-reserva.js       (timers de reserva: vence y republica
                                             para los casos de timer — levanta
                                             uno propio por caso en 3201-3204 con
                                             RESERVA_TIMEOUT_MINUTOS=0.1)
+node scripts/test-identidad.js             (Paso 1: PyMEs, miembros, invitaciones,
+                                            canje, choferes, roles, perfil y la
+                                            concurrencia de las 3 invariantes.
+                                            NO usa el server de :3000 — levanta
+                                            uno propio en 3501 y casos aparte en
+                                            3502-3504 (rate limit, sin secreto,
+                                            Redis caido). Necesita Redis para el
+                                            CASO 12. Borra TODO lo que crea (DB,
+                                            Firebase y keys de Redis) y lo
+                                            verifica. Acepta numeros de caso:
+                                            `... identidad.js 9 10 11`)
+node scripts/seed-cuentas-test.js          (recrea las cuentas FIJAS de las suites
+                                            de regresion — cliente@, cliente2@,
+                                            conductor@, conductor2@,
+                                            stress-conductor2@test.com y
+                                            admin-test@fleter.com — en Firebase y
+                                            en la DB. Idempotente. CORRERLO
+                                            despues de cualquier reset de la DB:
+                                            si no, el registro de las suites da
+                                            409 (el email sigue en Firebase) y
+                                            todo request autenticado 404
+                                            "Usuario no registrado")
 
 scripts/_server-efimero.js es el helper compartido que levanta src/app.js en un
 puerto propio con el env que se le pida. Lo usan el CASO 8 de test-jerarquia

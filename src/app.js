@@ -9,7 +9,11 @@ import conductoresRoutes from './routes/conductores.routes.js';
 import empresasRoutes from './routes/empresas.routes.js';
 import afiliacionesRoutes from './routes/afiliaciones.routes.js';
 import adminRoutes from './routes/admin.routes.js';
+import organizacionesRoutes from './routes/organizaciones.routes.js';
+import invitacionesRoutes from './routes/invitaciones.routes.js';
+import choferesRoutes from './routes/choferes.routes.js';
 import { inicializarSockets } from './sockets/index.js';
+import { secretoInvitaciones } from './services/invitacion.service.js';
 import { barridoInicialReservas } from './services/reserva.service.js';
 import { barridoInicialVencimientos } from './services/vencimiento.service.js';
 
@@ -29,6 +33,15 @@ app.use('/api/conductores', conductoresRoutes);
 app.use('/api/empresas', empresasRoutes);
 app.use('/api/afiliaciones', afiliacionesRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/organizaciones', organizacionesRoutes);
+app.use('/api/invitaciones', invitacionesRoutes);
+app.use('/api/choferes', choferesRoutes);
+
+// Sin secreto el server arranca igual: solo los endpoints de invitaciones
+// responden 503 (requireInvitacionesConfiguradas). Se avisa fuerte al arrancar.
+if (!secretoInvitaciones()) {
+  console.error('[invitaciones] INVITACION_SECRETO no configurado: los endpoints de invitaciones van a responder 503');
+}
 
 const httpServer = createServer(app);
 const io = inicializarSockets(httpServer);

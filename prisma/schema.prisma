@@ -70,6 +70,43 @@ enum TipoCondicion {
   VOLUMINOSO
 }
 
+// ── Identidad (Paso 1): PyMEs, miembros, invitaciones y vinculo con choferes ──
+
+// Las transiciones de estado de la PyME llegan en el Paso 5; hoy solo existe
+// el campo, con default TRIAL.
+enum EstadoOrganizacion {
+  TRIAL
+  ACTIVA
+  SUSPENDIDA
+}
+
+// Va a crecer (roles intermedios). La regla "siempre al menos un RESPONSABLE
+// activo" vive en organizacion.service.js.
+enum RolMiembro {
+  RESPONSABLE
+  MIEMBRO
+}
+
+enum MotivoBajaMiembro {
+  SE_FUE
+  ELIMINADO
+}
+
+enum TipoInvitacion {
+  MIEMBRO
+  CHOFER
+}
+
+// Un unico valor por ahora: el calculo actual de la plataforma.
+enum MetodoCobro {
+  CALCULO_PLATAFORMA
+}
+
+enum OrigenDesvinculacion {
+  CHOFER
+  ORGANIZACION
+}
+
 // ─────────────────────────────────────────────
 // USUARIO BASE
 // ─────────────────────────────────────────────
@@ -92,6 +129,8 @@ model Usuario {
   empresas_gerente Empresa[]
   metodos_pago     MetodoPago[]
   viajes_cancelados_por_admin Viaje[] @relation("ViajesCanceladosPorAdmin")
+  // Back-relation, NO una columna: la FK vive en miembros_organizacion.
+  membresias       MiembroOrganizacion[]
 
   @@map("usuarios")
 }
@@ -131,8 +170,116 @@ model Conductor {
   vehiculos_propios   Vehiculo[]          @relation("VehiculoPropio")
   viajes              Viaje[]
   calificaciones      Calificacion[]
+  // Back-relation, NO una columna: la FK vive en vinculos_chofer.
+  vinculos_organizacion VinculoChofer[]
 
   @@map("conductores")
+}
+
+// ─────────────────────────────────────────────
+// ORGANIZACION (PyME)
+// El CUIT se guarda normalizado (11 digitos). Su unicidad se valida en
+// organizacion.service.js bajo un advisory lock, NO con un constraint: la DB
+// esta compartida con produccion y el pedido fue explicito en no ponerlo.
+// ─────────────────────────────────────────────
+
+model Organizacion {
+  id_organizacion Int                @id @default(autoincrement())
+  nombre          String
+  cuit            String
+  razon_social    String?
+  direccion       String?
+  estado          EstadoOrganizacion @default(TRIAL)
+  creado_en       DateTime           @default(now())
+  actualizado_en  DateTime           @updatedAt
+
+  miembros     MiembroOrganizacion[]
+  invitaciones Invitacion[]
+  choferes     VinculoChofer[]
+
+  @@map("organizaciones")
+}
+
+// ─────────────────────────────────────────────
+// MIEMBRO DE ORGANIZACION
+// Una fila por cada PASO por la PyME: irse y volver a entrar crea una fila
+// nueva, asi que NO hay unique (organizacion, usuario). El limite de una
+// membresia activa por usuario (MAX_ORGANIZACIONES_POR_USUARIO) es del servicio.
+// ─────────────────────────────────────────────
+
+model MiembroOrganizacion {
+  id_miembro          Int                @id @default(autoincrement())
+  id_organizacion     Int
+  id_usuario          Int
+  rol                 RolMiembro         @default(MIEMBRO)
+  activo              Boolean            @default(true)
+  fecha_alta          DateTime           @default(now())
+  fecha_baja          DateTime?
+  motivo_baja         MotivoBajaMiembro?
+  // Quien dio la baja (el mismo usuario si se fue). Sin FK, mismo criterio que
+  // historial_estado_viaje.id_usuario.
+  baja_por_id_usuario Int?
+
+  organizacion Organizacion @relation(fields: [id_organizacion], references: [id_organizacion])
+  usuario      Usuario      @relation(fields: [id_usuario], references: [id_usuario])
+
+  @@index([id_usuario, activo])
+  @@index([id_organizacion, activo])
+  @@map("miembros_organizacion")
+}
+
+// ─────────────────────────────────────────────
+// INVITACION
+// El codigo en claro se devuelve UNA vez al crearlo y nunca se guarda: en la
+// base queda solo su HMAC-SHA256 con INVITACION_SECRETO.
+// ─────────────────────────────────────────────
+
+model Invitacion {
+  id_invitacion           Int            @id @default(autoincrement())
+  id_organizacion         Int
+  tipo                    TipoInvitacion
+  codigo_hash             String         @unique
+  creada_por_id_usuario   Int
+  fecha_creacion          DateTime       @default(now())
+  fecha_vencimiento       DateTime
+  fecha_uso               DateTime?
+  usada_por_id_usuario    Int?
+  fecha_revocacion        DateTime?
+  revocada_por_id_usuario Int?
+
+  organizacion Organizacion @relation(fields: [id_organizacion], references: [id_organizacion])
+
+  @@index([id_organizacion])
+  @@map("invitaciones")
+}
+
+// ─────────────────────────────────────────────
+// VINCULO PyME <-> CHOFER  (N:N)
+// Igual que las membresias: desvincular marca la fila, y revincularse con un
+// codigo nuevo crea otra. Sin unique (organizacion, conductor).
+// ─────────────────────────────────────────────
+
+model VinculoChofer {
+  id_vinculo                  Int                   @id @default(autoincrement())
+  id_organizacion             Int
+  id_conductor                Int
+  activo                      Boolean               @default(true)
+  fecha_alta                  DateTime              @default(now())
+  fecha_baja                  DateTime?
+  desvinculado_por            OrigenDesvinculacion?
+  desvinculado_por_id_usuario Int?
+  // Todavia nadie lo puede cambiar. parametros_cobro queda para metodos futuros.
+  metodo_cobro                MetodoCobro           @default(CALCULO_PLATAFORMA)
+  parametros_cobro            Json?
+  // Codigo con el que se creo el vinculo (trazabilidad).
+  id_invitacion               Int?
+
+  organizacion Organizacion @relation(fields: [id_organizacion], references: [id_organizacion])
+  conductor    Conductor    @relation(fields: [id_conductor], references: [id_conductor])
+
+  @@index([id_conductor, activo])
+  @@index([id_organizacion, activo])
+  @@map("vinculos_chofer")
 }
 
 // ─────────────────────────────────────────────

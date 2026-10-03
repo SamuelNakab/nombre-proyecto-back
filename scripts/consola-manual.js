@@ -7,6 +7,11 @@
 // ping GPS / cambiar estado / confirmar parada / cancelar / ver estado) contra
 // staging (o la API que se le indique). No depende del mobile ni del front.
 //
+// Identidad (Paso 1), opciones con LETRA: perfil, crear PyME, invitaciones
+// (MIEMBRO / CHOFER), canje como cliente o conductor, miembros, choferes, "mis
+// PyMEs" del conductor y desvincular desde los dos lados. El CLIENTE de prueba
+// opera la PyME; el CONDUCTOR de prueba es el chofer.
+//
 // No corre en CI: es interactivo, de uso manual local. Vive en scripts/, fuera
 // de los globs de lint y test.
 //
@@ -71,6 +76,10 @@ const estado = {
   idViaje: null,
   clienteToken: null,
   conductorToken: null,
+  // Identidad: la PyME del cliente (sale de /me) y el ultimo codigo generado
+  // (el backend lo muestra UNA sola vez, asi que lo guardamos para canjearlo).
+  idOrganizacion: null,
+  ultimoCodigo: null,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -278,6 +287,111 @@ async function accionVerEstado() {
   console.log(`  Detalle completo: ${JSON.stringify(data)}`);
 }
 
+// ── Acciones de identidad (Paso 1) ───────────────────────────────────────────
+
+function mostrar(etiqueta, { status, data }) {
+  const ok = status >= 200 && status < 300;
+  console.log(`  ${ok ? '✅' : '❌'} ${etiqueta} → ${status}: ${JSON.stringify(data, null, 2)}`);
+}
+
+// Refresca la PyME del cliente desde /me (organizacion null = huerfano).
+async function refrescarPyme() {
+  const r = await api('GET', '/api/auth/me', null, estado.clienteToken);
+  estado.idOrganizacion = r.data?.organizacion?.id_organizacion ?? null;
+  return r;
+}
+
+async function requierePyme() {
+  if (estado.idOrganizacion == null) await refrescarPyme();
+  if (estado.idOrganizacion == null) {
+    console.log('  ⚠  El cliente no tiene PyME (huerfano). Crea una (c) o canjea un codigo de MIEMBRO (g).');
+    return false;
+  }
+  return true;
+}
+
+async function accionPerfil(quien) {
+  const token = quien === 'cliente' ? estado.clienteToken : estado.conductorToken;
+  const r = await api('GET', '/api/auth/me', null, token);
+  if (quien === 'cliente') estado.idOrganizacion = r.data?.organizacion?.id_organizacion ?? null;
+  mostrar(`GET /api/auth/me (${quien})`, r);
+}
+
+async function accionCrearPyme() {
+  const nombre = (await pregunta('  Nombre de la PyME: ')) || `PyME consola ${Date.now()}`;
+  const cuit = await pregunta('  CUIT (11 digitos, con o sin guiones; ej. 33-69345023-9): ');
+  const r = await api('POST', '/api/organizaciones', { nombre, cuit }, estado.clienteToken);
+  if (r.status === 201) estado.idOrganizacion = r.data.id_organizacion;
+  mostrar('POST /api/organizaciones', r);
+}
+
+async function accionCrearInvitacion() {
+  if (!(await requierePyme())) return;
+  const tipo = (await pregunta('  Tipo (1=CHOFER, 2=MIEMBRO) [1]: ')) === '2' ? 'MIEMBRO' : 'CHOFER';
+  const r = await api('POST', `/api/organizaciones/${estado.idOrganizacion}/invitaciones`, { tipo }, estado.clienteToken);
+  if (r.status === 201) {
+    estado.ultimoCodigo = r.data.codigo;
+    console.log(`  🔑 Codigo ${tipo}: ${r.data.codigo}  (el backend no lo vuelve a mostrar; queda guardado para canjear)`);
+  }
+  mostrar('POST /api/organizaciones/:id/invitaciones', r);
+}
+
+async function accionListarInvitaciones() {
+  if (!(await requierePyme())) return;
+  mostrar('GET /api/organizaciones/:id/invitaciones',
+    await api('GET', `/api/organizaciones/${estado.idOrganizacion}/invitaciones`, null, estado.clienteToken));
+}
+
+async function accionCanjear(quien) {
+  const token = quien === 'cliente' ? estado.clienteToken : estado.conductorToken;
+  const sugerido = estado.ultimoCodigo ?? '';
+  const raw = await pregunta(`  Codigo a canjear como ${quien} [${sugerido || 'ninguno guardado'}]: `);
+  const codigo = raw || sugerido;
+  if (!codigo) {
+    console.log('  ⚠  No hay codigo. Genera uno con (d).');
+    return;
+  }
+  const r = await api('POST', '/api/invitaciones/canjear', { codigo }, token);
+  if (quien === 'cliente' && r.status === 200) estado.idOrganizacion = r.data.organizacion.id_organizacion;
+  mostrar(`POST /api/invitaciones/canjear (${quien})`, r);
+}
+
+async function accionListarMiembros() {
+  if (!(await requierePyme())) return;
+  mostrar('GET /api/organizaciones/:id/miembros',
+    await api('GET', `/api/organizaciones/${estado.idOrganizacion}/miembros`, null, estado.clienteToken));
+}
+
+async function accionListarChoferes() {
+  if (!(await requierePyme())) return;
+  mostrar('GET /api/organizaciones/:id/choferes',
+    await api('GET', `/api/organizaciones/${estado.idOrganizacion}/choferes`, null, estado.clienteToken));
+}
+
+async function accionMisPymes() {
+  mostrar('GET /api/choferes/mis-organizaciones',
+    await api('GET', '/api/choferes/mis-organizaciones', null, estado.conductorToken));
+}
+
+async function accionDesvincularDesdePyme() {
+  if (!(await requierePyme())) return;
+  const choferes = await api('GET', `/api/organizaciones/${estado.idOrganizacion}/choferes`, null, estado.clienteToken);
+  const lista = Array.isArray(choferes.data) ? choferes.data : [];
+  lista.forEach((c) => console.log(`    id_conductor=${c.id_conductor} — ${c.nombre} ${c.apellido}`));
+  const id = await preguntarNumero('  id_conductor a desvincular', lista[0]?.id_conductor ?? 0);
+  mostrar('DELETE /api/organizaciones/:id/choferes/:idConductor',
+    await api('DELETE', `/api/organizaciones/${estado.idOrganizacion}/choferes/${id}`, null, estado.clienteToken));
+}
+
+async function accionDesvincularme() {
+  const mias = await api('GET', '/api/choferes/mis-organizaciones', null, estado.conductorToken);
+  const lista = Array.isArray(mias.data) ? mias.data : [];
+  lista.forEach((o) => console.log(`    id_organizacion=${o.id_organizacion} — ${o.nombre}`));
+  const id = await preguntarNumero('  id_organizacion de la que desvincularse', lista[0]?.id_organizacion ?? 0);
+  mostrar('DELETE /api/choferes/mis-organizaciones/:id',
+    await api('DELETE', `/api/choferes/mis-organizaciones/${id}`, null, estado.conductorToken));
+}
+
 // ── Menu ──────────────────────────────────────────────────────────────────────
 
 function imprimirMenu() {
@@ -294,6 +408,19 @@ function imprimirMenu() {
 ║  7) Cancelar conductor  (conductor, REST)      ║
 ║  8) Cancelar cliente    (cliente, REST)        ║
 ║  9) Ver estado del viaje(REST)                 ║
+╠═════════════ IDENTIDAD (PyME: ${String(estado.idOrganizacion ?? '—').padEnd(6)}) ════════╣
+║  a) Perfil del cliente      (/me)              ║
+║  b) Perfil del conductor    (/me)              ║
+║  c) Crear PyME              (cliente)          ║
+║  d) Generar codigo          (cliente)          ║
+║  e) Invitaciones pendientes (cliente)          ║
+║  f) Canjear codigo          (conductor)        ║
+║  g) Canjear codigo          (cliente)          ║
+║  h) Miembros de la PyME     (cliente)          ║
+║  i) Choferes de la PyME     (cliente)          ║
+║  j) Mis PyMEs               (conductor)        ║
+║  k) Desvincular chofer      (cliente)          ║
+║  l) Desvincularme           (conductor)        ║
 ║  0) Salir                                      ║
 ╚══════════════════════════════════════════════╝`);
 }
@@ -302,7 +429,7 @@ async function loopMenu(sCliente, sConductor) {
   // eslint-disable-next-line no-constant-condition
   while (true) {
     imprimirMenu();
-    const opt = (await pregunta('> ')).trim();
+    const opt = (await pregunta('> ')).trim().toLowerCase();
     switch (opt) {
       case '1': await accionCrearViaje(sCliente); break;
       case '2': accionAceptar(sConductor); break;
@@ -313,6 +440,18 @@ async function loopMenu(sCliente, sConductor) {
       case '7': await accionCancelarConductor(); break;
       case '8': await accionCancelarCliente(); break;
       case '9': await accionVerEstado(); break;
+      case 'a': await accionPerfil('cliente'); break;
+      case 'b': await accionPerfil('conductor'); break;
+      case 'c': await accionCrearPyme(); break;
+      case 'd': await accionCrearInvitacion(); break;
+      case 'e': await accionListarInvitaciones(); break;
+      case 'f': await accionCanjear('conductor'); break;
+      case 'g': await accionCanjear('cliente'); break;
+      case 'h': await accionListarMiembros(); break;
+      case 'i': await accionListarChoferes(); break;
+      case 'j': await accionMisPymes(); break;
+      case 'k': await accionDesvincularDesdePyme(); break;
+      case 'l': await accionDesvincularme(); break;
       case '0':
         console.log('  Cerrando…');
         try { sCliente.disconnect(); } catch { /* noop */ }

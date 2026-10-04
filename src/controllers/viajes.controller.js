@@ -1,9 +1,11 @@
 import { z } from 'zod';
 import prisma from '../config/prisma.js';
-import { estimarCosto as estimarCostoService } from '../services/costo.service.js';
+import {
+  estimarCosto as estimarCostoService,
+  calcularCostoAcumulado,
+} from '../services/costo.service.js';
 import { conductorEsElegible } from '../services/elegibilidad.service.js';
 import { publicarViajeAConductoresElegibles } from '../services/matching.service.js';
-import { obtenerAcumulado } from '../services/gps.service.js';
 import { cerrarViaje } from '../services/cierre.service.js';
 import { recalcularEtaInmediato } from '../services/eta-emisor.js';
 import { limpiarViajeActivo } from '../services/cancelacion.service.js';
@@ -12,8 +14,9 @@ import {
   cancelarTimeoutReserva,
 } from '../services/reserva.service.js';
 import { calcularYGuardarRuta, obtenerRutaPlaneada } from '../services/ruta.service.js';
-import { validarTransicion } from '../services/estado-viaje.service.js';
-import { repartirPorZona } from '../services/zona.service.js';
+import { validarTransicion, cicloDe } from '../services/estado-viaje.service.js';
+import { ventanaInicioAntesMinutosLegacy } from '../services/ventana-inicio.js';
+import { salasDeViaje } from '../sockets/salas.js';
 import { horasAMinutos, calcularMetricasViaje } from '../services/duracion.service.js';
 import { calcularPuntualidadInicio } from '../services/puntualidad.service.js';
 import {
@@ -31,69 +34,25 @@ import {
   puedeVerViajeDisponible,
   INCLUDE_ACCESO_VIAJE,
 } from '../services/acceso-viaje.service.js';
+import {
+  camposBase,
+  schemaCondiciones,
+  schemaFechaProgramada,
+  paradasParaCrear,
+} from '../services/viaje-validacion.js';
 import { io } from '../sockets/index.js';
 
 // ─── Schemas de validacion ───────────────────────────────────────────────────
-
-const CONDICIONES = ['FRAGIL', 'REFRIGERADO', 'CARGA_PESADA', 'PELIGROSO', 'VOLUMINOSO'];
-
-const camposBase = {
-  // `zona` se acepta SOLO por compatibilidad con el front actual, que la sigue
-  // mandando. Su valor se IGNORA: la zona real se calcula en el servidor a
-  // partir de las coordenadas de las paradas (clasificarZona). Ver zona.service.
-  zona: z.enum(['CABA', 'PROVINCIA', 'MIXTO']).optional(),
-  paradas: z
-    .array(
-      z.object({
-        lat: z.number(),
-        lng: z.number(),
-        direccion: z.string().min(1).optional(),
-      })
-    )
-    .min(2),
-};
 
 const schemaEstimar = z.object({
   ...camposBase,
   fecha_programada: z.string().optional(),
 });
 
-// Anticipacion minima para programar un viaje. Configurable porque en
-// staging/local hay que poder crear viajes y debuggearlos sin esperar una hora.
-// Se lee en CADA request (no se cachea en el modulo) para que el umbral y el
-// mensaje de error no se puedan desincronizar, y para poder cambiarla sin
-// redeploy de codigo.
-const ANTICIPACION_MINIMA_DEFAULT = 60;
-
-function anticipacionMinimaMinutos() {
-  const valor = Number(process.env.ANTICIPACION_MINIMA_MINUTOS ?? ANTICIPACION_MINIMA_DEFAULT);
-  // Un valor basura (NaN) o negativo se ignora: sin este guard, NaN haria que
-  // TODA comparacion diera false y no se pudiera crear ningun viaje.
-  if (!Number.isFinite(valor) || valor < 0) return ANTICIPACION_MINIMA_DEFAULT;
-  return valor;
-}
-
 const schemaCrear = z.object({
   ...camposBase,
-  fecha_programada: z.string().superRefine((val, ctx) => {
-    const minutos = anticipacionMinimaMinutos();
-    const date = new Date(val);
-    // El piso es "futura" y no depende de la variable: con la anticipacion en 0
-    // el minimo queda en `ahora` y la comparacion estricta (<=) igual rechaza el
-    // presente y el pasado. Por eso anticipacionMinimaMinutos() nunca devuelve
-    // un negativo: correria el minimo hacia atras y dejaria pasar fechas pasadas.
-    const minimo = new Date(Date.now() + minutos * 60 * 1000);
-    if (isNaN(date.getTime()) || date <= minimo) {
-      ctx.addIssue({
-        code: 'custom',
-        message: `fecha_programada debe ser una fecha ISO futura (al menos ${minutos} minutos desde ahora)`,
-      });
-    }
-  }),
-  condiciones_requeridas: z
-    .array(z.enum(CONDICIONES))
-    .optional()
-    .default([]),
+  fecha_programada: schemaFechaProgramada,
+  condiciones_requeridas: schemaCondiciones.optional().default([]),
   descripcion: z.string().max(500).optional(),
 });
 
@@ -157,14 +116,7 @@ export async function crearViaje(req, res) {
       // persiste (en HORAS) para que el detalle del viaje pueda devolver la
       // duracion estimada sin volver a pegarle a Google en cada lectura.
       duracion_estimada_horas: resultado.desglose.tiempo_horas,
-      paradas: {
-        create: paradas.map((p, i) => ({
-          orden: i + 1,
-          latitud: p.lat,
-          longitud: p.lng,
-          direccion: p.direccion ?? `${p.lat},${p.lng}`,
-        })),
-      },
+      paradas: { create: paradasParaCrear(paradas) },
       condiciones_req: {
         create: condiciones_requeridas.map((condicion) => ({ condicion })),
       },
@@ -369,8 +321,18 @@ export async function cambiarEstado(req, res) {
   // La maquina de estados es la unica fuente de verdad de que transiciones son
   // validas. Reemplaza el viejo chequeo ad-hoc de FINALIZADO/CANCELADO y ademas
   // rechaza retrocesos (p. ej. EN_RUTA -> CARGANDO).
+  //
+  // Viaje INTERNO: tabla del ciclo interno, y este endpoint solo AVANZA
+  // (EN_RUTA, DESCARGANDO). CARGANDO se alcanza unicamente por
+  // POST /api/choferes/viajes/:id/iniciar, que valida ventana y proximidad.
+  const interno = cicloDe(viaje) === 'INTERNO';
+  if (interno && estado === 'CARGANDO') {
+    return res.status(400).json({
+      error: 'En un viaje de PyME, CARGANDO se alcanza iniciando el viaje (POST /api/choferes/viajes/:id/iniciar)',
+    });
+  }
   try {
-    validarTransicion(viaje.estado, estado);
+    validarTransicion(viaje.estado, estado, interno ? { ciclo: 'INTERNO', quien: 'CHOFER' } : undefined);
   } catch (err) {
     return res.status(400).json({ error: err.message });
   }
@@ -386,13 +348,19 @@ export async function cambiarEstado(req, res) {
   // Solo rellena si sigue null: un ping que ya la registro nunca se pisa.
   const rellenaLlegada = estado === 'CARGANDO' && viaje.fecha_llegada_origen === null;
 
-  await prisma.viaje.update({
-    where: { id_viaje },
+  // GUARD ATOMICO: el estado leido va en el WHERE. Antes era un update plano:
+  // una cancelacion concurrente (la PyME cancela un viaje en curso) quedaba
+  // pisada por este avance, que devolvia el viaje CANCELADO a EN_RUTA.
+  const actualizado = await prisma.viaje.updateMany({
+    where: { id_viaje, estado: estado_anterior },
     data: {
       estado,
       ...(rellenaLlegada ? { fecha_llegada_origen: new Date() } : {}),
     },
   });
+  if (actualizado.count === 0) {
+    return res.status(409).json({ error: 'El viaje cambio de estado mientras se procesaba tu pedido' });
+  }
 
   // SITIO 3/12 del historial.
   await registrarCambioEstado({
@@ -403,7 +371,8 @@ export async function cambiarEstado(req, res) {
   });
 
   if (io) {
-    io.to(`viaje:${id_viaje}`).emit('viaje:estado_cambiado', {
+    // viaje:{id} y, si es de una PyME, organizacion:{id}.
+    io.to(salasDeViaje(viaje)).emit('viaje:estado_cambiado', {
       id_viaje,
       estado_anterior,
       estado_nuevo: estado,
@@ -449,9 +418,11 @@ export async function iniciarViaje(req, res) {
     });
   }
 
-  // 4. Ventana de tiempo: se puede iniciar desde VENTANA_INICIO_MINUTOS antes de
-  //    la fecha programada. NO hay limite superior — iniciar tarde siempre se puede.
-  const VENTANA_INICIO_MINUTOS = Number(process.env.VENTANA_INICIO_MINUTOS ?? 30);
+  // 4. Ventana de tiempo: se puede iniciar desde VENTANA_INICIO_ANTES_MINUTOS
+  //    antes de la fecha programada (fallback a la vieja VENTANA_INICIO_MINUTOS,
+  //    que esa variable reemplazo). NO hay limite superior en el ciclo LEGACY —
+  //    iniciar tarde siempre se puede. El ciclo interno tiene su propio iniciar.
+  const VENTANA_INICIO_MINUTOS = ventanaInicioAntesMinutosLegacy();
   const ahora = new Date();
   const aperturaVentana = new Date(
     viaje.fecha_programada.getTime() - VENTANA_INICIO_MINUTOS * 60000
@@ -742,44 +713,7 @@ export async function obtenerCostoAcumulado(req, res) {
     return res.status(403).json({ error: 'Sin acceso a este viaje' });
   }
 
-  const acumulado = await obtenerAcumulado(id_viaje);
-  if (!acumulado) {
-    return res.status(200).json({ precio_acumulado: 0, desglose: null });
-  }
-
-  // Mismo reparto que usan la estimacion y el cierre: en MIXTO se prorratea en
-  // vez de cobrar el tiempo total Y la distancia total.
-  const { tiempo_capital, distancia_provincia, fraccion_caba } = repartirPorZona({
-    zona: viaje.zona,
-    paradas: viaje.paradas,
-    tiempo_horas: acumulado.tiempo_horas,
-    distancia_km: acumulado.distancia_km,
-  });
-
-  const precio_por_tiempo =
-    tiempo_capital === null ? null : tiempo_capital * (viaje.tarifa_hora || 0);
-  const precio_por_distancia =
-    distancia_provincia === null ? null : distancia_provincia * (viaje.tarifa_km || 0);
-  const precio_acumulado = (precio_por_tiempo ?? 0) + (precio_por_distancia ?? 0);
-
-  const hora = new Date().getHours();
-  const es_hora_pico = (hora >= 7 && hora <= 10) || (hora >= 17 && hora <= 20);
-
-  return res.status(200).json({
-    precio_acumulado,
-    desglose: {
-      precio_por_tiempo,
-      precio_por_distancia,
-      tiempo_horas: acumulado.tiempo_horas,
-      distancia_km: acumulado.distancia_km,
-      tiempo_capital,
-      distancia_provincia,
-      fraccion_caba,
-      tarifa_hora: viaje.tarifa_hora,
-      tarifa_km: viaje.tarifa_km,
-      es_hora_pico,
-    },
-  });
+  return res.status(200).json(await calcularCostoAcumulado(viaje));
 }
 
 // ─── Fase 5 ───────────────────────────────────────────────────────────────────
@@ -849,16 +783,22 @@ export async function confirmarParada(req, res) {
 
   if (pendientes > 0) {
     // La proxima parada pendiente cambio: forzamos recalculo de ETA inmediato.
-    await recalcularEtaInmediato(io, id_viaje);
+    await recalcularEtaInmediato(io, id_viaje, salasDeViaje(viaje));
     return res.status(200).json({ confirmada: true, viaje_finalizado: false });
   }
 
   // cerrarViaje no conoce al actor: se lo pasamos. El conductor que confirma la
   // ultima parada es quien dispara el FINALIZADO (sitio 11/12 del historial).
-  const { precio_real, remito_url } = await cerrarViaje(id_viaje, io, {
+  const cierre = await cerrarViaje(id_viaje, io, {
     id_usuario: req.usuario.id_usuario,
     origen: 'CONDUCTOR',
   });
+  // null = el cierre perdio la carrera (p. ej. la PyME cancelo el viaje
+  // mientras se confirmaba la ultima parada): el viaje NO se finalizo.
+  if (!cierre) {
+    return res.status(409).json({ error: 'El viaje cambio de estado y no se pudo cerrar' });
+  }
+  const { precio_real, remito_url } = cierre;
   return res.status(200).json({ confirmada: true, viaje_finalizado: true, precio_real, remito_url });
 }
 
@@ -884,6 +824,9 @@ export async function calificarViaje(req, res) {
   });
 
   if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
+  // Los viajes de PyME (ciclo interno) no se califican: id_cliente es solo un
+  // ancla del schema, no el dueño del viaje.
+  if (viaje.id_organizacion !== null) return res.status(400).json({ error: 'Los viajes de PyME no se califican' });
   if (viaje.estado !== 'FINALIZADO') return res.status(400).json({ error: 'Solo se puede calificar un viaje finalizado' });
   if (viaje.cliente.id_usuario !== req.usuario.id_usuario) return res.status(403).json({ error: 'Sin acceso a este viaje' });
   if (viaje.calificacion) return res.status(409).json({ error: 'Este viaje ya tiene una calificacion' });
@@ -947,7 +890,9 @@ export async function listarMisViajes(req, res) {
   }
 
   const viajes = await prisma.viaje.findMany({
-    where: { id_cliente: cliente.id_cliente },
+    // Solo viajes LEGACY: los de PyME se listan por membresia en
+    // GET /api/organizaciones/:id/viajes, nunca por usuario.
+    where: { id_cliente: cliente.id_cliente, id_organizacion: null },
     include: {
       paradas: true,
       conductor: { include: { usuario: true } },
@@ -996,8 +941,10 @@ export async function listarMisViajesConductor(req, res) {
   }
 
   const viajes = await prisma.viaje.findMany({
+    // Solo viajes LEGACY: los de PyME estan en GET /api/choferes/viajes.
     where: {
       id_conductor: conductor.id_conductor,
+      id_organizacion: null,
       ...(estado ? { estado } : {}),
     },
     select: {
@@ -1051,7 +998,7 @@ export async function listarViajesAsignados(req, res) {
   }
 
   const viajes = await prisma.viaje.findMany({
-    where: { id_conductor: conductor.id_conductor, estado: 'CONDUCTOR_ASIGNADO' },
+    where: { id_conductor: conductor.id_conductor, estado: 'CONDUCTOR_ASIGNADO', id_organizacion: null },
     select: {
       id_viaje: true,
       zona: true,

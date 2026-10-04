@@ -18,6 +18,8 @@ import {
   listarChoferes as listarChoferesSrv,
   desvincularChofer as desvincularChoferSrv,
 } from '../services/vinculo-chofer.service.js';
+import { sincronizarSalaOrganizacion } from '../sockets/salas.js';
+import { io } from '../sockets/index.js';
 
 // ─── Schemas ─────────────────────────────────────────────────────────────────
 
@@ -66,6 +68,8 @@ export async function crearOrganizacion(req, res) {
   if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
   try {
     const org = await crearOrganizacionSrv({ id_usuario: req.usuario.id_usuario, ...parsed.data });
+    // El creador entra a la sala de la PyME (organizacion:{id}).
+    await sincronizarSalaOrganizacion(io, req.usuario.id_usuario, org.id_organizacion, true);
     return res.status(201).json(org);
   } catch (err) {
     return responderErrorNegocio(res, err);
@@ -129,6 +133,8 @@ export async function eliminarMiembro(req, res) {
   if (!id_usuario) return res.status(400).json({ error: 'id de usuario invalido' });
   try {
     await eliminarMiembroSrv({ id_organizacion: req.id_organizacion, id_actor: req.usuario.id_usuario, id_usuario });
+    // Sale de la sala de la PyME: deja de recibir eventos y tracking.
+    await sincronizarSalaOrganizacion(io, id_usuario, req.id_organizacion, false);
     return res.status(200).json({ mensaje: 'Miembro eliminado', id_usuario });
   } catch (err) {
     return responderErrorNegocio(res, err);
@@ -139,6 +145,7 @@ export async function eliminarMiembro(req, res) {
 export async function salir(req, res) {
   try {
     await salirDeOrganizacion({ id_organizacion: req.id_organizacion, id_usuario: req.usuario.id_usuario });
+    await sincronizarSalaOrganizacion(io, req.usuario.id_usuario, req.id_organizacion, false);
     return res.status(200).json({ mensaje: 'Saliste de la PyME', id_organizacion: req.id_organizacion });
   } catch (err) {
     return responderErrorNegocio(res, err);
@@ -197,12 +204,15 @@ export async function desvincularChofer(req, res) {
   const id_conductor = idParam(req.params.idConductor);
   if (!id_conductor) return res.status(400).json({ error: 'id de conductor invalido' });
   try {
-    await desvincularChoferSrv({
+    // Cancela en la misma transaccion TODOS los viajes no finales de ese chofer
+    // con esta PyME, incluido uno en curso (causa DESVINCULACION).
+    const viajes_cancelados = await desvincularChoferSrv({
       id_organizacion: req.id_organizacion,
       id_conductor,
       actor: { id_usuario: req.usuario.id_usuario, origen: 'ORGANIZACION' },
+      io,
     });
-    return res.status(200).json({ mensaje: 'Chofer desvinculado', id_conductor });
+    return res.status(200).json({ mensaje: 'Chofer desvinculado', id_conductor, viajes_cancelados });
   } catch (err) {
     return responderErrorNegocio(res, err);
   }

@@ -19,6 +19,16 @@ import {
   listarChoferes,
   desvincularChofer,
 } from '../controllers/organizaciones.controller.js';
+import {
+  crearViaje,
+  listarViajes,
+  obtenerViaje,
+  editarViaje,
+  reasignarViaje,
+  cancelarViajePyme,
+  costoAcumulado,
+  remito,
+} from '../controllers/viajes-internos.controller.js';
 
 const router = Router();
 
@@ -44,5 +54,16 @@ router.delete('/:id/invitaciones/:idInv', requireMiembro, requireInvitacionesCon
 
 router.get('/:id/choferes', requireMiembro, listarChoferes);
 router.delete('/:id/choferes/:idConductor', requireMiembro, desvincularChofer);
+
+// Viajes INTERNOS de la PyME (Paso 2). Cualquier miembro activo. Scoping por
+// req.id_organizacion: un viaje de otra PyME da 404.
+router.post('/:id/viajes', requireMiembro, crearViaje);
+router.get('/:id/viajes', requireMiembro, listarViajes);
+router.get('/:id/viajes/:idViaje', requireMiembro, obtenerViaje);
+router.put('/:id/viajes/:idViaje', requireMiembro, editarViaje);
+router.post('/:id/viajes/:idViaje/reasignar', requireMiembro, reasignarViaje);
+router.post('/:id/viajes/:idViaje/cancelar', requireMiembro, cancelarViajePyme);
+router.get('/:id/viajes/:idViaje/costo-acumulado', requireMiembro, costoAcumulado);
+router.get('/:id/viajes/:idViaje/remito', requireMiembro, remito);
 
 export default router;

@@ -2,6 +2,8 @@ import { z } from 'zod';
 import { responderErrorNegocio } from '../services/error-negocio.js';
 import { canjearCodigo } from '../services/invitacion.service.js';
 import { consumirIntentoCanje, ipDelRequest } from '../services/rate-limit-canje.service.js';
+import { sincronizarSalaOrganizacion } from '../sockets/salas.js';
+import { io } from '../sockets/index.js';
 
 const schemaCanje = z.object({
   codigo: z.string({ error: 'codigo es requerido' }).min(1, 'codigo es requerido'),
@@ -25,6 +27,11 @@ export async function canjear(req, res) {
 
   try {
     const resultado = await canjearCodigo({ usuario: req.usuario, codigo: parsed.data.codigo });
+    // Un nuevo MIEMBRO entra a la sala de la PyME (eventos y tracking de sus
+    // viajes). El chofer no: recibe lo suyo por su sala personal.
+    if (resultado.tipo === 'MIEMBRO') {
+      await sincronizarSalaOrganizacion(io, req.usuario.id_usuario, resultado.organizacion.id_organizacion, true);
+    }
     return res.status(200).json(resultado);
   } catch (err) {
     return responderErrorNegocio(res, err);

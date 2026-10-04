@@ -1,10 +1,17 @@
 import prisma from '../config/prisma.js';
 import { obtenerRutaPlaneada } from '../services/ruta.service.js';
 import { registrarCambioEstado } from '../services/historial-estado.service.js';
+import { marketplaceHabilitado } from '../middlewares/flags.middleware.js';
 
 export function manejarAceptarViaje(socket, io) {
   socket.on('viaje:aceptar', async (payload) => {
     console.log('[viaje:aceptar] Payload recibido:', payload);
+
+    // Marketplace dormido: el aceptar no existe (equivalente al 404 de REST).
+    if (!marketplaceHabilitado()) {
+      socket.emit('error', { mensaje: 'Funcion no disponible' });
+      return;
+    }
 
     if (!payload?.id_viaje) {
       socket.emit('error', { mensaje: 'id_viaje requerido' });

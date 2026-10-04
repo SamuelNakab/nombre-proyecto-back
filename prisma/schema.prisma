@@ -30,6 +30,13 @@ enum EstadoViaje {
   DESCARGANDO
   FINALIZADO
   CANCELADO
+  // Ciclo del viaje INTERNO (Paso 2): la PyME asigna, el chofer confirma o
+  // rechaza. Los valores de arriba quedan para el ciclo legacy del marketplace.
+  // La tabla de transiciones vive en estado-viaje.service.js.
+  ASIGNADO
+  CONFIRMADO
+  RECHAZADO
+  VENCIDO
 }
 
 enum EstadoAfiliacion {
@@ -107,6 +114,16 @@ enum OrigenDesvinculacion {
   ORGANIZACION
 }
 
+// Quien o que cancelo un viaje del ciclo interno. Quien exactamente (usuario) y
+// cuando quedan en historial_estado_viaje. Viaje.motivo_cancelacion sigue siendo
+// el texto libre.
+enum CausaCancelacion {
+  CHOFER
+  ORGANIZACION
+  ADMIN
+  DESVINCULACION
+}
+
 // ─────────────────────────────────────────────
 // USUARIO BASE
 // ─────────────────────────────────────────────
@@ -124,13 +141,15 @@ model Usuario {
   rol            Rol
   fecha_registro DateTime @default(now())
 
-  cliente          Cliente?
-  conductor        Conductor?
-  empresas_gerente Empresa[]
-  metodos_pago     MetodoPago[]
-  viajes_cancelados_por_admin Viaje[] @relation("ViajesCanceladosPorAdmin")
+  cliente                     Cliente?
+  conductor                   Conductor?
+  empresas_gerente            Empresa[]
+  metodos_pago                MetodoPago[]
+  viajes_cancelados_por_admin Viaje[]               @relation("ViajesCanceladosPorAdmin")
   // Back-relation, NO una columna: la FK vive en miembros_organizacion.
-  membresias       MiembroOrganizacion[]
+  membresias                  MiembroOrganizacion[]
+  // Back-relation, NO una columna: la FK vive en viajes.id_creador.
+  viajes_creados              Viaje[]               @relation("ViajesCreados")
 
   @@map("usuarios")
 }
@@ -158,18 +177,18 @@ model Cliente {
 // ─────────────────────────────────────────────
 
 model Conductor {
-  id_conductor         Int      @id @default(autoincrement())
-  id_usuario           Int      @unique
-  nro_licencia         String
-  licencia_vencimiento DateTime
-  calificacion_promedio Float   @default(0)
+  id_conductor          Int      @id @default(autoincrement())
+  id_usuario            Int      @unique
+  nro_licencia          String
+  licencia_vencimiento  DateTime
+  calificacion_promedio Float    @default(0)
 
-  usuario             Usuario             @relation(fields: [id_usuario], references: [id_usuario])
-  conductor_empresas  ConductorEmpresa[]
-  conductor_vehiculos ConductorVehiculo[]
-  vehiculos_propios   Vehiculo[]          @relation("VehiculoPropio")
-  viajes              Viaje[]
-  calificaciones      Calificacion[]
+  usuario               Usuario             @relation(fields: [id_usuario], references: [id_usuario])
+  conductor_empresas    ConductorEmpresa[]
+  conductor_vehiculos   ConductorVehiculo[]
+  vehiculos_propios     Vehiculo[]          @relation("VehiculoPropio")
+  viajes                Viaje[]
+  calificaciones        Calificacion[]
   // Back-relation, NO una columna: la FK vive en vinculos_chofer.
   vinculos_organizacion VinculoChofer[]
 
@@ -196,6 +215,8 @@ model Organizacion {
   miembros     MiembroOrganizacion[]
   invitaciones Invitacion[]
   choferes     VinculoChofer[]
+  // Back-relation, NO una columna: la FK vive en viajes.id_organizacion.
+  viajes       Viaje[]
 
   @@map("organizaciones")
 }
@@ -426,26 +447,26 @@ model CondicionRequerida {
 // ─────────────────────────────────────────────
 
 model Viaje {
-  id_viaje            Int         @id @default(autoincrement())
-  id_cliente          Int
-  id_conductor        Int?
-  id_vehiculo         Int?
-  id_empresa          Int?
-  zona                TipoZona
-  tarifa_hora         Float?
-  tarifa_km           Float?
-  distancia_provincia Float?
-  tiempo_capital      Float?
+  id_viaje                Int         @id @default(autoincrement())
+  id_cliente              Int
+  id_conductor            Int?
+  id_vehiculo             Int?
+  id_empresa              Int?
+  zona                    TipoZona
+  tarifa_hora             Float?
+  tarifa_km               Float?
+  distancia_provincia     Float?
+  tiempo_capital          Float?
   // Duracion total estimada de la ruta (Google Distance Matrix), en HORAS.
   // Es el mismo tiempo_horas que costo.service usa para estimar el precio: se
   // persiste al crear el viaje para no tener que volver a pedirlo a Google en
   // cada lectura del detalle. La API lo expone convertido a MINUTOS enteros
   // (duracion_estimada) — ver duracion.service.js.
   duracion_estimada_horas Float?
-  fecha_programada    DateTime
-  descripcion         String?
-  estado              EstadoViaje @default(BUSCANDO_CONDUCTOR)
-  fecha_inicio        DateTime?
+  fecha_programada        DateTime
+  descripcion             String?
+  estado                  EstadoViaje @default(BUSCANDO_CONDUCTOR)
+  fecha_inicio            DateTime?
   // COLUMNA MUERTA. Nadie la escribe ni la lee desde que la puntualidad pasa a
   // medirse en la LLEGADA al origen y a calcularse en el read (ver
   // puntualidad.service.js). Las respuestas de la API traen un campo con este
@@ -453,7 +474,7 @@ model Viaje {
   // esta columna se midieron en la SALIDA hacia el origen y no son comparables.
   // Queda en el schema por el mismo motivo que Parada.qr_token: la DB de Neon
   // esta compartida con produccion y dropear columnas ahi es destructivo.
-  puntualidad_inicio  String?
+  puntualidad_inicio      String?
   // Momento en que el conductor LLEGO al origen (la parada de orden 1).
   // Lo setea el primer ping GPS que cae dentro de RADIO_CONFIRMACION_METROS
   // del origen mientras el viaje esta en EN_CAMINO_A_ORIGEN; si no hubo ningun
@@ -464,30 +485,47 @@ model Viaje {
   // derivan de timestamps ya persistidos — porque el GPS es EFIMERO: vive en
   // Redis y limpiarGPS lo borra al cerrar el viaje. Si no se persiste en el
   // instante en que ocurre, se pierde para siempre.
-  fecha_llegada_origen DateTime?
+  fecha_llegada_origen    DateTime?
   // Momento en que el gerente reserva el viaje (RESERVADO_POR_EMPRESA).
-  fecha_reserva       DateTime?
+  fecha_reserva           DateTime?
   // Quien apreto "Iniciar viaje": "CONDUCTOR" | "GERENTE".
-  iniciado_por        String?
-  precio_estimado     Float?
-  precio_real         Float?
-  creado_en           DateTime    @default(now())
-  motivo_cancelacion     String?
-  cancelado_por_admin_id Int?
+  iniciado_por            String?
+  precio_estimado         Float?
+  precio_real             Float?
+  creado_en               DateTime    @default(now())
+  motivo_cancelacion      String?
+  cancelado_por_admin_id  Int?
 
-  cliente          Cliente              @relation(fields: [id_cliente], references: [id_cliente])
-  conductor        Conductor?           @relation(fields: [id_conductor], references: [id_conductor])
-  vehiculo         Vehiculo?            @relation(fields: [id_vehiculo], references: [id_vehiculo])
-  empresa          Empresa?             @relation(fields: [id_empresa], references: [id_empresa])
-  cancelado_por_admin Usuario?          @relation("ViajesCanceladosPorAdmin", fields: [cancelado_por_admin_id], references: [id_usuario])
-  paradas          Parada[]
-  transacciones    Transaccion[]
-  condiciones_req  CondicionRequerida[]
-  calificacion     Calificacion?
+  // ── Viaje INTERNO (Paso 2) ──
+  // Todas nullable: los viajes legacy del marketplace no las tienen. Un viaje es
+  // interno si id_organizacion != null (ver cicloDe en estado-viaje.service).
+  // id_cliente sigue siendo NOT NULL: en un viaje interno apunta al Cliente del
+  // creador, solo porque el schema lo exige. Ningun permiso nuevo lo usa.
+  id_organizacion    Int?
+  // El miembro de la PyME que lo creo.
+  id_creador         Int?
+  // Copia del metodo de cobro del vinculo PyME-chofer al crear / reasignar.
+  metodo_cobro       MetodoCobro?
+  fecha_confirmacion DateTime?
+  fecha_rechazo      DateTime?
+  causa_cancelacion  CausaCancelacion?
+
+  cliente             Cliente                @relation(fields: [id_cliente], references: [id_cliente])
+  organizacion        Organizacion?          @relation(fields: [id_organizacion], references: [id_organizacion])
+  creador             Usuario?               @relation("ViajesCreados", fields: [id_creador], references: [id_usuario])
+  conductor           Conductor?             @relation(fields: [id_conductor], references: [id_conductor])
+  vehiculo            Vehiculo?              @relation(fields: [id_vehiculo], references: [id_vehiculo])
+  empresa             Empresa?               @relation(fields: [id_empresa], references: [id_empresa])
+  cancelado_por_admin Usuario?               @relation("ViajesCanceladosPorAdmin", fields: [cancelado_por_admin_id], references: [id_usuario])
+  paradas             Parada[]
+  transacciones       Transaccion[]
+  condiciones_req     CondicionRequerida[]
+  calificacion        Calificacion?
   // Back-relation, NO una columna: no genera DDL sobre la tabla viajes.
   // La FK vive en historial_estado_viaje.
-  historial_estados HistorialEstadoViaje[]
+  historial_estados   HistorialEstadoViaje[]
 
+  @@index([id_organizacion, estado])
   @@map("viajes")
 }
 

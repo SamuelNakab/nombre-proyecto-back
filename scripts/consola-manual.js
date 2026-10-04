@@ -12,6 +12,13 @@
 // PyMEs" del conductor y desvincular desde los dos lados. El CLIENTE de prueba
 // opera la PyME; el CONDUCTOR de prueba es el chofer.
 //
+// Viaje interno (Paso 2), opciones m-w: la PyME crea el viaje para un chofer
+// vinculado, el chofer confirma (eligiendo vehiculo) o rechaza, lo inicia en el
+// origen, y despues avanza con las opciones 5 (estado) y 6 (confirmar parada),
+// que son las mismas rutas para los dos ciclos. Tambien cancelar como chofer o
+// como PyME, reasignar y editar. Las opciones 1, 2, 7 y 8 son del marketplace:
+// con MARKETPLACE_HABILITADO en false, 1 y 2 dan 404 / error.
+//
 // No corre en CI: es interactivo, de uso manual local. Vive en scripts/, fuera
 // de los globs de lint y test.
 //
@@ -68,6 +75,14 @@ const EVENTOS = [
   'viaje:estado_cambiado',
   'viaje:finalizado',
   'viaje:cancelado_por_admin',
+  // Ciclo del viaje interno (Paso 2).
+  'viaje:asignado',
+  'viaje:desasignado',
+  'viaje:editado',
+  'viaje:confirmado',
+  'viaje:rechazado',
+  'viaje:cancelado',
+  'viaje:vencido',
   'error',
 ];
 
@@ -187,7 +202,7 @@ async function accionCrearViaje(sCliente) {
 
 function requiereViaje() {
   if (estado.idViaje == null) {
-    console.log('  ⚠  No hay id_viaje en memoria. Primero crea un viaje (opcion 1).');
+    console.log('  ⚠  No hay id_viaje en memoria. Primero crea un viaje (opcion m, o 1 en el marketplace).');
     return false;
   }
   return true;
@@ -392,6 +407,135 @@ async function accionDesvincularme() {
     await api('DELETE', `/api/choferes/mis-organizaciones/${id}`, null, estado.conductorToken));
 }
 
+// ── Acciones del viaje interno (Paso 2) ──────────────────────────────────────
+
+const rutaViajePyme = (sufijo = '') =>
+  `/api/organizaciones/${estado.idOrganizacion}/viajes/${estado.idViaje}${sufijo}`;
+
+async function elegirChofer() {
+  const choferes = await api('GET', `/api/organizaciones/${estado.idOrganizacion}/choferes`, null, estado.clienteToken);
+  const lista = Array.isArray(choferes.data) ? choferes.data : [];
+  if (lista.length === 0) {
+    console.log('  ⚠  La PyME no tiene choferes vinculados. Genera un codigo CHOFER (d) y canjealo (f).');
+    return null;
+  }
+  for (const c of lista) {
+    const vehiculos = c.vehiculos.map((v) => `${v.patente}[${v.condiciones.join(',')}]`).join(' ') || 'ninguno';
+    console.log(`    id_conductor=${c.id_conductor} — ${c.nombre} ${c.apellido} — vehiculos: ${vehiculos}`);
+  }
+  return preguntarNumero('  id_conductor', lista[0].id_conductor);
+}
+
+async function preguntarCondiciones() {
+  const raw = await pregunta('  Condiciones separadas por coma (FRAGIL, REFRIGERADO, CARGA_PESADA, PELIGROSO, VOLUMINOSO) []: ');
+  return raw ? raw.split(',').map((c) => c.trim().toUpperCase()).filter(Boolean) : [];
+}
+
+const siONo = async (texto) => (await pregunta(`  ${texto} (s/N): `)).toLowerCase() === 's';
+
+async function accionCrearViajePyme() {
+  if (!(await requierePyme())) return;
+  const id_conductor = await elegirChofer();
+  if (id_conductor == null) return;
+  const minutos = await preguntarNumero('  Minutos desde ahora para fecha_programada', 30);
+  const condiciones_requeridas = await preguntarCondiciones();
+  const r = await api('POST', `/api/organizaciones/${estado.idOrganizacion}/viajes`, {
+    id_conductor,
+    fecha_programada: new Date(Date.now() + minutos * 60000).toISOString(),
+    condiciones_requeridas,
+    paradas: [PARADA_1, PARADA_2],
+  }, estado.clienteToken);
+  if (r.status === 201) estado.idViaje = r.data.id_viaje;
+  mostrar('POST /api/organizaciones/:id/viajes', r);
+}
+
+async function accionViajesPyme() {
+  if (!(await requierePyme())) return;
+  const grupo = await pregunta('  Grupo (activos / en_curso / historial, vacio = todos): ');
+  const r = await api(
+    'GET', `/api/organizaciones/${estado.idOrganizacion}/viajes${grupo ? '?grupo=' + grupo : ''}`, null, estado.clienteToken
+  );
+  if (r.status !== 200) return mostrar('GET /api/organizaciones/:id/viajes', r);
+  for (const v of r.data) {
+    console.log(`    #${v.id_viaje} ${v.estado.padEnd(11)} ${v.fecha_programada} chofer=${v.conductor?.nombre ?? '—'} vencido=${v.vencido}`);
+  }
+}
+
+async function accionVerViajePyme() {
+  if (!(await requierePyme()) || !requiereViaje()) return;
+  mostrar('GET /api/organizaciones/:id/viajes/:idViaje', await api('GET', rutaViajePyme(), null, estado.clienteToken));
+}
+
+async function accionMisViajesChofer() {
+  const grupo = await pregunta('  Grupo (asignados / confirmados / en_curso / historial, vacio = todos): ');
+  const r = await api('GET', `/api/choferes/viajes${grupo ? '?grupo=' + grupo : ''}`, null, estado.conductorToken);
+  if (r.status !== 200) return mostrar('GET /api/choferes/viajes', r);
+  for (const v of r.data) {
+    console.log(`    #${v.id_viaje} ${v.estado.padEnd(11)} ${v.fecha_programada} PyME=${v.organizacion?.nombre}`);
+  }
+}
+
+async function accionConfirmarViaje() {
+  if (!requiereViaje()) return;
+  const vehiculos = await api('GET', '/api/conductores/mis-vehiculos', null, estado.conductorToken);
+  const lista = Array.isArray(vehiculos.data) ? vehiculos.data : [];
+  for (const v of lista) {
+    const condiciones = (v.condiciones ?? []).map((c) => c.condicion ?? c).join(',');
+    console.log(`    id_vehiculo=${v.id_vehiculo} — ${v.patente} [${condiciones}]`);
+  }
+  const id_vehiculo = await preguntarNumero('  id_vehiculo', lista[0]?.id_vehiculo ?? 0);
+  mostrar('POST /api/choferes/viajes/:id/confirmar',
+    await api('POST', `/api/choferes/viajes/${estado.idViaje}/confirmar`, { id_vehiculo }, estado.conductorToken));
+}
+
+async function accionRechazarViaje() {
+  if (!requiereViaje()) return;
+  mostrar('POST /api/choferes/viajes/:id/rechazar',
+    await api('POST', `/api/choferes/viajes/${estado.idViaje}/rechazar`, null, estado.conductorToken));
+}
+
+async function accionIniciarViajePyme() {
+  if (!requiereViaje()) return;
+  // Default = el origen exacto (distancia 0). Cambialo para probar "lejos del origen".
+  const lat = await preguntarNumero('  lat', PARADA_1.lat);
+  const lng = await preguntarNumero('  lng', PARADA_1.lng);
+  mostrar('POST /api/choferes/viajes/:id/iniciar',
+    await api('POST', `/api/choferes/viajes/${estado.idViaje}/iniciar`, { lat, lng }, estado.conductorToken));
+}
+
+async function accionCancelarComoChofer() {
+  if (!requiereViaje()) return;
+  mostrar('POST /api/choferes/viajes/:id/cancelar',
+    await api('POST', `/api/choferes/viajes/${estado.idViaje}/cancelar`, null, estado.conductorToken));
+}
+
+async function accionCancelarComoPyme() {
+  if (!(await requierePyme()) || !requiereViaje()) return;
+  const motivo = await pregunta('  Motivo (opcional): ');
+  mostrar('POST /api/organizaciones/:id/viajes/:idViaje/cancelar',
+    await api('POST', rutaViajePyme('/cancelar'), motivo ? { motivo } : {}, estado.clienteToken));
+}
+
+async function accionReasignar() {
+  if (!(await requierePyme()) || !requiereViaje()) return;
+  const id_conductor = await elegirChofer();
+  if (id_conductor == null) return;
+  mostrar('POST /api/organizaciones/:id/viajes/:idViaje/reasignar',
+    await api('POST', rutaViajePyme('/reasignar'), { id_conductor }, estado.clienteToken));
+}
+
+async function accionEditar() {
+  if (!(await requierePyme()) || !requiereViaje()) return;
+  const body = {};
+  const minutos = await pregunta('  Nueva fecha: minutos desde ahora (vacio = no cambiar): ');
+  if (minutos) body.fecha_programada = new Date(Date.now() + Number(minutos) * 60000).toISOString();
+  if (await siONo('Cambiar condiciones?')) body.condiciones_requeridas = await preguntarCondiciones();
+  if (await siONo('Invertir las paradas?')) body.paradas = [PARADA_2, PARADA_1];
+  const descripcion = await pregunta('  Descripcion (vacio = no cambiar): ');
+  if (descripcion) body.descripcion = descripcion;
+  mostrar('PUT /api/organizaciones/:id/viajes/:idViaje', await api('PUT', rutaViajePyme(), body, estado.clienteToken));
+}
+
 // ── Menu ──────────────────────────────────────────────────────────────────────
 
 function imprimirMenu() {
@@ -421,6 +565,19 @@ function imprimirMenu() {
 ║  j) Mis PyMEs               (conductor)        ║
 ║  k) Desvincular chofer      (cliente)          ║
 ║  l) Desvincularme           (conductor)        ║
+╠═════════════ VIAJE DE PyME (Paso 2) ═══════════╣
+║  m) Crear viaje para un chofer (cliente)       ║
+║  n) Viajes de la PyME          (cliente)       ║
+║  o) Mis viajes                 (conductor)     ║
+║  p) Confirmar (elige vehiculo) (conductor)     ║
+║  q) Rechazar                   (conductor)     ║
+║  r) Iniciar en el origen       (conductor)     ║
+║     → avanzar: 5   confirmar parada: 6         ║
+║  s) Cancelar como chofer       (conductor)     ║
+║  t) Cancelar como PyME         (cliente)       ║
+║  u) Reasignar a otro chofer    (cliente)       ║
+║  v) Editar                     (cliente)       ║
+║  w) Ver viaje de la PyME       (cliente)       ║
 ║  0) Salir                                      ║
 ╚══════════════════════════════════════════════╝`);
 }
@@ -452,6 +609,17 @@ async function loopMenu(sCliente, sConductor) {
       case 'j': await accionMisPymes(); break;
       case 'k': await accionDesvincularDesdePyme(); break;
       case 'l': await accionDesvincularme(); break;
+      case 'm': await accionCrearViajePyme(); break;
+      case 'n': await accionViajesPyme(); break;
+      case 'o': await accionMisViajesChofer(); break;
+      case 'p': await accionConfirmarViaje(); break;
+      case 'q': await accionRechazarViaje(); break;
+      case 'r': await accionIniciarViajePyme(); break;
+      case 's': await accionCancelarComoChofer(); break;
+      case 't': await accionCancelarComoPyme(); break;
+      case 'u': await accionReasignar(); break;
+      case 'v': await accionEditar(); break;
+      case 'w': await accionVerViajePyme(); break;
       case '0':
         console.log('  Cerrando…');
         try { sCliente.disconnect(); } catch { /* noop */ }

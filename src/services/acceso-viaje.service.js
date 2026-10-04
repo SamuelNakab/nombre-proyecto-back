@@ -37,8 +37,19 @@ export function puedeVerViaje(viaje, usuario) {
       'puedeVerViaje: el viaje debe venir con las relaciones cliente, conductor y empresa incluidas'
     );
   }
+  // Mismo idiom para el escalar que distingue el ciclo: un select sin
+  // id_organizacion trataria un viaje de PyME como legacy.
+  if (viaje.id_organizacion === undefined) {
+    throw new Error('puedeVerViaje: el viaje debe traer id_organizacion');
+  }
 
-  const esCliente = viaje.cliente.id_usuario === usuario.id_usuario;
+  // CICLO INTERNO (Paso 2): el "cliente dueño" NO aplica. En un viaje de PyME,
+  // id_cliente es solo el ancla que exige el schema (el Cliente del creador); el
+  // acceso de la PyME va por membresia, en las rutas /api/organizaciones/:id/
+  // viajes. Si no, un miembro que se fue de la PyME seguiria viendo los viajes
+  // que creo. El chofer asignado si pasa (ve su viaje por las rutas viejas).
+  const esCliente =
+    viaje.id_organizacion === null && viaje.cliente.id_usuario === usuario.id_usuario;
   const esConductorAsignado =
     viaje.conductor !== null && viaje.conductor.id_usuario === usuario.id_usuario;
   const esGerenteDeLaEmpresa =

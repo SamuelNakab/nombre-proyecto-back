@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import prisma from '../config/prisma.js';
+import { ESTADOS_TERMINALES } from '../services/estado-viaje.service.js';
 import { generarCodigoUnico, ejecutarDesafiliacion } from '../services/afiliacion.service.js';
 import { conductorEsElegible } from '../services/elegibilidad.service.js';
 import { esViajeVencido } from '../services/vencimiento.service.js';
@@ -304,7 +305,7 @@ export async function bajaVehiculoFlota(req, res) {
   }
 
   const viajeActivo = await prisma.viaje.findFirst({
-    where: { id_vehiculo, estado: { notIn: ['FINALIZADO', 'CANCELADO'] } },
+    where: { id_vehiculo, estado: { notIn: ESTADOS_TERMINALES } },
   });
   if (viajeActivo) {
     return res.status(400).json({ error: 'No se puede dar de baja un vehiculo en uso' });

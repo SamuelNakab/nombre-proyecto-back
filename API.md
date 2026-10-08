@@ -78,6 +78,12 @@ Crea una cuenta de cliente. Firebase genera las credenciales, luego se persiste 
 }
 ```
 
+> **`cuit`, `nombre_empresa` y `direccion_principal` son campos legacy.** Se aceptan y se guardan, pero
+> nada nuevo los usa: la PyME del usuario es una [organización](#identidad--pymes-miembros-invitaciones-y-choferes)
+> que se crea aparte (`POST /api/organizaciones`) o a la que se entra con un código. El front no
+> necesita pedirlos más. Una cuenta `CLIENTE` es un **usuario de PyME**; el rol no cambia después del
+> registro (quien es PyME y chofer a la vez usa dos cuentas).
+
 **Respuesta exitosa — 201:**
 ```json
 {
@@ -218,7 +224,39 @@ Retorna el perfil completo del usuario autenticado.
   "email": "juan@example.com",
   "telefono": "+5491112345678",
   "rol": "CLIENTE",
-  "fecha_registro": "2026-04-28T00:00:00.000Z"
+  "fecha_registro": "2026-04-28T00:00:00.000Z",
+  "organizacion": {
+    "id_organizacion": 1,
+    "nombre": "Distribuidora Norte",
+    "estado": "TRIAL",
+    "rol": "RESPONSABLE"
+  }
+}
+```
+
+**Campos de identidad (Paso 1)** — se suman a los de siempre, que no cambian:
+
+| Rol de la cuenta | Campo extra | Valor |
+|---|---|---|
+| `CLIENTE` | `organizacion` | Su PyME activa `{ id_organizacion, nombre, estado, rol }` (`rol`: `RESPONSABLE` \| `MIEMBRO`), o **`null`** si todavía no pertenece a ninguna (huérfano: solo puede [crear una PyME](#post-apiorganizaciones) o [canjear un código](#post-apiinvitacionescanjear)). |
+| `CONDUCTOR` | `organizaciones` | Lista de sus PyMEs activas `[{ id_organizacion, nombre }]`; `[]` si no tiene vínculos. |
+| `GERENTE`, `ADMIN` | — | Sin cambios. |
+
+Ejemplo de un `CONDUCTOR`:
+```json
+{
+  "id_usuario": 12,
+  "firebase_uid": "nriYJKZNZofnGaZmfVnh8raMbMt1",
+  "nombre": "Carlos",
+  "apellido": "Gómez",
+  "dni": "30123456",
+  "email": "carlos@example.com",
+  "telefono": "+5491189350006",
+  "rol": "CONDUCTOR",
+  "fecha_registro": "2026-10-03T22:19:30.000Z",
+  "organizaciones": [
+    { "id_organizacion": 1, "nombre": "Distribuidora Norte" }
+  ]
 }
 ```
 
@@ -3112,6 +3150,493 @@ Body: `{ "codigo_afiliacion": "string" }`. → `201` con la afiliación. `404` c
 - `viaje:asignado` le puede llegar al mismo conductor desde **varias empresas** — no asumir una sola empresa por conductor.
 - `viaje:vencido` avisa que un viaje llegó a su `fecha_programada` **sin avanzar**. El viaje no cambia de estado. Es **best-effort**: la fuente de verdad es el campo `vencido` del REST. Ver [Evento: viaje:vencido](#evento-viajevencido) y [Viajes vencidos](#viajes-vencidos).
 - `viaje:requiere_reasignacion` avisa que un viaje **ya asignado** volvió a `RESERVADO_POR_EMPRESA` y necesita reasignarse. `motivo`: `"conductor_desafiliado"` o `"conductor_cancelo"`. Es distinto de `viaje:reserva_cancelada` (ese es "vuelve al mercado abierto").
+
+---
+
+## Identidad — PyMEs, miembros, invitaciones y choferes
+
+Capa de identidad del modelo nuevo (Paso 1): una **PyME** (organización) registra y sigue sus viajes con
+**choferes de confianza**. Todavía no está conectada a los viajes — el flujo de viajes, gerente y
+empresas de esta API sigue igual por ahora.
+
+**Tipos de cuenta.** El `rol` del usuario es el tipo de cuenta y no cambia después del registro:
+
+| `rol` | Qué es | Qué puede hacer acá |
+|---|---|---|
+| `CLIENTE` | Usuario de PyME | Crear una PyME o entrar con un código de **MIEMBRO**; después, operar su PyME. |
+| `CONDUCTOR` | Chofer | Entrar a una o varias PyMEs con códigos de **CHOFER**; ver sus PyMEs y desvincularse. |
+
+**Huérfano.** Un `CLIENTE` sin PyME activa solo puede [crear una PyME](#post-apiorganizaciones) o
+[canjear un código](#post-apiinvitacionescanjear). Cualquier `/api/organizaciones/:id/...` le
+devuelve `403`. Se detecta con `organizacion: null` en [`GET /api/auth/me`](#get-apiauthme).
+
+**Roles dentro de la PyME.**
+
+| Acción | `RESPONSABLE` | `MIEMBRO` |
+|---|:-:|:-:|
+| Ver la PyME, sus miembros y las invitaciones pendientes | ✅ | ✅ |
+| Generar / revocar códigos de **CHOFER** | ✅ | ✅ |
+| Listar choferes y desvincularlos | ✅ | ✅ |
+| Irse de la PyME | ✅ (salvo el último) | ✅ |
+| Editar los datos de la PyME | ✅ | ❌ 403 |
+| Generar / revocar códigos de **MIEMBRO** | ✅ | ❌ 403 |
+| Promover / degradar / eliminar miembros | ✅ | ❌ 403 |
+
+**Invariantes que garantiza el backend** (también bajo requests simultáneas):
+- Una cuenta `CLIENTE` tiene **una sola PyME activa** a la vez. Dos canjes a la vez, o crear una PyME
+  mientras canjea, nunca la dejan en dos: gana uno y el otro recibe `409`.
+- Toda PyME tiene **siempre al menos un `RESPONSABLE` activo**. Degradar, eliminar o dejar irse al
+  último devuelve `409`. Dos responsables degradándose o yéndose a la vez: uno `200`, el otro `409`.
+- Un código se usa **una sola vez**. Dos usuarios con el mismo código a la vez: uno `200`, el otro
+  `400 "Codigo invalido"`.
+- El **CUIT** es único entre PyMEs (se compara normalizado: `30-71234567-1` = `30712345671`).
+
+**Códigos de invitación.** 10 caracteres sin ambiguos (sin `0`/`O` ni `1`/`I`/`L`), mostrados como
+`XXXXX-XXXXX`. El código en claro se devuelve **una única vez**, al crearlo: el backend solo guarda
+un hash, así que no hay forma de volver a verlo (si se pierde, se revoca y se genera otro). Vence a las
+72 h (`INVITACION_VIGENCIA_HORAS`), es de un solo uso y se puede revocar. Al canjear se ignoran
+guiones, espacios y mayúsculas. Si el servidor no tiene configurado el secreto de invitaciones, los
+cuatro endpoints de invitaciones (crear, listar, revocar, canjear) responden
+`503 { "error": "Las invitaciones no estan disponibles en este momento" }`.
+
+**Errores comunes a todo `/api/organizaciones`:**
+
+| Status | Body | Causa |
+|--------|------|-------|
+| 401 | `{ "error": "Token no proporcionado" }` / `{ "error": "Token invalido o expirado" }` | Sin token o token inválido |
+| 403 | `{ "error": "Acceso denegado" }` | La cuenta no es `CLIENTE` (p. ej. un `CONDUCTOR`) |
+| 400 | `{ "error": "id de PyME invalido" }` | `:id` no es un entero positivo |
+| 403 | `{ "error": "No perteneces a esta PyME" }` | No tenés membresía activa en `:id` (mismo error exista o no la PyME) |
+| 403 | `{ "error": "Solo un responsable puede hacer esto" }` | La acción es solo de `RESPONSABLE` |
+
+---
+
+### POST /api/organizaciones
+
+Crea una PyME. Quien la crea queda como `RESPONSABLE` en la misma operación.
+
+**Autenticación:** Requerida — rol `CLIENTE` **sin PyME activa**.
+
+**Body:**
+```json
+{
+  "nombre": "string (requerido)",
+  "cuit": "string (requerido, con o sin guiones)",
+  "razon_social": "string (opcional)",
+  "direccion": "string (opcional)"
+}
+```
+
+**Respuesta exitosa — 201:**
+```json
+{
+  "id_organizacion": 1,
+  "nombre": "Distribuidora Norte",
+  "cuit": "30968935077",
+  "razon_social": "Distribuidora Norte SRL",
+  "direccion": "Av. Siempreviva 742",
+  "estado": "TRIAL",
+  "creado_en": "2026-10-03T22:19:38.120Z",
+  "actualizado_en": "2026-10-03T22:19:38.120Z",
+  "mi_rol": "RESPONSABLE"
+}
+```
+- `cuit` vuelve **normalizado** (sin guiones ni espacios).
+- `estado`: `TRIAL` | `ACTIVA` | `SUSPENDIDA`. Toda PyME nueva arranca en `TRIAL`; todavía no hay
+  transiciones.
+- `mi_rol`: el rol de quien hace el request.
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "nombre es requerido" }` | Falta `nombre` o está vacío |
+| 400 | `{ "error": "cuit es requerido" }` | Falta `cuit` |
+| 400 | `{ "error": "CUIT con formato invalido: deben ser 11 digitos" }` | Después de sacar guiones y espacios no quedan 11 dígitos |
+| 400 | `{ "error": "CUIT con digito verificador invalido" }` | El dígito verificador no coincide |
+| 403 | `{ "error": "Acceso denegado" }` | La cuenta no es `CLIENTE` |
+| 409 | `{ "error": "Ya perteneces a una PyME" }` | El usuario ya tiene una PyME activa |
+| 409 | `{ "error": "Ya existe una PyME con ese CUIT" }` | Otra PyME tiene ese CUIT |
+
+---
+
+### GET /api/organizaciones/:id
+
+Datos de la PyME.
+
+**Autenticación:** Requerida — miembro activo de la PyME.
+
+**Respuesta exitosa — 200:** mismo objeto que en la creación, con `mi_rol` del que pregunta
+(`RESPONSABLE` o `MIEMBRO`).
+
+**Errores posibles:** los [comunes](#identidad--pymes-miembros-invitaciones-y-choferes).
+
+---
+
+### PUT /api/organizaciones/:id
+
+Edita la PyME. Solo se tocan los campos presentes (al menos uno).
+
+**Autenticación:** Requerida — `RESPONSABLE` de la PyME.
+
+**Body (todos opcionales, al menos uno):**
+```json
+{
+  "nombre": "string",
+  "cuit": "string",
+  "razon_social": "string | null",
+  "direccion": "string | null"
+}
+```
+`razon_social` y `direccion` aceptan `null` para borrarlos.
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "id_organizacion": 1,
+  "nombre": "Distribuidora Norte",
+  "cuit": "30968935077",
+  "razon_social": "Distribuidora Norte SA",
+  "direccion": null,
+  "estado": "TRIAL",
+  "creado_en": "2026-10-03T22:19:38.120Z",
+  "actualizado_en": "2026-10-03T22:19:46.904Z",
+  "mi_rol": "RESPONSABLE"
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "Mandá al menos un campo para editar" }` | Body vacío |
+| 400 | `{ "error": "CUIT con formato invalido: deben ser 11 digitos" }` / `{ "error": "CUIT con digito verificador invalido" }` | CUIT inválido |
+| 403 | `{ "error": "Solo un responsable puede hacer esto" }` | Lo intenta un `MIEMBRO` |
+| 409 | `{ "error": "Ya existe una PyME con ese CUIT" }` | El CUIT es de **otra** PyME (re-guardar el propio no choca) |
+
+---
+
+### GET /api/organizaciones/:id/miembros
+
+Miembros **activos** de la PyME, del más antiguo al más nuevo.
+
+**Autenticación:** Requerida — miembro activo de la PyME.
+
+**Respuesta exitosa — 200:**
+```json
+[
+  {
+    "id_usuario": 9,
+    "nombre": "Laura",
+    "apellido": "Pérez",
+    "email": "laura@distribuidoranorte.com",
+    "telefono": "+5491189350001",
+    "rol": "RESPONSABLE",
+    "fecha_alta": "2026-10-03T22:19:38.120Z"
+  },
+  {
+    "id_usuario": 10,
+    "nombre": "Martín",
+    "apellido": "Ruiz",
+    "email": "martin@distribuidoranorte.com",
+    "telefono": null,
+    "rol": "MIEMBRO",
+    "fecha_alta": "2026-10-03T22:19:41.860Z"
+  }
+]
+```
+
+---
+
+### PUT /api/organizaciones/:id/miembros/:idUsuario/rol
+
+Promueve (`MIEMBRO` → `RESPONSABLE`) o degrada (`RESPONSABLE` → `MIEMBRO`) a un miembro. Un
+responsable se puede degradar a sí mismo, salvo que sea el último. Pedir el rol que ya tiene es un
+no-op (`200`).
+
+**Autenticación:** Requerida — `RESPONSABLE` de la PyME. `:idUsuario` es el `id_usuario` del miembro.
+
+**Body:**
+```json
+{ "rol": "RESPONSABLE | MIEMBRO" }
+```
+
+**Respuesta exitosa — 200:**
+```json
+{ "mensaje": "Rol actualizado", "id_usuario": 10, "rol": "RESPONSABLE" }
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "rol debe ser RESPONSABLE o MIEMBRO" }` | `rol` inválido |
+| 400 | `{ "error": "id de usuario invalido" }` | `:idUsuario` inválido |
+| 403 | `{ "error": "Solo un responsable puede hacer esto" }` | El que pide no es (o dejó de ser) `RESPONSABLE` |
+| 404 | `{ "error": "Miembro no encontrado" }` | Ese usuario no es miembro activo de la PyME |
+| 409 | `{ "error": "La PyME tiene que tener al menos un responsable activo: promove a otro miembro antes" }` | Degradar al último responsable |
+
+---
+
+### DELETE /api/organizaciones/:id/miembros/:idUsuario
+
+Da de baja a un miembro (motivo `ELIMINADO`). Si el responsable se elimina **a sí mismo** cuenta como
+irse (motivo `SE_FUE`) y aplica la regla del último responsable. El eliminado queda huérfano y puede
+volver a entrar más adelante con un código nuevo.
+
+**Autenticación:** Requerida — `RESPONSABLE` de la PyME.
+
+**Respuesta exitosa — 200:**
+```json
+{ "mensaje": "Miembro eliminado", "id_usuario": 10 }
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "id de usuario invalido" }` | `:idUsuario` inválido |
+| 403 | `{ "error": "Solo un responsable puede hacer esto" }` | El que pide no es (o dejó de ser) `RESPONSABLE` |
+| 404 | `{ "error": "Miembro no encontrado" }` | Ese usuario no es miembro activo de la PyME |
+| 409 | `{ "error": "La PyME tiene que tener al menos un responsable activo: promove a otro miembro antes" }` | El último responsable se elimina a sí mismo |
+
+---
+
+### POST /api/organizaciones/:id/salir
+
+El usuario se va de la PyME (motivo `SE_FUE`) y queda huérfano. Puede volver a entrar más adelante con
+un código nuevo.
+
+**Autenticación:** Requerida — miembro activo de la PyME. Sin body.
+
+**Respuesta exitosa — 200:**
+```json
+{ "mensaje": "Saliste de la PyME", "id_organizacion": 1 }
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 409 | `{ "error": "La PyME tiene que tener al menos un responsable activo: promove a otro miembro antes" }` | Es el último responsable: primero tiene que promover a otro |
+
+---
+
+### POST /api/organizaciones/:id/invitaciones
+
+Genera un código de invitación.
+
+**Autenticación:** Requerida — miembro activo. Tipo `MIEMBRO`: solo `RESPONSABLE`. Tipo `CHOFER`:
+cualquier miembro.
+
+**Body:**
+```json
+{ "tipo": "MIEMBRO | CHOFER" }
+```
+
+**Respuesta exitosa — 201:**
+```json
+{
+  "id_invitacion": 1,
+  "tipo": "MIEMBRO",
+  "codigo": "GZ32F-JNQSR",
+  "fecha_creacion": "2026-10-03T22:19:40.478Z",
+  "fecha_vencimiento": "2026-10-06T22:19:40.462Z"
+}
+```
+> ⚠️ `codigo` aparece **solo en esta respuesta**. El backend no lo guarda (solo un hash): mostralo /
+> compartilo en ese momento.
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "tipo debe ser MIEMBRO o CHOFER" }` | `tipo` inválido |
+| 403 | `{ "error": "Solo un responsable puede invitar miembros" }` | Un `MIEMBRO` pide una de tipo `MIEMBRO` |
+| 503 | `{ "error": "Las invitaciones no estan disponibles en este momento" }` | Falta el secreto de invitaciones en el servidor |
+
+---
+
+### GET /api/organizaciones/:id/invitaciones
+
+Invitaciones **pendientes** (sin usar, sin revocar y sin vencer), de la más nueva a la más vieja.
+**Nunca** incluye el código.
+
+**Autenticación:** Requerida — miembro activo.
+
+**Respuesta exitosa — 200:**
+```json
+[
+  {
+    "id_invitacion": 1,
+    "tipo": "MIEMBRO",
+    "fecha_creacion": "2026-10-03T22:19:40.478Z",
+    "fecha_vencimiento": "2026-10-06T22:19:40.462Z",
+    "creada_por": { "id_usuario": 9, "nombre": "Laura", "apellido": "Pérez" }
+  }
+]
+```
+
+**Errores posibles:** `503` si falta el secreto de invitaciones.
+
+---
+
+### DELETE /api/organizaciones/:id/invitaciones/:idInv
+
+Revoca una invitación pendiente.
+
+**Autenticación:** Requerida — miembro activo. Las de tipo `MIEMBRO` solo las revoca un `RESPONSABLE`;
+las de tipo `CHOFER`, cualquier miembro.
+
+**Respuesta exitosa — 200:**
+```json
+{ "mensaje": "Invitacion revocada", "id_invitacion": 2 }
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "id de invitacion invalido" }` | `:idInv` inválido |
+| 403 | `{ "error": "Solo un responsable puede revocar invitaciones de miembro" }` | Un `MIEMBRO` revoca una de tipo `MIEMBRO` |
+| 404 | `{ "error": "Invitacion no encontrada" }` | No existe o es de otra PyME |
+| 409 | `{ "error": "La invitacion ya no esta pendiente" }` | Ya fue usada, revocada o venció |
+| 503 | `{ "error": "Las invitaciones no estan disponibles en este momento" }` | Falta el secreto de invitaciones |
+
+---
+
+### POST /api/invitaciones/canjear
+
+Endpoint **único** de canje. Una cuenta `CLIENTE` solo canjea códigos de **MIEMBRO** y queda como
+`MIEMBRO` de la PyME. Una cuenta `CONDUCTOR` solo canjea códigos de **CHOFER** y queda vinculada.
+
+**Autenticación:** Requerida — rol `CLIENTE` o `CONDUCTOR`.
+
+**Body:**
+```json
+{ "codigo": "GZ32F-JNQSR" }
+```
+Se ignoran guiones, espacios y mayúsculas: `" gz32f - jnqsr "` también vale.
+
+**Respuesta exitosa — 200 (CLIENTE):**
+```json
+{
+  "mensaje": "Te uniste a la PyME",
+  "tipo": "MIEMBRO",
+  "organizacion": { "id_organizacion": 1, "nombre": "Distribuidora Norte", "estado": "TRIAL", "rol": "MIEMBRO" }
+}
+```
+
+**Respuesta exitosa — 200 (CONDUCTOR):**
+```json
+{
+  "mensaje": "Quedaste vinculado a la PyME",
+  "tipo": "CHOFER",
+  "organizacion": { "id_organizacion": 1, "nombre": "Distribuidora Norte" }
+}
+```
+
+**Errores posibles** — se evalúan **en este orden**:
+| Status | Body | Causa |
+|--------|------|-------|
+| 503 | `{ "error": "Las invitaciones no estan disponibles en este momento" }` | Falta el secreto de invitaciones |
+| 429 | `{ "error": "Demasiados intentos. Proba de nuevo en unos minutos" }` | Más de 5 intentos en 15 minutos **por usuario o por IP** (cuenta cualquier intento, bueno o malo) |
+| 400 | `{ "error": "codigo es requerido" }` | Falta `codigo` |
+| 409 | `{ "error": "Ya perteneces a una PyME" }` | `CLIENTE` que ya tiene PyME activa. Se chequea **antes** de mirar el código |
+| 400 | `{ "error": "Codigo invalido" }` | **Cualquier** falla del código: no existe, venció, ya se usó, fue revocado, es del otro tipo (`CLIENTE` con código de chofer o al revés) o lo canjeó otro un instante antes. La respuesta es **idéntica** en todos los casos a propósito |
+| 409 | `{ "error": "Ya estas vinculado a esta PyME" }` | `CONDUCTOR` con un código **válido** de una PyME a la que ya está vinculado. El código no se consume |
+
+---
+
+### GET /api/organizaciones/:id/choferes
+
+Choferes vinculados (activos) a la PyME. De cada uno se ve nombre, teléfono y sus vehículos propios
+(patente y características). **Nunca** a qué otras PyMEs está vinculado.
+
+**Autenticación:** Requerida — miembro activo.
+
+**Respuesta exitosa — 200:**
+```json
+[
+  {
+    "id_conductor": 4,
+    "id_usuario": 12,
+    "nombre": "Carlos",
+    "apellido": "Gómez",
+    "telefono": "+5491189350006",
+    "fecha_alta": "2026-10-03T22:19:53.244Z",
+    "metodo_cobro": "CALCULO_PLATAFORMA",
+    "vehiculos": [
+      {
+        "id_vehiculo": 1,
+        "patente": "AB123CD",
+        "marca": "Ford",
+        "modelo": "Transit",
+        "anio": 2022,
+        "color": "Blanco",
+        "tipo_vehiculo": "FURGON",
+        "condiciones": ["FRAGIL"]
+      }
+    ]
+  }
+]
+```
+`metodo_cobro` tiene un único valor por ahora (`CALCULO_PLATAFORMA`, el cálculo actual de la
+plataforma) y todavía no se puede cambiar.
+
+---
+
+### DELETE /api/organizaciones/:id/choferes/:idConductor
+
+Desvincula a un chofer de la PyME. `:idConductor` es el `id_conductor` del listado. El chofer puede
+volver a vincularse más adelante con un código nuevo.
+
+**Autenticación:** Requerida — miembro activo (no hace falta ser responsable).
+
+**Respuesta exitosa — 200:**
+```json
+{ "mensaje": "Chofer desvinculado", "id_conductor": 4 }
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "id de conductor invalido" }` | `:idConductor` inválido |
+| 404 | `{ "error": "No hay un vinculo activo con ese chofer" }` | No está vinculado (o ya se desvinculó) |
+
+---
+
+### GET /api/choferes/mis-organizaciones
+
+Las PyMEs a las que está vinculado el chofer.
+
+**Autenticación:** Requerida — rol `CONDUCTOR`.
+
+**Respuesta exitosa — 200:**
+```json
+[
+  { "id_organizacion": 1, "nombre": "Distribuidora Norte", "fecha_alta": "2026-10-03T22:19:53.244Z" },
+  { "id_organizacion": 2, "nombre": "Mayorista Sur", "fecha_alta": "2026-10-03T22:19:54.049Z" }
+]
+```
+`[]` si no tiene vínculos.
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 403 | `{ "error": "Acceso denegado" }` | La cuenta no es `CONDUCTOR` |
+
+---
+
+### DELETE /api/choferes/mis-organizaciones/:id
+
+El chofer se desvincula de una PyME (`:id` = `id_organizacion`).
+
+**Autenticación:** Requerida — rol `CONDUCTOR`.
+
+**Respuesta exitosa — 200:**
+```json
+{ "mensaje": "Te desvinculaste de la PyME", "id_organizacion": 2 }
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "id de PyME invalido" }` | `:id` inválido |
+| 404 | `{ "error": "No hay un vinculo activo con ese chofer" }` | No estaba vinculado a esa PyME |
 
 ---
 

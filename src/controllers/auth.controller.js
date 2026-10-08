@@ -2,6 +2,8 @@ import { z } from 'zod';
 import admin from '../config/firebase.js';
 import prisma from '../config/prisma.js';
 import { generarCodigoUnico } from '../services/afiliacion.service.js';
+import { organizacionActivaDe } from '../services/organizacion.service.js';
+import { organizacionesDeChofer } from '../services/vinculo-chofer.service.js';
 
 // ─── Schemas de validacion ───────────────────────────────────────────────────
 
@@ -189,8 +191,25 @@ export function login(req, res) {
   return res.status(200).json({ id_usuario, nombre, apellido, email, rol });
 }
 
-export function getMe(req, res) {
-  return res.status(200).json(req.usuario);
+// Suma la identidad nueva al perfil, sin sacar nada de lo que ya devolvia:
+// - CLIENTE: `organizacion` = su PyME activa { id_organizacion, nombre, estado,
+//   rol }, o null si es huerfano.
+// - CONDUCTOR: `organizaciones` = [{ id_organizacion, nombre }] de sus vinculos
+//   activos ([] si no tiene).
+// GERENTE y ADMIN quedan como estaban.
+export async function getMe(req, res) {
+  const perfil = { ...req.usuario };
+  if (req.usuario.rol === 'CLIENTE') {
+    perfil.organizacion = await organizacionActivaDe(req.usuario.id_usuario);
+  } else if (req.usuario.rol === 'CONDUCTOR') {
+    const conductor = await prisma.conductor.findUnique({
+      where: { id_usuario: req.usuario.id_usuario },
+      select: { id_conductor: true },
+    });
+    const orgs = conductor ? await organizacionesDeChofer(conductor.id_conductor) : [];
+    perfil.organizaciones = orgs.map(({ id_organizacion, nombre }) => ({ id_organizacion, nombre }));
+  }
+  return res.status(200).json(perfil);
 }
 
 export async function actualizarPerfil(req, res) {

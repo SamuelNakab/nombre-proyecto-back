@@ -1,6 +1,7 @@
 import prisma from '../config/prisma.js';
 import { responderErrorNegocio } from '../services/error-negocio.js';
 import { organizacionesDeChofer, desvincularChofer } from '../services/vinculo-chofer.service.js';
+import { io } from '../sockets/index.js';
 
 function idParam(valor) {
   const n = Number(valor);
@@ -27,12 +28,14 @@ export async function desvincularme(req, res) {
   const conductor = await conductorDe(req.usuario.id_usuario);
   if (!conductor) return res.status(400).json({ error: 'El usuario no tiene perfil de conductor' });
   try {
-    await desvincularChofer({
+    // Mismo servicio: cancela tus viajes no finales con esa PyME.
+    const viajes_cancelados = await desvincularChofer({
       id_organizacion,
       id_conductor: conductor.id_conductor,
       actor: { id_usuario: req.usuario.id_usuario, origen: 'CHOFER' },
+      io,
     });
-    return res.status(200).json({ mensaje: 'Te desvinculaste de la PyME', id_organizacion });
+    return res.status(200).json({ mensaje: 'Te desvinculaste de la PyME', id_organizacion, viajes_cancelados });
   } catch (err) {
     return responderErrorNegocio(res, err);
   }

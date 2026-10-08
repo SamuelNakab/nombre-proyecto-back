@@ -1,3 +1,4 @@
+import redis from '../config/redis.js';
 import { obtenerUltimaCoordenada } from './gps.service.js';
 import { calcularEtaConApi, obtenerEtaActual, leerEstadoEta } from './eta.service.js';
 
@@ -8,6 +9,11 @@ import { calcularEtaConApi, obtenerEtaActual, leerEstadoEta } from './eta.servic
 
 const timers = new Map(); // id_viaje → intervalId
 const ultimaActividad = new Map(); // id_viaje → wall-clock ms del ultimo ping
+// Salas a las que se emite el ETA de cada viaje: viaje:{id} y, si el viaje es de
+// una PyME, organizacion:{id} (ver sockets/salas.js). Las pasa gps.socket en cada
+// ping; sin entrada se emite solo al room del viaje, como siempre.
+const salasPorViaje = new Map(); // id_viaje → string[]
+const salasDe = (id_viaje) => salasPorViaje.get(id_viaje) ?? [`viaje:${id_viaje}`];
 
 const emisionSeg = () => parseInt(process.env.ETA_EMISION_SEGUNDOS) || 30;
 const recalculoSeg = () => parseInt(process.env.ETA_RECALCULO_SEGUNDOS) || 360;
@@ -46,14 +52,23 @@ async function emitirEta(io, id_viaje) {
     resultado = await calcularEtaConApi(id_viaje, ultima.lat, ultima.lng);
   }
 
+  // El viaje se cerro o se cancelo MIENTRAS se calculaba (detenerEmisorEta ya
+  // corrio y limpiarGPS ya borro las keys): calcularEtaConApi acaba de volver a
+  // escribir gps:{id}:eta y quedaria huerfana 24 h. Se borra y no se emite.
+  if (!timers.has(id_viaje)) {
+    await redis.del(`gps:${id_viaje}:eta`);
+    return;
+  }
+
   if (!resultado) return; // sin parada pendiente o fallo de calculo
 
-  io.to(`viaje:${id_viaje}`).emit('eta:actualizar', construirPayload(id_viaje, resultado));
+  io.to(salasDe(id_viaje)).emit('eta:actualizar', construirPayload(id_viaje, resultado));
 }
 
 // Arranca el emisor para un viaje (idempotente). Emite una vez de inmediato y
 // luego cada ETA_EMISION_SEGUNDOS.
-export function iniciarEmisorEta(io, id_viaje) {
+export function iniciarEmisorEta(io, id_viaje, salas = null) {
+  if (salas) salasPorViaje.set(id_viaje, salas);
   // Registrar actividad en CADA ping (aunque el emisor ya este corriendo) para
   // que el watchdog de inactividad sepa que el viaje sigue vivo.
   ultimaActividad.set(id_viaje, Date.now());
@@ -88,17 +103,18 @@ export function detenerEmisorEta(id_viaje) {
     console.log(`[eta-emisor] detenido para viaje ${id_viaje}`);
   }
   ultimaActividad.delete(id_viaje);
+  salasPorViaje.delete(id_viaje);
 }
 
 // Fuerza un recalculo con la API y emite el resultado de inmediato. Lo usan el
 // recalculo de ruta por desvio y la confirmacion de parada (cambia la proxima
 // parada), donde el ETA viejo ya no vale.
-export async function recalcularEtaInmediato(io, id_viaje) {
+export async function recalcularEtaInmediato(io, id_viaje, salas = null) {
   const ultima = await obtenerUltimaCoordenada(id_viaje);
   if (!ultima) return;
 
   const resultado = await calcularEtaConApi(id_viaje, ultima.lat, ultima.lng);
   if (!resultado) return;
 
-  io.to(`viaje:${id_viaje}`).emit('eta:actualizar', construirPayload(id_viaje, resultado));
+  io.to(salas ?? salasDe(id_viaje)).emit('eta:actualizar', construirPayload(id_viaje, resultado));
 }

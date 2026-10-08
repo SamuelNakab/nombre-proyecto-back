@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { verificarToken } from '../middlewares/auth.middleware.js';
+import { requireMarketplace } from '../middlewares/flags.middleware.js';
 import {
   registrarCliente,
   registrarConductor,
@@ -13,7 +14,8 @@ const router = Router();
 
 router.post('/registro-cliente', registrarCliente);
 router.post('/registro-conductor', registrarConductor);
-router.post('/registro-gerente', registrarGerente);
+// El gerente es del marketplace: con el flag en false el registro queda cerrado.
+router.post('/registro-gerente', requireMarketplace, registrarGerente);
 router.post('/login', verificarToken, login);
 router.get('/me', verificarToken, getMe);
 router.put('/perfil', verificarToken, actualizarPerfil);

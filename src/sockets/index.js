@@ -4,6 +4,8 @@ import { autenticarSocket } from './auth.socket.js';
 import { manejarAceptarViaje } from './matching.socket.js';
 import { registrarHandlersGPS } from './gps.socket.js';
 import { conductorEsElegible } from '../services/elegibilidad.service.js';
+import { marketplaceHabilitado } from '../middlewares/flags.middleware.js';
+import { salaOrganizacion } from './salas.js';
 
 export let io = null;
 
@@ -52,6 +54,10 @@ async function unirseARoomsDisponibles(socket) {
   // sin re-query por ping. El handler de conductor:ubicacion lo reutiliza.
   socket.data.id_conductor = conductor.id_conductor;
 
+  // Con el marketplace dormido no hay pool abierto: el chofer recibe sus viajes
+  // de PyME por su sala personal (usuario:{id}).
+  if (!marketplaceHabilitado()) return;
+
   const viajes = await prisma.viaje.findMany({
     where: { estado: 'BUSCANDO_CONDUCTOR', fecha_programada: { gt: new Date() } },
     include: { condiciones_req: true },
@@ -70,9 +76,23 @@ async function unirseARoomsDisponibles(socket) {
 }
 
 async function unirseARoomsCliente(socket) {
+  // Sala de cada PyME donde el usuario es miembro ACTIVO: eventos y tracking de
+  // TODOS los viajes de la organizacion. Despues se sincroniza al crear la
+  // PyME, canjear un codigo, salir o ser eliminado (sincronizarSalaOrganizacion).
+  const membresias = await prisma.miembroOrganizacion.findMany({
+    where: { id_usuario: socket.data.usuario.id_usuario, activo: true },
+    select: { id_organizacion: true },
+  });
+  for (const m of membresias) {
+    socket.join(salaOrganizacion(m.id_organizacion));
+  }
+
+  // Rooms de los viajes LEGACY propios. Los de PyME NO se scopean por usuario
+  // (un ex miembro no tiene que seguir recibiendolos): van por la sala de la PyME.
   const viajes = await prisma.viaje.findMany({
     where: {
       cliente: { id_usuario: socket.data.usuario.id_usuario },
+      id_organizacion: null,
       estado: { notIn: ['FINALIZADO', 'CANCELADO'] },
     },
     select: { id_viaje: true },
@@ -80,6 +100,8 @@ async function unirseARoomsCliente(socket) {
   for (const v of viajes) {
     socket.join(`viaje:${v.id_viaje}`);
   }
-  console.log(`[Socket] cliente unido a ${viajes.length} rooms de viajes activos`);
+  console.log(
+    `[Socket] cliente unido a ${membresias.length} salas de PyME y ${viajes.length} rooms de viajes activos`
+  );
 }
 

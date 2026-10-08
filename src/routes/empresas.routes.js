@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { verificarToken, requireRol } from '../middlewares/auth.middleware.js';
+import { requireMarketplace } from '../middlewares/flags.middleware.js';
 import {
   crearEmpresa,
   listarMisEmpresas,
@@ -17,8 +18,9 @@ import {
 
 const router = Router();
 
-// Todos los endpoints de empresa requieren token valido + rol GERENTE.
-router.use(verificarToken, requireRol('GERENTE'));
+// Todos los endpoints de empresa requieren token valido + rol GERENTE. Con
+// MARKETPLACE_HABILITADO en false, todo /api/empresas da 404 (antes del token).
+router.use(requireMarketplace, verificarToken, requireRol('GERENTE'));
 
 // Las rutas concretas (/mias) van antes que /:id para que matcheen primero.
 router.post('/', crearEmpresa);

@@ -1,5 +1,4 @@
-El API.md que tenés mezcló contenido del CLAUDE.md adentro. Acá está el API.md correcto y completo hasta Fase 3. Reemplazás todo el contenido del archivo con esto:
-markdown# Fleter — Contrato de API
+# Fleter — Contrato de API
 
 Documento de referencia para el equipo mobile y web.
 Base URL desarrollo: `http://localhost:3000`
@@ -49,9 +48,12 @@ Verificación de estado del servidor. No requiere autenticación.
 ```json
 {
   "status": "ok",
-  "timestamp": "2026-05-09T12:00:00.000Z"
+  "timestamp": "2026-05-09T12:00:00.000Z",
+  "capacidades": ["viaje-interno"]
 }
 ```
+- `capacidades`: lo que sabe hacer este deploy. `viaje-interno` = el ciclo del viaje de PyME (Paso 2).
+  El job `e2e-staging` de CI lo usa para esperar a que staging tenga el deploy nuevo.
 
 ---
 
@@ -140,6 +142,10 @@ Crea una cuenta de conductor.
 ---
 
 ### POST /api/auth/registro-gerente
+
+> **Dormido (Paso 2).** Con `MARKETPLACE_HABILITADO` en `false` (default) responde
+> `404 { "error": "No encontrado" }`, con o sin token. El viaje nuevo es el de PyME: ver
+> [Viaje interno](#viaje-interno--la-pyme-asigna-el-chofer-confirma-paso-2).
 
 Crea una cuenta de gerente y la empresa asociada en una sola operación.
 
@@ -370,6 +376,12 @@ Lo único que hace es dejar de ocultarlo, por dos canales:
 | **`vencido`** (campo calculado) | `true` en cada viaje que devuelve la API | **Fuente de verdad.** Se calcula en el read, se ve apenas el front carga sus viajes, sobrevive a cualquier caída del backend |
 | **`viaje:vencido`** (evento socket) | El aviso en tiempo real | **Best-effort.** Si el destinatario no está conectado en ese instante, se pierde |
 
+> **Viajes de PyME (Paso 2): ahí SÍ hay cambio de estado.** Un viaje `ASIGNADO` o `CONFIRMADO` cuya
+> ventana de inicio cerró (`fecha_programada + VENTANA_INICIO_DESPUES_MINUTOS`) pasa a `VENCIDO`, que es
+> final. El campo `vencido` es el mismo para los dos ciclos: `true` si el estado es `VENCIDO`, o si es
+> `ASIGNADO`/`CONFIRMADO` con la ventana ya cerrada (el instante entre que cierra y el backend lo pasa a
+> `VENCIDO`). Para los viajes del marketplace no cambió nada de lo que sigue.
+
 > **El front no debe depender solo del evento.** Si el usuario tenía la app cerrada cuando
 > el viaje venció, el evento no le llega nunca; el flag sí. Ver
 > [Evento: viaje:vencido](#evento-viajevencido).
@@ -547,6 +559,10 @@ Si `GOOGLE_MAPS_API_KEY` no está configurada usa valores mock (10 km, 0.5 h).
 
 ### POST /api/viajes
 
+> **Dormido (Paso 2).** Con `MARKETPLACE_HABILITADO` en `false` (default) responde
+> `404 { "error": "No encontrado" }`, con o sin token. El viaje nuevo es el de PyME: ver
+> [Viaje interno](#viaje-interno--la-pyme-asigna-el-chofer-confirma-paso-2).
+
 Crea un viaje nuevo. El viaje queda en estado `BUSCANDO_CONDUCTOR` y se publica
 instantáneamente a los conductores elegibles conectados via WebSocket.
 
@@ -681,6 +697,10 @@ Las tarifas se calculan automáticamente según la zona y si la `fecha_programad
 
 ### GET /api/viajes/disponibles
 
+> **Dormido (Paso 2).** Con `MARKETPLACE_HABILITADO` en `false` (default) responde
+> `404 { "error": "No encontrado" }`, con o sin token. El viaje nuevo es el de PyME: ver
+> [Viaje interno](#viaje-interno--la-pyme-asigna-el-chofer-confirma-paso-2).
+
 Devuelve los viajes en estado `BUSCANDO_CONDUCTOR` con fecha futura para los que
 el conductor es elegible. Un conductor es elegible si y solo si tiene al menos
 un vehículo (propio o asignado vía empresa) que cumple todas las condiciones
@@ -736,6 +756,10 @@ Ordenados por `fecha_programada` ascendente.
 
 ### GET /api/viajes/mis-viajes
 
+> **Solo viajes del marketplace (legacy).** Los viajes de PyME no aparecen acá: se listan por
+> membresía en [`GET /api/organizaciones/:id/viajes`](#get-apiorganizacionesidviajes) y, para el
+> chofer, en [`GET /api/choferes/viajes`](#get-apichoferesviajes).
+
 Devuelve todos los viajes del cliente autenticado, del más reciente al más antiguo.
 
 **Rol requerido:** `CLIENTE`
@@ -784,6 +808,10 @@ Devuelve todos los viajes del cliente autenticado, del más reciente al más ant
 ---
 
 ### GET /api/viajes/mis-viajes-conductor
+
+> **Solo viajes del marketplace (legacy).** Los viajes de PyME no aparecen acá: se listan por
+> membresía en [`GET /api/organizaciones/:id/viajes`](#get-apiorganizacionesidviajes) y, para el
+> chofer, en [`GET /api/choferes/viajes`](#get-apichoferesviajes).
 
 Devuelve todos los viajes que el conductor autenticado tiene asignados (donde es el conductor
 del viaje), del más reciente al más antiguo. Es el equivalente de `mis-viajes` para el conductor.
@@ -1023,6 +1051,8 @@ emiten con `{ "error": "..." }` (ver esa sección). Conviene leer ambos campos:
 
 ### Evento: viaje:disponible
 
+> **Dormido (Paso 2).** Con `MARKETPLACE_HABILITADO` en `false` no se emite.
+
 **Dirección:** servidor → conductores y gerentes elegibles  
 **Quién lo recibe:** conductores independientes elegibles **y** gerentes cuya empresa activa tiene al menos un vehículo de flota que cumple las condiciones del viaje (elegibilidad a nivel empresa)  
 **Cuándo:** inmediatamente después de que un cliente hace `POST /api/viajes`, y también cuando un viaje **vuelve al mercado** (cancelación de conductor independiente, o una reserva de empresa liberada por `cancelar-reserva`/timeout)
@@ -1054,6 +1084,9 @@ socket.on('viaje:disponible', (data) => {
 ---
 
 ### Evento: viaje:aceptar
+
+> **Dormido (Paso 2).** Con `MARKETPLACE_HABILITADO` en `false` responde por el evento `error`
+> `{ "mensaje": "Funcion no disponible" }`.
 
 **Dirección:** conductor → servidor  
 **Quién lo emite:** el conductor que quiere tomar el viaje  
@@ -1287,6 +1320,12 @@ socket.on('viaje:vencido', (data) => {
 Cambia el estado del viaje manualmente. Solo puede ejecutarlo el conductor asignado al viaje.
 Estados válidos para este endpoint: `CARGANDO`, `EN_RUTA`, `DESCARGANDO`.
 
+> **Viaje de PyME (Paso 2):** este mismo endpoint avanza `CARGANDO → EN_RUTA → DESCARGANDO`. `CARGANDO`
+> **no** se puede pedir acá (`400`): se alcanza solo iniciando el viaje en el origen
+> ([`POST /api/choferes/viajes/:id/iniciar`](#post-apichoferesviajesidiniciar)).
+> Si el estado cambió mientras se procesaba el pedido (p. ej. la PyME canceló el viaje), responde
+> `409 { "error": "El viaje cambio de estado mientras se procesaba tu pedido" }`.
+
 **Rol requerido:** `CONDUCTOR`
 
 **Body:**
@@ -1338,6 +1377,10 @@ inicio automático por primer ping GPS **ya no existe**. Registra el momento rea
 > **El GPS siempre viene del celular del conductor**, sin importar quién apretó "Iniciar viaje".
 > **Flujo correcto del mobile:** botón → `200` → **recién ahí** arrancar el GPS. Los pings
 > enviados antes de iniciar se rechazan (ver el evento `conductor:ubicacion`).
+
+> **Solo viajes del marketplace.** La ventana se abre `VENTANA_INICIO_ANTES_MINUTOS` antes de la hora
+> (si no está definida, la vieja `VENTANA_INICIO_MINUTOS`), sin límite superior. Un viaje de PyME se
+> inicia con [`POST /api/choferes/viajes/:id/iniciar`](#post-apichoferesviajesidiniciar).
 
 **Rol requerido:** `CONDUCTOR` (el conductor asignado) **o** `GERENTE` (el gerente de la empresa del viaje)
 
@@ -1662,12 +1705,13 @@ emiten con la forma `{ "error": "..." }` (no `{ "mensaje": "..." }`):
 ### Evento: mapa:actualizar
 
 **Dirección:** servidor → room del viaje  
-**Quién lo recibe:** cliente y conductor conectados al room `viaje:{id_viaje}`  
+**Quién lo recibe:** cliente y conductor conectados al room `viaje:{id_viaje}`; en un viaje de PyME, además, todos los miembros de la PyME (sala `organizacion:{id}`)  
 **Cuándo:** cada vez que el conductor emite `conductor:ubicacion`
 
 **Payload:**
 ```json
 {
+  "id_viaje": 42,
   "lat": -34.6037,
   "lng": -58.3816,
   "timestamp": 1746700000000,
@@ -1691,9 +1735,14 @@ socket.on('mapa:actualizar', (data) => {
 **Quién lo recibe:** cliente y conductor conectados al room  
 **Cuándo:** aproximadamente una vez por minuto (cuando `timestamp % 60000 < 16000`)
 
+`id_viaje` se sumó en el Paso 2: la sala de una PyME recibe el tracking de **varios** viajes. Lo
+mismo vale para `eta:actualizar`, `alerta:desvio`, `alerta:parada` y `ruta:recalculada`, que ya lo
+traían.
+
 **Payload:**
 ```json
 {
+  "id_viaje": 42,
   "precio_acumulado": 1750,
   "desglose": {
     "precio_por_tiempo": 1750,
@@ -2175,6 +2224,11 @@ Authorization: Bearer <firebase-id-token>
 
 ### POST /api/viajes/:id/confirmar-parada
 
+> **Compartido por los dos ciclos.** Un viaje de PyME confirma sus paradas acá, igual que uno del
+> marketplace. Si al confirmar la última parada el viaje ya no está en `EN_RUTA`/`DESCARGANDO` (p. ej.
+> la PyME lo canceló en ese instante), responde `409 { "error": "El viaje cambio de estado y no se
+> pudo cerrar" }` y el viaje no se finaliza.
+
 
 El conductor llega a una parada, toca "confirmar" en su app y el backend valida
 que su posición GPS esté **dentro de `RADIO_CONFIRMACION_METROS` de esa parada**.
@@ -2351,6 +2405,10 @@ socket.on('viaje:finalizado', (data) => {
 
 
 ### POST /api/viajes/:id/calificacion
+
+> **Dormido (Paso 2).** Con `CALIFICACIONES_HABILITADAS` en `false` (default) responde
+> `404 { "error": "No encontrado" }`. Los viajes de PyME no se califican (`400 { "error": "Los viajes
+> de PyME no se califican" }` con el flag prendido).
 
 
 El cliente califica al conductor después de que el viaje finalizó.
@@ -2882,6 +2940,10 @@ Un GERENTE se registra con `POST /api/auth/registro-gerente` (crea gerente + su 
 
 ### /empresas — gestión de empresas (rol GERENTE)
 
+> **Dormido (Paso 2).** Con `MARKETPLACE_HABILITADO` en `false` (default) responde
+> `404 { "error": "No encontrado" }`, con o sin token. El viaje nuevo es el de PyME: ver
+> [Viaje interno](#viaje-interno--la-pyme-asigna-el-chofer-confirma-paso-2).
+
 Todos requieren token + rol `GERENTE`. Los que operan sobre `:id` verifican que seas el gerente dueño (si no → `403 "No sos el gerente de esta empresa"`; inexistente → `404`).
 
 **POST /api/empresas** — crea una empresa; el creador queda como gerente y se genera un `codigo_afiliacion` único.
@@ -3099,6 +3161,10 @@ cumpla). `descripcion` es `null` si el cliente no escribió una.
 
 ### /afiliaciones — afiliación de conductores (rol CONDUCTOR)
 
+> **Dormido (Paso 2).** Con `MARKETPLACE_HABILITADO` en `false` (default) responde
+> `404 { "error": "No encontrado" }`, con o sin token. El viaje nuevo es el de PyME: ver
+> [Viaje interno](#viaje-interno--la-pyme-asigna-el-chofer-confirma-paso-2).
+
 **POST /api/afiliaciones** — el conductor se afilia con el `codigo_afiliacion` de una empresa → solicitud en `PENDIENTE`.
 Body: `{ "codigo_afiliacion": "string" }`. → `201` con la afiliación. `404` código inválido; `400` empresa inactiva; `409` si ya estás afiliado o con solicitud pendiente.
 
@@ -3109,6 +3175,10 @@ Body: `{ "codigo_afiliacion": "string" }`. → `201` con la afiliación. `404` c
 ---
 
 ### Reserva y asignación (rol GERENTE)
+
+> **Dormido (Paso 2).** Con `MARKETPLACE_HABILITADO` en `false` (default) responde
+> `404 { "error": "No encontrado" }`, con o sin token. El viaje nuevo es el de PyME: ver
+> [Viaje interno](#viaje-interno--la-pyme-asigna-el-chofer-confirma-paso-2).
 
 **POST /api/viajes/:id/reservar** — reserva **atómica** de un viaje en `BUSCANDO_CONDUCTOR` → `RESERVADO_POR_EMPRESA` (setea `id_empresa`, `fecha_reserva`). Body: `{ "id_empresa": N }` (opcional si el gerente tiene una sola empresa). Emite `viaje:reservado` al room (sale del pool). `409` si el viaje ya no está disponible.
 
@@ -3156,8 +3226,8 @@ Body: `{ "codigo_afiliacion": "string" }`. → `201` con la afiliación. `404` c
 ## Identidad — PyMEs, miembros, invitaciones y choferes
 
 Capa de identidad del modelo nuevo (Paso 1): una **PyME** (organización) registra y sigue sus viajes con
-**choferes de confianza**. Todavía no está conectada a los viajes — el flujo de viajes, gerente y
-empresas de esta API sigue igual por ahora.
+**choferes de confianza**. Desde el Paso 2 los viajes de la PyME se crean y se siguen por
+[Viaje interno](#viaje-interno--la-pyme-asigna-el-chofer-confirma-paso-2).
 
 **Tipos de cuenta.** El `rol` del usuario es el tipo de cuenta y no cambia después del registro:
 
@@ -3588,8 +3658,12 @@ volver a vincularse más adelante con un código nuevo.
 
 **Respuesta exitosa — 200:**
 ```json
-{ "mensaje": "Chofer desvinculado", "id_conductor": 4 }
+{ "mensaje": "Chofer desvinculado", "id_conductor": 4, "viajes_cancelados": [101, 102, 103, 104] }
 ```
+- **Paso 2:** en la misma operación se cancelan **todos** los viajes no finales de ese chofer con esta
+  PyME, incluso uno en curso (`causa_cancelacion: "DESVINCULACION"`). `viajes_cancelados` trae sus ids
+  (`[]` si no había). La PyME y el chofer reciben `viaje:cancelado` por cada uno. Los viajes del chofer
+  con otras PyMEs no se tocan.
 
 **Errores posibles:**
 | Status | Body | Causa |
@@ -3629,14 +3703,1407 @@ El chofer se desvincula de una PyME (`:id` = `id_organizacion`).
 
 **Respuesta exitosa — 200:**
 ```json
-{ "mensaje": "Te desvinculaste de la PyME", "id_organizacion": 2 }
+{ "mensaje": "Te desvinculaste de la PyME", "id_organizacion": 2, "viajes_cancelados": [105] }
 ```
+- Mismo efecto que desvincular desde la PyME: se cancelan tus viajes no finales **con esa PyME**,
+  incluso uno en curso.
 
 **Errores posibles:**
 | Status | Body | Causa |
 |--------|------|-------|
 | 400 | `{ "error": "id de PyME invalido" }` | `:id` inválido |
 | 404 | `{ "error": "No hay un vinculo activo con ese chofer" }` | No estaba vinculado a esa PyME |
+
+---
+
+## Viaje interno — la PyME asigna, el chofer confirma (Paso 2)
+
+Ciclo nuevo del viaje: una **PyME** crea el viaje y lo asigna **directo** a un chofer vinculado; el
+chofer lo **confirma** (eligiendo con qué vehículo) o lo **rechaza**, lo **inicia en el origen** y lo
+ejecuta. Reemplaza al marketplace, que queda dormido (ver [Flags](#flags--lo-que-queda-dormido)).
+
+**Estados del ciclo:**
+
+```
+ASIGNADO ──confirmar──▶ CONFIRMADO ──iniciar──▶ CARGANDO ──▶ EN_RUTA ──▶ DESCARGANDO ──▶ FINALIZADO
+   │  ▲                     │  │
+   │  └──reasignar/editar───┘  │
+   ├──rechazar──▶ RECHAZADO    │
+   ├──────────────────────────┴──▶ VENCIDO   (la ventana de inicio cerró)
+   └── cancelar ──▶ CANCELADO   (desde cualquier estado no final; el chofer solo antes de iniciar)
+```
+
+Finales: `RECHAZADO`, `VENCIDO`, `CANCELADO`, `FINALIZADO`. No existe `EN_CAMINO_A_ORIGEN`: el chofer
+inicia el viaje **estando en el origen** y pasa directo a `CARGANDO`.
+
+| Desde | Hacia | Quién | Cómo |
+|---|---|---|---|
+| — | `ASIGNADO` | PyME | [`POST /api/organizaciones/:id/viajes`](#post-apiorganizacionesidviajes) |
+| `ASIGNADO` | `CONFIRMADO` | Chofer | [`POST /api/choferes/viajes/:id/confirmar`](#post-apichoferesviajesidconfirmar) |
+| `ASIGNADO` | `RECHAZADO` | Chofer | [`POST /api/choferes/viajes/:id/rechazar`](#post-apichoferesviajesidrechazar) |
+| `ASIGNADO` / `CONFIRMADO` | `ASIGNADO` | PyME | reasignar o editar (si estaba `CONFIRMADO`, hay que reconfirmar) |
+| `CONFIRMADO` | `CARGANDO` | Chofer | [`POST /api/choferes/viajes/:id/iniciar`](#post-apichoferesviajesidiniciar) (única forma) |
+| `CARGANDO` → `EN_RUTA` → `DESCARGANDO` | | Chofer | [`PATCH /api/viajes/:id/estado`](#patch-apiviajesidestado) |
+| `EN_RUTA` / `DESCARGANDO` | `FINALIZADO` | Chofer | confirmar la **última** parada ([`POST /api/viajes/:id/confirmar-parada`](#post-apiviajesidconfirmar-parada)) |
+| `ASIGNADO` / `CONFIRMADO` | `CANCELADO` | Chofer, PyME, admin | cancelar, o desvincular al chofer |
+| `CARGANDO` / `EN_RUTA` / `DESCARGANDO` | `CANCELADO` | PyME, admin | el chofer **no** puede cancelar en curso |
+| `ASIGNADO` / `CONFIRMADO` | `VENCIDO` | Sistema | la ventana de inicio cerró |
+
+**Ventana de inicio.** El chofer puede iniciar entre `fecha_programada − VENTANA_INICIO_ANTES_MINUTOS`
+y `fecha_programada + VENTANA_INICIO_DESPUES_MINUTOS` (60 y 90 min por default: un viaje a las 10:00 se
+inicia de 9:00 a 11:30). Si la ventana cierra y el viaje sigue `ASIGNADO` o `CONFIRMADO`, pasa a
+**`VENCIDO`** (final). El backend lo hace solo (por timer, al arrancar y al leer o accionar sobre el
+viaje); el front ve `estado: "VENCIDO"` y `vencido: true`, y recibe `viaje:vencido`.
+
+**Quién ve qué.**
+- La **PyME** ve todos los viajes de su organización, los haya creado quien sea, por
+  `/api/organizaciones/:id/viajes` (cualquier miembro activo; un `CLIENTE` sin membresía recibe `403`).
+  Un viaje de **otra** PyME da `404 { "error": "Viaje no encontrado" }`, exista o no.
+- El **chofer** ve solo sus viajes, de todas sus PyMEs, por `/api/choferes/viajes`, cada uno con el
+  nombre de la PyME. Una PyME nunca ve los viajes que el chofer hace para otra.
+- Las rutas viejas **no** sirven para los viajes de PyME: `GET /api/viajes/mis-viajes` no los lista, y
+  `GET /api/viajes/:id` le da `403` al miembro (solo lo abre el chofer asignado).
+
+**Forma del viaje.** Las listas y el detalle devuelven la fila del viaje más:
+- `organizacion` `{ id_organizacion, nombre, cuit }`, `creador` `{ id_usuario, nombre, apellido }`,
+  `conductor` `{ id_conductor, id_usuario, nombre, apellido, telefono }` (o `null`), `vehiculo` (`null`
+  hasta que el chofer confirma), `paradas` (con `id_parada`, ordenadas) y `condiciones_requeridas`
+  (array de strings).
+- `metodo_cobro` (copiado del vínculo con el chofer), `fecha_confirmacion`, `fecha_rechazo`,
+  `causa_cancelacion` (`CHOFER` | `ORGANIZACION` | `ADMIN` | `DESVINCULACION`) y `motivo_cancelacion`.
+- Los campos calculados de siempre: `duracion_estimada` (min), `duracion_real`, `duracion_carga`,
+  `duracion_descarga`, `duracion_aproximacion_origen` (siempre `0` en este ciclo: el viaje se inicia en
+  el origen), `puntualidad_inicio` (contra `fecha_programada`, medida en la llegada al origen =
+  el inicio), `vencido` y `remito_url` (solo `FINALIZADO`). El detalle suma `ruta_planeada`.
+- `historial_estados`: una fila por cambio de estado (`origen` `CLIENTE` = la PyME, `CONDUCTOR` = el
+  chofer, `ADMIN`, `SISTEMA`).
+
+**Errores de carrera.** Si dos acciones compiten por el mismo viaje (p. ej. el chofer confirma mientras
+la PyME cancela), gana una y la otra recibe
+`409 { "error": "El viaje cambio de estado mientras se procesaba tu pedido: volve a cargarlo" }`.
+En el caso secuencial (el estado ya no lo permite) la respuesta es un `400` que dice el estado actual.
+
+---
+
+### POST /api/organizaciones/:id/viajes
+
+La PyME crea un viaje asignado a un chofer vinculado. Queda **`ASIGNADO`**, sin vehículo: el vehículo
+lo elige el chofer al confirmar.
+
+**Autenticación:** Requerida — miembro activo de la PyME (`RESPONSABLE` o `MIEMBRO`).
+
+**Body:**
+```json
+{
+  "id_conductor": 34,
+  "fecha_programada": "2026-10-05T13:00:00.000Z",
+  "paradas": [
+    { "lat": -34.6037, "lng": -58.3816, "direccion": "Plaza de Mayo, CABA" },
+    { "lat": -34.5895, "lng": -58.3974, "direccion": "Recoleta, CABA" }
+  ],
+  "condiciones_requeridas": ["FRAGIL"],
+  "descripcion": "string (opcional, max 500)"
+}
+```
+- `id_conductor`: el `id_conductor` de [`GET /api/organizaciones/:id/choferes`](#get-apiorganizacionesidchoferes).
+- `paradas` y `condiciones_requeridas`: mismo formato que la ruta vieja. La primera parada es el **origen**
+  (ahí se inicia el viaje). `zona` se acepta y se ignora (la calcula el servidor).
+- `fecha_programada`: futura, con al menos `ANTICIPACION_MINIMA_MINUTOS` de anticipación (mismo mensaje
+  que la ruta vieja).
+- El precio y la duración salen del mismo cálculo de siempre. `metodo_cobro` se copia del vínculo.
+
+**Respuesta exitosa — 201** (viaje real de una corrida del test, recortado):
+```json
+{
+  "id_viaje": 457,
+  "id_cliente": 172,
+  "id_conductor": 189,
+  "id_vehiculo": null,
+  "id_empresa": null,
+  "zona": "CABA",
+  "tarifa_hora": 3500,
+  "tarifa_km": null,
+  "distancia_provincia": null,
+  "tiempo_capital": null,
+  "duracion_estimada_horas": 0.5,
+  "fecha_programada": "2026-10-04T02:04:48.340Z",
+  "descripcion": null,
+  "estado": "ASIGNADO",
+  "fecha_inicio": null,
+  "puntualidad_inicio": null,
+  "fecha_llegada_origen": null,
+  "fecha_reserva": null,
+  "iniciado_por": null,
+  "precio_estimado": 1750,
+  "precio_real": null,
+  "creado_en": "2026-10-04T02:02:48.956Z",
+  "motivo_cancelacion": null,
+  "cancelado_por_admin_id": null,
+  "id_organizacion": 77,
+  "id_creador": 369,
+  "metodo_cobro": "CALCULO_PLATAFORMA",
+  "fecha_confirmacion": null,
+  "fecha_rechazo": null,
+  "causa_cancelacion": null,
+  "paradas": [
+    {
+      "id_parada": 918,
+      "id_viaje": 457,
+      "orden": 1,
+      "direccion": "Plaza de Mayo, CABA",
+      "latitud": -34.6037,
+      "longitud": -58.3816,
+      "estado": "PENDIENTE",
+      "fecha_entrega": null
+    },
+    {
+      "id_parada": 919,
+      "id_viaje": 457,
+      "orden": 2,
+      "direccion": "Recoleta, CABA",
+      "latitud": -34.5895,
+      "longitud": -58.3974,
+      "estado": "PENDIENTE",
+      "fecha_entrega": null
+    }
+  ],
+  "organizacion": {
+    "id_organizacion": 77,
+    "nombre": "PyME A 1791079343293",
+    "cuit": "30343343074"
+  },
+  "creador": {
+    "id_usuario": 369,
+    "nombre": "Pym1",
+    "apellido": "Vin"
+  },
+  "vehiculo": null,
+  "historial_estados": [
+    {
+      "id_historial": 1363,
+      "id_viaje": 457,
+      "estado": "ASIGNADO",
+      "fecha": "2026-10-04T02:02:49.526Z",
+      "id_usuario": 369,
+      "origen": "CLIENTE"
+    }
+  ],
+  "condiciones_requeridas": [
+    "FRAGIL"
+  ],
+  "conductor": {
+    "id_conductor": 189,
+    "id_usuario": 373,
+    "nombre": "Cho1",
+    "apellido": "Vin",
+    "telefono": "+5491132930004"
+  },
+  "duracion_estimada": 30,
+  "duracion_real": null,
+  "duracion_carga": null,
+  "duracion_descarga": null,
+  "duracion_aproximacion_origen": null,
+  "vencido": false,
+  "remito_url": null,
+  "ruta_planeada": null,
+  "desglose_estimado": {
+    "precio_por_tiempo": 1750,
+    "precio_por_distancia": null,
+    "tiempo_horas": 0.5,
+    "distancia_km": 10,
+    "tiempo_capital": 0.5,
+    "distancia_provincia": null,
+    "fraccion_caba": 1,
+    "tarifa_hora": 3500,
+    "tarifa_km": null,
+    "es_hora_pico": false
+  }
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{"error": "El chofer no esta vinculado a esta PyME"}` | El chofer no tiene vínculo activo con esta PyME |
+| 400 | `{"error": "El chofer no tiene un vehiculo propio que cumpla las condiciones del viaje: REFRIGERADO"}` | Ningún vehículo **propio** del chofer cumple las condiciones (la flota de empresas no cuenta) |
+| 400 | `{ "error": "El chofer no tiene vehiculos propios registrados" }` | El chofer no tiene vehículos |
+| 400 | `{ "error": "id_conductor es requerido" }` / errores de `paradas` / `fecha_programada` | Body inválido |
+| 403 | `{"error": "La PyME esta suspendida: no puede crear ni modificar viajes"}` | La PyME está `SUSPENDIDA` |
+| 503 | `{ "error": "No se pudo calcular la distancia" }` | Falló el cálculo de costo |
+
+Emite `viaje:asignado` al chofer y a la sala de la PyME.
+
+---
+
+### GET /api/organizaciones/:id/viajes
+
+Todos los viajes de la PyME (de cualquier miembro). Antes de responder, vence los que tengan la ventana
+cerrada.
+
+**Autenticación:** Requerida — miembro activo.
+
+**Query (opcional, uno de los dos):**
+- `grupo`: `activos` (no finales) | `en_curso` (`CARGANDO`, `EN_RUTA`, `DESCARGANDO`) | `historial` (finales)
+- `estado`: un estado del ciclo (`ASIGNADO`, `CONFIRMADO`, ..., `VENCIDO`)
+
+**Respuesta exitosa — 200:** array de viajes, más reciente primero. Un elemento real (recortado):
+```json
+{
+  "id_viaje": 460,
+  "id_cliente": 172,
+  "id_conductor": 189,
+  "id_vehiculo": 204,
+  "id_empresa": null,
+  "zona": "CABA",
+  "tarifa_hora": 3500,
+  "tarifa_km": null,
+  "distancia_provincia": null,
+  "tiempo_capital": null,
+  "duracion_estimada_horas": 0.5,
+  "fecha_programada": "2026-10-04T05:02:57.061Z",
+  "descripcion": null,
+  "estado": "CANCELADO",
+  "fecha_inicio": null,
+  "puntualidad_inicio": null,
+  "fecha_llegada_origen": null,
+  "fecha_reserva": null,
+  "iniciado_por": null,
+  "precio_estimado": 1750,
+  "precio_real": null,
+  "creado_en": "2026-10-04T02:02:57.545Z",
+  "motivo_cancelacion": null,
+  "cancelado_por_admin_id": null,
+  "id_organizacion": 77,
+  "id_creador": 369,
+  "metodo_cobro": "CALCULO_PLATAFORMA",
+  "fecha_confirmacion": "2026-10-04T02:02:58.665Z",
+  "fecha_rechazo": null,
+  "causa_cancelacion": "ORGANIZACION",
+  "paradas": [
+    {
+      "id_parada": 924,
+      "id_viaje": 460,
+      "orden": 1,
+      "direccion": "Plaza de Mayo, CABA",
+      "latitud": -34.6037,
+      "longitud": -58.3816,
+      "estado": "PENDIENTE",
+      "fecha_entrega": null
+    },
+    {
+      "id_parada": 925,
+      "id_viaje": 460,
+      "orden": 2,
+      "direccion": "Recoleta, CABA",
+      "latitud": -34.5895,
+      "longitud": -58.3974,
+      "estado": "PENDIENTE",
+      "fecha_entrega": null
+    }
+  ],
+  "organizacion": {
+    "id_organizacion": 77,
+    "nombre": "PyME A 1791079343293",
+    "cuit": "30343343074"
+  },
+  "creador": {
+    "id_usuario": 369,
+    "nombre": "Pym1",
+    "apellido": "Vin"
+  },
+  "vehiculo": {
+    "id_vehiculo": 204,
+    "patente": "V329301",
+    "marca": "Fiat",
+    "modelo": "Fiorino",
+    "anio": 2020,
+    "color": "Blanco",
+    "tipo_vehiculo": "Utilitario"
+  },
+  "historial_estados": [
+    {
+      "id_historial": 1368,
+      "id_viaje": 460,
+      "estado": "ASIGNADO",
+      "fecha": "2026-10-04T02:02:57.761Z",
+      "id_usuario": 369,
+      "origen": "CLIENTE"
+    },
+    {
+      "id_historial": 1369,
+      "id_viaje": 460,
+      "estado": "CONFIRMADO",
+      "fecha": "2026-10-04T02:02:58.882Z",
+      "id_usuario": 373,
+      "origen": "CONDUCTOR"
+    },
+    {
+      "id_historial": 1376,
+      "id_viaje": 460,
+      "estado": "CANCELADO",
+      "fecha": "2026-10-04T02:03:06.867Z",
+      "id_usuario": 369,
+      "origen": "CLIENTE"
+    }
+  ],
+  "condiciones_requeridas": [],
+  "conductor": {
+    "id_conductor": 189,
+    "id_usuario": 373,
+    "nombre": "Cho1",
+    "apellido": "Vin",
+    "telefono": "+5491132930004"
+  },
+  "duracion_estimada": 30,
+  "duracion_real": null,
+  "duracion_carga": null,
+  "duracion_descarga": null,
+  "duracion_aproximacion_origen": null,
+  "vencido": false,
+  "remito_url": null
+}
+```
+
+**Errores posibles:** `400 { "error": "Estado invalido" }`, `400` con un `grupo` inválido, `403` si no
+sos miembro.
+
+---
+
+### GET /api/organizaciones/:id/viajes/:idViaje
+
+Detalle de un viaje de la PyME, con `ruta_planeada` (`[[lng, lat], ...]` o `null`).
+
+**Autenticación:** Requerida — miembro activo.
+
+**Respuesta exitosa — 200** (viaje real `FINALIZADO`, recortado):
+```json
+{
+  "id_viaje": 464,
+  "id_cliente": 172,
+  "id_conductor": 189,
+  "id_vehiculo": 204,
+  "id_empresa": null,
+  "zona": "CABA",
+  "tarifa_hora": 3500,
+  "tarifa_km": null,
+  "distancia_provincia": null,
+  "tiempo_capital": 0,
+  "duracion_estimada_horas": 0.5,
+  "fecha_programada": "2026-10-04T02:05:08.761Z",
+  "descripcion": null,
+  "estado": "FINALIZADO",
+  "fecha_inicio": "2026-10-04T02:03:11.939Z",
+  "puntualidad_inicio": "A_TIEMPO",
+  "fecha_llegada_origen": "2026-10-04T02:03:11.939Z",
+  "fecha_reserva": null,
+  "iniciado_por": "CONDUCTOR",
+  "precio_estimado": 1750,
+  "precio_real": 0,
+  "creado_en": "2026-10-04T02:03:09.271Z",
+  "motivo_cancelacion": null,
+  "cancelado_por_admin_id": null,
+  "id_organizacion": 77,
+  "id_creador": 369,
+  "metodo_cobro": "CALCULO_PLATAFORMA",
+  "fecha_confirmacion": "2026-10-04T02:03:10.454Z",
+  "fecha_rechazo": null,
+  "causa_cancelacion": null,
+  "paradas": [
+    {
+      "id_parada": 932,
+      "id_viaje": 464,
+      "orden": 1,
+      "direccion": "Plaza de Mayo, CABA",
+      "latitud": -34.6037,
+      "longitud": -58.3816,
+      "estado": "ENTREGADO",
+      "fecha_entrega": "2026-10-04T02:03:16.341Z"
+    },
+    {
+      "id_parada": 933,
+      "id_viaje": 464,
+      "orden": 2,
+      "direccion": "Recoleta, CABA",
+      "latitud": -34.5895,
+      "longitud": -58.3974,
+      "estado": "ENTREGADO",
+      "fecha_entrega": "2026-10-04T02:03:17.738Z"
+    }
+  ],
+  "organizacion": {
+    "id_organizacion": 77,
+    "nombre": "PyME A 1791079343293",
+    "cuit": "30343343074"
+  },
+  "creador": {
+    "id_usuario": 369,
+    "nombre": "Pym1",
+    "apellido": "Vin"
+  },
+  "vehiculo": {
+    "id_vehiculo": 204,
+    "patente": "V329301",
+    "marca": "Fiat",
+    "modelo": "Fiorino",
+    "anio": 2020,
+    "color": "Blanco",
+    "tipo_vehiculo": "Utilitario"
+  },
+  "historial_estados": [
+    {
+      "id_historial": 1379,
+      "id_viaje": 464,
+      "estado": "ASIGNADO",
+      "fecha": "2026-10-04T02:03:09.481Z",
+      "id_usuario": 369,
+      "origen": "CLIENTE"
+    },
+    {
+      "id_historial": 1380,
+      "id_viaje": 464,
+      "estado": "CONFIRMADO",
+      "fecha": "2026-10-04T02:03:10.670Z",
+      "id_usuario": 373,
+      "origen": "CONDUCTOR"
+    },
+    {
+      "id_historial": 1381,
+      "id_viaje": 464,
+      "estado": "CARGANDO",
+      "fecha": "2026-10-04T02:03:12.156Z",
+      "id_usuario": 373,
+      "origen": "CONDUCTOR"
+    },
+    {
+      "id_historial": 1382,
+      "id_viaje": 464,
+      "estado": "EN_RUTA",
+      "fecha": "2026-10-04T02:03:15.083Z",
+      "id_usuario": 373,
+      "origen": "CONDUCTOR"
+    },
+    {
+      "id_historial": 1383,
+      "id_viaje": 464,
+      "estado": "DESCARGANDO",
+      "fecha": "2026-10-04T02:03:17.476Z",
+      "id_usuario": 373,
+      "origen": "CONDUCTOR"
+    },
+    {
+      "id_historial": 1384,
+      "id_viaje": 464,
+      "estado": "FINALIZADO",
+      "fecha": "2026-10-04T02:03:18.519Z",
+      "id_usuario": 373,
+      "origen": "CONDUCTOR"
+    }
+  ],
+  "condiciones_requeridas": [],
+  "conductor": {
+    "id_conductor": 189,
+    "id_usuario": 373,
+    "nombre": "Cho1",
+    "apellido": "Vin",
+    "telefono": "+5491132930004"
+  },
+  "duracion_estimada": 30,
+  "duracion_real": 0,
+  "duracion_carga": 0,
+  "duracion_descarga": 0,
+  "duracion_aproximacion_origen": 0,
+  "vencido": false,
+  "remito_url": "https://pub-259e35cb295345b4b029cc3b28a349e8.r2.dev/remitos/464.pdf",
+  "ruta_planeada": null
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 404 | `{"error": "Viaje no encontrado"}` | No existe, o es de otra PyME |
+
+---
+
+### PUT /api/organizaciones/:id/viajes/:idViaje
+
+Edita un viaje que todavía no arrancó. Mandá solo lo que cambia (al menos un campo).
+
+**Autenticación:** Requerida — miembro activo.
+
+**Body:**
+```json
+{
+  "paradas": [ { "lat": -34.6037, "lng": -58.3816 }, { "lat": -34.5895, "lng": -58.3974 } ],
+  "fecha_programada": "2026-10-05T14:00:00.000Z",
+  "condiciones_requeridas": ["FRAGIL", "REFRIGERADO"],
+  "descripcion": "string | null"
+}
+```
+- Solo en `ASIGNADO` o `CONFIRMADO`. Si estaba **`CONFIRMADO` vuelve a `ASIGNADO`**: se borra el
+  vehículo y el chofer tiene que volver a confirmar.
+- Si cambian las paradas o la fecha se recalculan precio, zona y duración (y la ruta si cambian las
+  paradas). Se reprograma el vencimiento.
+- El chofer actual tiene que seguir teniendo un vehículo que cumpla las condiciones nuevas; si no, `400`
+  (reasigná el viaje).
+
+**Respuesta exitosa — 200:** el viaje actualizado (misma forma que el detalle). Real, recortado:
+```json
+{
+  "id_viaje": 469,
+  "id_cliente": 172,
+  "id_conductor": 189,
+  "id_vehiculo": null,
+  "id_empresa": null,
+  "zona": "CABA",
+  "tarifa_hora": 3500,
+  "tarifa_km": null,
+  "distancia_provincia": null,
+  "tiempo_capital": null,
+  "duracion_estimada_horas": 1,
+  "fecha_programada": "2026-10-04T02:33:50.189Z",
+  "descripcion": "editado",
+  "estado": "ASIGNADO",
+  "fecha_inicio": null,
+  "puntualidad_inicio": null,
+  "fecha_llegada_origen": null,
+  "fecha_reserva": null,
+  "iniciado_por": null,
+  "precio_estimado": 3500,
+  "precio_real": null,
+  "creado_en": "2026-10-04T02:03:48.755Z",
+  "motivo_cancelacion": null,
+  "cancelado_por_admin_id": null,
+  "id_organizacion": 77,
+  "id_creador": 369,
+  "metodo_cobro": "CALCULO_PLATAFORMA",
+  "fecha_confirmacion": null,
+  "fecha_rechazo": null,
+  "causa_cancelacion": null,
+  "paradas": [
+    {
+      "id_parada": 944,
+      "id_viaje": 469,
+      "orden": 1,
+      "direccion": "Plaza de Mayo, CABA",
+      "latitud": -34.6037,
+      "longitud": -58.3816,
+      "estado": "PENDIENTE",
+      "fecha_entrega": null
+    },
+    {
+      "id_parada": 945,
+      "id_viaje": 469,
+      "orden": 2,
+      "direccion": "Tribunales, CABA",
+      "latitud": -34.5975,
+      "longitud": -58.3923,
+      "estado": "PENDIENTE",
+      "fecha_entrega": null
+    },
+    {
+      "id_parada": 946,
+      "id_viaje": 469,
+      "orden": 3,
+      "direccion": "Recoleta, CABA",
+      "latitud": -34.5895,
+      "longitud": -58.3974,
+      "estado": "PENDIENTE",
+      "fecha_entrega": null
+    }
+  ],
+  "organizacion": {
+    "id_organizacion": 77,
+    "nombre": "PyME A 1791079343293",
+    "cuit": "30343343074"
+  },
+  "creador": {
+    "id_usuario": 369,
+    "nombre": "Pym1",
+    "apellido": "Vin"
+  },
+  "vehiculo": null,
+  "historial_estados": [
+    {
+      "id_historial": 1400,
+      "id_viaje": 469,
+      "estado": "ASIGNADO",
+      "fecha": "2026-10-04T02:03:49.014Z",
+      "id_usuario": 369,
+      "origen": "CLIENTE"
+    },
+    {
+      "id_historial": 1401,
+      "id_viaje": 469,
+      "estado": "CONFIRMADO",
+      "fecha": "2026-10-04T02:03:50.134Z",
+      "id_usuario": 373,
+      "origen": "CONDUCTOR"
+    },
+    {
+      "id_historial": 1402,
+      "id_viaje": 469,
+      "estado": "ASIGNADO",
+      "fecha": "2026-10-04T02:03:51.547Z",
+      "id_usuario": 369,
+      "origen": "CLIENTE"
+    }
+  ],
+  "condiciones_requeridas": [
+    "FRAGIL",
+    "REFRIGERADO"
+  ],
+  "conductor": {
+    "id_conductor": 189,
+    "id_usuario": 373,
+    "nombre": "Cho1",
+    "apellido": "Vin",
+    "telefono": "+5491132930004"
+  },
+  "duracion_estimada": 60,
+  "duracion_real": null,
+  "duracion_carga": null,
+  "duracion_descarga": null,
+  "duracion_aproximacion_origen": null,
+  "vencido": false,
+  "remito_url": null,
+  "ruta_planeada": null
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "Mandá al menos un campo para editar (paradas, fecha_programada, condiciones_requeridas o descripcion)" }` | Body vacío |
+| 400 | `{ "error": "Solo se puede editar un viaje ASIGNADO o CONFIRMADO; este esta en estado CARGANDO" }` | Ya arrancó o terminó |
+| 400 | `{ "error": "El chofer no tiene un vehiculo propio que cumpla las condiciones del viaje: CARGA_PESADA. Reasigna el viaje a otro chofer" }` | Condiciones que el chofer no cumple |
+| 403 | `{ "error": "La PyME esta suspendida: no puede crear ni modificar viajes" }` | PyME `SUSPENDIDA` |
+| 404 | `{ "error": "Viaje no encontrado" }` | No existe o es de otra PyME |
+| 409 | `{ "error": "El viaje cambio de estado mientras se procesaba tu pedido: volve a cargarlo" }` | Carrera |
+
+Emite `viaje:editado` al chofer y a la PyME.
+
+---
+
+### POST /api/organizaciones/:id/viajes/:idViaje/reasignar
+
+Pasa el viaje a otro chofer vinculado. Solo en `ASIGNADO` o `CONFIRMADO`. Vuelve a `ASIGNADO`, sin
+vehículo, con el `metodo_cobro` del vínculo nuevo.
+
+**Autenticación:** Requerida — miembro activo.
+
+**Body:** `{ "id_conductor": 35 }`
+
+**Respuesta exitosa — 200:** el viaje actualizado. Real, recortado:
+```json
+{
+  "id_viaje": 468,
+  "id_cliente": 172,
+  "id_conductor": 188,
+  "id_vehiculo": null,
+  "id_empresa": null,
+  "zona": "CABA",
+  "tarifa_hora": 3500,
+  "tarifa_km": null,
+  "distancia_provincia": null,
+  "tiempo_capital": null,
+  "duracion_estimada_horas": 0.5,
+  "fecha_programada": "2026-10-04T02:05:41.840Z",
+  "descripcion": null,
+  "estado": "ASIGNADO",
+  "fecha_inicio": null,
+  "puntualidad_inicio": null,
+  "fecha_llegada_origen": null,
+  "fecha_reserva": null,
+  "iniciado_por": null,
+  "precio_estimado": 1750,
+  "precio_real": null,
+  "creado_en": "2026-10-04T02:03:42.355Z",
+  "motivo_cancelacion": null,
+  "cancelado_por_admin_id": null,
+  "id_organizacion": 77,
+  "id_creador": 369,
+  "metodo_cobro": "CALCULO_PLATAFORMA",
+  "fecha_confirmacion": null,
+  "fecha_rechazo": null,
+  "causa_cancelacion": null,
+  "paradas": [
+    {
+      "id_parada": 940,
+      "id_viaje": 468,
+      "orden": 1,
+      "direccion": "Plaza de Mayo, CABA",
+      "latitud": -34.6037,
+      "longitud": -58.3816,
+      "estado": "PENDIENTE",
+      "fecha_entrega": null
+    },
+    {
+      "id_parada": 941,
+      "id_viaje": 468,
+      "orden": 2,
+      "direccion": "Recoleta, CABA",
+      "latitud": -34.5895,
+      "longitud": -58.3974,
+      "estado": "PENDIENTE",
+      "fecha_entrega": null
+    }
+  ],
+  "organizacion": {
+    "id_organizacion": 77,
+    "nombre": "PyME A 1791079343293",
+    "cuit": "30343343074"
+  },
+  "creador": {
+    "id_usuario": 369,
+    "nombre": "Pym1",
+    "apellido": "Vin"
+  },
+  "vehiculo": null,
+  "historial_estados": [
+    {
+      "id_historial": 1396,
+      "id_viaje": 468,
+      "estado": "ASIGNADO",
+      "fecha": "2026-10-04T02:03:42.629Z",
+      "id_usuario": 369,
+      "origen": "CLIENTE"
+    },
+    {
+      "id_historial": 1397,
+      "id_viaje": 468,
+      "estado": "CONFIRMADO",
+      "fecha": "2026-10-04T02:03:43.779Z",
+      "id_usuario": 373,
+      "origen": "CONDUCTOR"
+    },
+    {
+      "id_historial": 1398,
+      "id_viaje": 468,
+      "estado": "ASIGNADO",
+      "fecha": "2026-10-04T02:03:44.858Z",
+      "id_usuario": 369,
+      "origen": "CLIENTE"
+    }
+  ],
+  "condiciones_requeridas": [
+    "FRAGIL"
+  ],
+  "conductor": {
+    "id_conductor": 188,
+    "id_usuario": 372,
+    "nombre": "Cho2",
+    "apellido": "Vin",
+    "telefono": "+5491132930005"
+  },
+  "duracion_estimada": 30,
+  "duracion_real": null,
+  "duracion_carga": null,
+  "duracion_descarga": null,
+  "duracion_aproximacion_origen": null,
+  "vencido": false,
+  "remito_url": null
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "El viaje ya esta asignado a ese chofer" }` | Mismo chofer |
+| 400 | `{ "error": "El chofer no esta vinculado a esta PyME" }` / sin vehículo compatible | Mismas validaciones que crear |
+| 400 | `{ "error": "Solo se puede reasignar un viaje ASIGNADO o CONFIRMADO; este esta en estado ..." }` | Ya arrancó o terminó |
+| 403 | PyME `SUSPENDIDA` | |
+| 404 / 409 | como en editar | |
+
+Emite `viaje:desasignado` al chofer anterior y `viaje:asignado` al nuevo (los dos también a la PyME).
+
+---
+
+### POST /api/organizaciones/:id/viajes/:idViaje/cancelar
+
+La PyME cancela el viaje, **en cualquier estado no final, incluido en curso**. Corta el tracking (ETA,
+GPS y Redis).
+
+**Autenticación:** Requerida — miembro activo. Funciona aunque la PyME esté `SUSPENDIDA`.
+
+**Body (opcional):** `{ "motivo": "string" }` (queda en `motivo_cancelacion`).
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "mensaje": "Viaje cancelado",
+  "id_viaje": 466,
+  "estado": "CANCELADO",
+  "causa_cancelacion": "ORGANIZACION"
+}
+```
+
+**Errores posibles:** `400 { "error": "No se puede cancelar un viaje en estado RECHAZADO" }` (u otro
+final), `404`, `409` (carrera).
+
+Emite `viaje:cancelado` al chofer y a la PyME.
+
+---
+
+### GET /api/organizaciones/:id/viajes/:idViaje/costo-acumulado
+
+Precio acumulado en vivo de un viaje en curso. Mismo cálculo y misma forma que
+[`GET /api/viajes/:id/costo-acumulado`](#get-apiviajesidcosto-acumulado). `404` si el viaje no es de la PyME.
+
+### GET /api/organizaciones/:id/viajes/:idViaje/remito
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "remito_url": "https://pub-259e35cb295345b4b029cc3b28a349e8.r2.dev/remitos/464.pdf"
+}
+```
+`400 { "error": "El remito solo esta disponible para viajes finalizados" }` si no está `FINALIZADO`.
+El PDF de un viaje de PyME muestra en el encabezado la **PyME** (nombre, CUIT y razón social), no a
+quien lo creó.
+
+---
+
+### GET /api/choferes/viajes
+
+Los viajes del chofer, de **todas** sus PyMEs. Antes de responder, vence los que tengan la ventana
+cerrada.
+
+**Autenticación:** Requerida — rol `CONDUCTOR`.
+
+**Query (opcional, uno de los dos):**
+- `grupo`: `asignados` | `confirmados` | `en_curso` | `historial`
+- `estado`: un estado del ciclo
+
+**Respuesta exitosa — 200:** array, por `fecha_programada` ascendente. Un elemento real (recortado):
+```json
+{
+  "id_viaje": 464,
+  "id_cliente": 172,
+  "id_conductor": 189,
+  "id_vehiculo": 204,
+  "id_empresa": null,
+  "zona": "CABA",
+  "tarifa_hora": 3500,
+  "tarifa_km": null,
+  "distancia_provincia": null,
+  "tiempo_capital": 0,
+  "duracion_estimada_horas": 0.5,
+  "fecha_programada": "2026-10-04T02:05:08.761Z",
+  "descripcion": null,
+  "estado": "FINALIZADO",
+  "fecha_inicio": "2026-10-04T02:03:11.939Z",
+  "puntualidad_inicio": "A_TIEMPO",
+  "fecha_llegada_origen": "2026-10-04T02:03:11.939Z",
+  "fecha_reserva": null,
+  "iniciado_por": "CONDUCTOR",
+  "precio_estimado": 1750,
+  "precio_real": 0,
+  "creado_en": "2026-10-04T02:03:09.271Z",
+  "motivo_cancelacion": null,
+  "cancelado_por_admin_id": null,
+  "id_organizacion": 77,
+  "id_creador": 369,
+  "metodo_cobro": "CALCULO_PLATAFORMA",
+  "fecha_confirmacion": "2026-10-04T02:03:10.454Z",
+  "fecha_rechazo": null,
+  "causa_cancelacion": null,
+  "paradas": [
+    {
+      "id_parada": 932,
+      "id_viaje": 464,
+      "orden": 1,
+      "direccion": "Plaza de Mayo, CABA",
+      "latitud": -34.6037,
+      "longitud": -58.3816,
+      "estado": "ENTREGADO",
+      "fecha_entrega": "2026-10-04T02:03:16.341Z"
+    },
+    {
+      "id_parada": 933,
+      "id_viaje": 464,
+      "orden": 2,
+      "direccion": "Recoleta, CABA",
+      "latitud": -34.5895,
+      "longitud": -58.3974,
+      "estado": "ENTREGADO",
+      "fecha_entrega": "2026-10-04T02:03:17.738Z"
+    }
+  ],
+  "organizacion": {
+    "id_organizacion": 77,
+    "nombre": "PyME A 1791079343293",
+    "cuit": "30343343074"
+  },
+  "creador": {
+    "id_usuario": 369,
+    "nombre": "Pym1",
+    "apellido": "Vin"
+  },
+  "vehiculo": {
+    "id_vehiculo": 204,
+    "patente": "V329301",
+    "marca": "Fiat",
+    "modelo": "Fiorino",
+    "anio": 2020,
+    "color": "Blanco",
+    "tipo_vehiculo": "Utilitario"
+  },
+  "historial_estados": [
+    {
+      "id_historial": 1379,
+      "id_viaje": 464,
+      "estado": "ASIGNADO",
+      "fecha": "2026-10-04T02:03:09.481Z",
+      "id_usuario": 369,
+      "origen": "CLIENTE"
+    },
+    {
+      "id_historial": 1380,
+      "id_viaje": 464,
+      "estado": "CONFIRMADO",
+      "fecha": "2026-10-04T02:03:10.670Z",
+      "id_usuario": 373,
+      "origen": "CONDUCTOR"
+    },
+    {
+      "id_historial": 1381,
+      "id_viaje": 464,
+      "estado": "CARGANDO",
+      "fecha": "2026-10-04T02:03:12.156Z",
+      "id_usuario": 373,
+      "origen": "CONDUCTOR"
+    },
+    {
+      "id_historial": 1382,
+      "id_viaje": 464,
+      "estado": "EN_RUTA",
+      "fecha": "2026-10-04T02:03:15.083Z",
+      "id_usuario": 373,
+      "origen": "CONDUCTOR"
+    },
+    {
+      "id_historial": 1383,
+      "id_viaje": 464,
+      "estado": "DESCARGANDO",
+      "fecha": "2026-10-04T02:03:17.476Z",
+      "id_usuario": 373,
+      "origen": "CONDUCTOR"
+    },
+    {
+      "id_historial": 1384,
+      "id_viaje": 464,
+      "estado": "FINALIZADO",
+      "fecha": "2026-10-04T02:03:18.519Z",
+      "id_usuario": 373,
+      "origen": "CONDUCTOR"
+    }
+  ],
+  "condiciones_requeridas": [],
+  "conductor": {
+    "id_conductor": 189,
+    "id_usuario": 373,
+    "nombre": "Cho1",
+    "apellido": "Vin",
+    "telefono": "+5491132930004"
+  },
+  "duracion_estimada": 30,
+  "duracion_real": 0,
+  "duracion_carga": 0,
+  "duracion_descarga": 0,
+  "duracion_aproximacion_origen": 0,
+  "vencido": false,
+  "remito_url": "https://pub-259e35cb295345b4b029cc3b28a349e8.r2.dev/remitos/464.pdf"
+}
+```
+`organizacion.nombre` es lo único que el chofer ve de cada PyME.
+
+### GET /api/choferes/viajes/:id
+
+Detalle de un viaje del chofer (misma forma, con `ruta_planeada`). `404` si no es suyo (incluido uno que
+le reasignaron a otro chofer).
+
+---
+
+### POST /api/choferes/viajes/:id/confirmar
+
+El chofer acepta el viaje y elige con qué vehículo lo hace. `ASIGNADO` → `CONFIRMADO`.
+
+**Autenticación:** Requerida — rol `CONDUCTOR`, el chofer asignado.
+
+**Body:** `{ "id_vehiculo": 25 }` — un vehículo **propio** (de `GET /api/conductores/mis-vehiculos`) que
+cumpla las condiciones del viaje.
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "mensaje": "Viaje confirmado",
+  "id_viaje": 458,
+  "estado": "CONFIRMADO",
+  "fecha_confirmacion": "2026-10-04T02:02:53.801Z",
+  "vehiculo": {
+    "id_vehiculo": 204,
+    "patente": "V329301",
+    "marca": "Fiat",
+    "modelo": "Fiorino",
+    "tipo_vehiculo": "Utilitario"
+  }
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{"error": "El vehiculo no es tuyo"}` | El vehículo no es suyo |
+| 400 | `{"error": "El vehiculo no cumple las condiciones del viaje: FRAGIL"}` | No cumple las condiciones |
+| 400 | `{ "error": "No se puede confirmar un viaje en estado CONFIRMADO" }` | Ya no está `ASIGNADO` (incluye `VENCIDO`) |
+| 404 | `{ "error": "Viaje no encontrado" }` | No es su viaje |
+| 409 | `{ "error": "El viaje cambio de estado mientras se procesaba tu pedido: volve a cargarlo" }` | Carrera (la PyME lo canceló, lo reasignó o lo editó en ese instante) |
+
+Emite `viaje:confirmado` a la PyME.
+
+---
+
+### POST /api/choferes/viajes/:id/rechazar
+
+El chofer rechaza el viaje. `ASIGNADO` → `RECHAZADO` (final). Sin body.
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "mensaje": "Viaje rechazado",
+  "id_viaje": 459,
+  "estado": "RECHAZADO",
+  "fecha_rechazo": "2026-10-04T02:02:56.038Z"
+}
+```
+`400` si ya no está `ASIGNADO`, `404` si no es suyo. Emite `viaje:rechazado` a la PyME.
+
+---
+
+### POST /api/choferes/viajes/:id/iniciar
+
+El chofer inicia el viaje **en el origen**. `CONFIRMADO` → **`CARGANDO`** (directo, no hay
+`EN_CAMINO_A_ORIGEN`). `fecha_inicio` y `fecha_llegada_origen` quedan en este instante; la
+`puntualidad_inicio` se calcula en el read contra `fecha_programada`.
+
+**Autenticación:** Requerida — rol `CONDUCTOR`, el chofer asignado.
+
+**Body:** `{ "lat": -34.6037, "lng": -58.3816 }` — la posición actual del celular (la misma fuente que
+`confirmar-parada`).
+
+Valida las dos cosas y, si fallan, el `400` dice cuál (o las dos):
+- estar dentro de la **ventana de inicio**;
+- estar a ≤ `RADIO_CONFIRMACION_METROS` (50 m) de la **primera parada** (el origen).
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "mensaje": "Viaje iniciado",
+  "id_viaje": 464,
+  "estado": "CARGANDO",
+  "fecha_inicio": "2026-10-04T02:03:11.939Z",
+  "fecha_llegada_origen": "2026-10-04T02:03:11.939Z"
+}
+```
+Recién después de este `200` el mobile tiene que arrancar el GPS (`conductor:ubicacion`). Los pings de
+un viaje `ASIGNADO` o `CONFIRMADO` se rechazan con `error { "error": "El viaje no fue iniciado" }`.
+Después se avanza con [`PATCH /api/viajes/:id/estado`](#patch-apiviajesidestado) y se cierra con
+[`POST /api/viajes/:id/confirmar-parada`](#post-apiviajesidconfirmar-parada), igual que antes.
+
+**Errores posibles** (reales):
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{"error": "No podes iniciar el viaje: el viaje solo puede iniciarse a partir de las 01:02"}` | Antes de la ventana |
+| 400 | `{"error": "No podes iniciar el viaje: estas a 1112m del origen y debes estar a menos de 50m"}` | Lejos del origen |
+| 400 | `{"error": "No podes iniciar el viaje: el viaje solo puede iniciarse a partir de las 01:02; estas a 1112m del origen y debes estar a menos de 50m"}` | Las dos cosas |
+| 400 | `{"error": "La ventana para iniciar el viaje cerro a las 22:53; el viaje vencio"}` | La ventana cerró (el viaje queda `VENCIDO`) |
+| 400 | `{ "error": "Tenes que confirmar el viaje (elegir el vehiculo) antes de iniciarlo" }` | Sigue `ASIGNADO` |
+| 404 | `{ "error": "Viaje no encontrado" }` | No es su viaje |
+| 409 | `{ "error": "El viaje cambio de estado mientras se procesaba tu pedido: volve a cargarlo" }` | Carrera (lo cancelaron o lo desvincularon en ese instante) |
+
+Emite `viaje:iniciado` y `viaje:estado_cambiado` a la PyME.
+
+---
+
+### POST /api/choferes/viajes/:id/cancelar
+
+El chofer cancela el viaje, **solo antes de iniciarlo** (`ASIGNADO` o `CONFIRMADO`). → `CANCELADO` con
+`causa_cancelacion: "CHOFER"`. Sin body.
+
+**Respuesta exitosa — 200:**
+```json
+{
+  "mensaje": "Viaje cancelado",
+  "id_viaje": 465,
+  "estado": "CANCELADO",
+  "causa_cancelacion": "CHOFER"
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{"error": "El viaje ya esta en curso: no lo podes cancelar. Pedile a la PyME que lo cancele"}` | Ya está en curso |
+| 400 | `{ "error": "No se puede cancelar un viaje en estado VENCIDO" }` | Ya es final |
+| 404 / 409 | | No es suyo / carrera |
+
+Emite `viaje:cancelado` a la PyME.
+
+---
+
+### Desvincular a un chofer cancela sus viajes
+
+[`DELETE /api/organizaciones/:id/choferes/:idConductor`](#delete-apiorganizacionesidchoferesidconductor)
+y [`DELETE /api/choferes/mis-organizaciones/:id`](#delete-apichoferesmis-organizacionesid) cancelan,
+en la misma operación, **todos** los viajes no finales de ese chofer con esa PyME, **incluso uno en
+curso** (`causa_cancelacion: "DESVINCULACION"`). Respuesta real:
+```json
+{
+  "mensaje": "Chofer desvinculado",
+  "id_conductor": 192,
+  "viajes_cancelados": [
+    474,
+    475,
+    476,
+    477
+  ]
+}
+```
+
+---
+
+### WebSocket — eventos del viaje interno
+
+**Salas.** Al conectarse, un `CLIENTE` entra a la sala `organizacion:{id}` de su PyME (y se suma o sale
+solo al crear la PyME, canjear un código, irse o ser eliminado). El chofer recibe todo por su sala
+personal. Todos los payloads traen `id_viaje` e `id_organizacion`.
+
+| Evento | Quién lo recibe | Cuándo |
+|---|---|---|
+| `viaje:asignado` | PyME + chofer | Al crear, y al chofer nuevo al reasignar |
+| `viaje:desasignado` | PyME + chofer anterior | Al reasignar |
+| `viaje:editado` | PyME + chofer | Al editar. `confirmacion_anulada: true` si estaba `CONFIRMADO` |
+| `viaje:confirmado` | PyME | El chofer confirma |
+| `viaje:rechazado` | PyME | El chofer rechaza |
+| `viaje:iniciado`, `viaje:estado_cambiado`, `viaje:finalizado` | PyME | Iniciar, avanzar, cierre |
+| `viaje:cancelado` | PyME + chofer | Cualquier cancelación. `causa`: `CHOFER` / `ORGANIZACION` / `ADMIN` / `DESVINCULACION` |
+| `viaje:vencido` | PyME + chofer | Pasó a `VENCIDO`. Trae `estado_anterior` |
+| `mapa:actualizar`, `costo:actualizar`, `eta:actualizar`, `alerta:desvio`, `alerta:parada`, `ruta:recalculada` | PyME | Tracking en vivo de sus viajes en curso |
+
+`viaje:asignado` y `viaje:vencido` tienen el mismo nombre que eventos del marketplace pero otro payload:
+en un viaje de PyME siempre traen `id_organizacion`.
+
+Payloads reales:
+
+`viaje:asignado`
+```json
+{
+  "id_viaje": 457,
+  "id_organizacion": 77,
+  "organizacion": {
+    "id_organizacion": 77,
+    "nombre": "PyME A 1791079343293"
+  },
+  "estado": "ASIGNADO",
+  "fecha_programada": "2026-10-04T02:04:48.340Z",
+  "precio_estimado": 1750,
+  "descripcion": null,
+  "paradas": [
+    {
+      "id_parada": 918,
+      "orden": 1,
+      "direccion": "Plaza de Mayo, CABA",
+      "latitud": -34.6037,
+      "longitud": -58.3816
+    },
+    {
+      "id_parada": 919,
+      "orden": 2,
+      "direccion": "Recoleta, CABA",
+      "latitud": -34.5895,
+      "longitud": -58.3974
+    }
+  ],
+  "condiciones_requeridas": [
+    "FRAGIL"
+  ]
+}
+```
+`viaje:confirmado`
+```json
+{
+  "id_viaje": 458,
+  "id_organizacion": 77,
+  "estado": "CONFIRMADO",
+  "vehiculo": {
+    "id_vehiculo": 204,
+    "patente": "V329301",
+    "marca": "Fiat",
+    "modelo": "Fiorino",
+    "tipo_vehiculo": "Utilitario"
+  }
+}
+```
+`viaje:rechazado`
+```json
+{
+  "id_viaje": 459,
+  "id_organizacion": 77,
+  "estado": "RECHAZADO"
+}
+```
+`viaje:desasignado`
+```json
+{
+  "id_viaje": 468,
+  "id_organizacion": 77,
+  "motivo": "reasignado"
+}
+```
+`viaje:editado`
+```json
+{
+  "id_viaje": 469,
+  "id_organizacion": 77,
+  "organizacion": {
+    "id_organizacion": 77,
+    "nombre": "PyME A 1791079343293"
+  },
+  "estado": "ASIGNADO",
+  "fecha_programada": "2026-10-04T02:33:50.189Z",
+  "precio_estimado": 3500,
+  "descripcion": "editado",
+  "paradas": [
+    {
+      "id_parada": 944,
+      "orden": 1,
+      "direccion": "Plaza de Mayo, CABA",
+      "latitud": -34.6037,
+      "longitud": -58.3816
+    },
+    {
+      "id_parada": 945,
+      "orden": 2,
+      "direccion": "Tribunales, CABA",
+      "latitud": -34.5975,
+      "longitud": -58.3923
+    },
+    {
+      "id_parada": 946,
+      "orden": 3,
+      "direccion": "Recoleta, CABA",
+      "latitud": -34.5895,
+      "longitud": -58.3974
+    }
+  ],
+  "condiciones_requeridas": [
+    "FRAGIL",
+    "REFRIGERADO"
+  ],
+  "confirmacion_anulada": true
+}
+```
+`viaje:cancelado`
+```json
+{
+  "id_viaje": 466,
+  "id_organizacion": 77,
+  "estado": "CANCELADO",
+  "estado_anterior": "CARGANDO",
+  "causa": "ORGANIZACION",
+  "motivo": "cliente cancelo el pedido"
+}
+```
+`viaje:vencido`
+```json
+{
+  "id_viaje": 470,
+  "id_organizacion": 77,
+  "estado": "VENCIDO",
+  "estado_anterior": "ASIGNADO",
+  "fecha_programada": "2026-10-04T00:23:56.985Z"
+}
+```
+`viaje:finalizado`
+```json
+{
+  "id_viaje": 464,
+  "precio_real": 0,
+  "desglose": {
+    "precio_por_tiempo": 0,
+    "precio_por_distancia": null,
+    "tiempo_horas": 0,
+    "distancia_km": 0,
+    "tiempo_capital": 0,
+    "distancia_provincia": null,
+    "tarifa_hora": 3500,
+    "tarifa_km": null
+  },
+  "remito_url": "https://pub-259e35cb295345b4b029cc3b28a349e8.r2.dev/remitos/464.pdf",
+  "duracion_real": 0,
+  "duracion_carga": 0,
+  "duracion_descarga": 0,
+  "duracion_aproximacion_origen": 0,
+  "puntualidad_inicio": "A_TIEMPO"
+}
+```
+`mapa:actualizar` (en la sala de la PyME)
+```json
+{
+  "id_viaje": 464,
+  "lat": -34.6037,
+  "lng": -58.3816,
+  "timestamp": 1791079393328,
+  "velocidad_kmh": 0
+}
+```
+
+---
+
+### Flags — lo que queda dormido
+
+| Variable | Default | Con `false` |
+|---|---|---|
+| `MARKETPLACE_HABILITADO` | `false` | `404 { "error": "No encontrado" }` en `POST /api/viajes`, `GET /api/viajes/disponibles`, `POST /api/viajes/:id/reservar`, `/asignar`, `/reasignar`, `/cancelar-reserva`, todo `/api/empresas`, todo `/api/afiliaciones` y `POST /api/auth/registro-gerente`. El socket `viaje:aceptar` responde `error { "mensaje": "Funcion no disponible" }` y no se emite `viaje:disponible`. |
+| `CALIFICACIONES_HABILITADAS` | `false` | `404` en `POST /api/viajes/:id/calificacion` |
+
+El `404` sale **antes** de mirar el token (con o sin `Authorization`). Respuesta real:
+```json
+{
+  "error": "No encontrado"
+}
+```
+Con los dos en `true`, todo lo del marketplace funciona como antes. Siguen activos sin flag, porque
+sirven a viajes viejos todavía vivos: `estimar-costo`, `mis-viajes`, `mis-viajes-conductor`,
+`asignados`, `cancelar-cliente`, `cancelar-conductor`, el iniciar viejo, `costo-acumulado`, `remito` y
+`GET /api/viajes/:id`.
+
+### Admin
+
+`GET /api/admin/viajes` y `GET /api/admin/viajes/:id` traen `organizacion`
+`{ id_organizacion, nombre, cuit, estado }` (`null` en los viajes del marketplace) y el detalle suma
+`creador`. El filtro `estado` y `estadisticas.viajes.por_estado` incluyen `ASIGNADO`, `CONFIRMADO`,
+`RECHAZADO` y `VENCIDO`. Cancelar un viaje de PyME desde el admin deja `causa_cancelacion: "ADMIN"` y
+emite `viaje:cancelado` a la PyME y al chofer. Real (recortado):
+```json
+{
+  "id_viaje": 482,
+  "organizacion": {
+    "id_organizacion": 77,
+    "nombre": "PyME A 1791079343293",
+    "cuit": "30343343074",
+    "estado": "TRIAL"
+  },
+  "creador": {
+    "id_usuario": 369,
+    "nombre": "Pym1",
+    "apellido": "Vin",
+    "email": "pym1-vin-1791079343293-1@test.com"
+  },
+  "causa_cancelacion": null
+}
+```
 
 ---
 

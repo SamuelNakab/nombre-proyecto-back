@@ -1,9 +1,11 @@
 # Fleter — Backend
 
 ## Descripcion del proyecto
-Plataforma de fletes para PyMEs argentinas. El cliente crea un viaje, el
-sistema lo publica a conductores elegibles via WebSocket. Fee porcentual.
-MVP: CABA + GBA.
+Sistema administrativo de fletes para PyMEs argentinas (antes: marketplace).
+Una PyME registra y sigue sus viajes con choferes de confianza: asigna el viaje
+a un chofer vinculado, el chofer confirma o rechaza y lo ejecuta, y la PyME lo
+sigue en vivo. El marketplace viejo (el sistema publica el viaje a conductores
+elegibles) queda DORMIDO detras de MARKETPLACE_HABILITADO. MVP: CABA + GBA.
 
 ## Estado actual
 - Fases 0-5 COMPLETAS (registro, viajes, matching atomico, GPS/tracking,
@@ -27,6 +29,12 @@ MVP: CABA + GBA.
   marketplace, gerente, empresas, afiliaciones y calificaciones NO cambio (se
   reemplaza en el Paso 2). Ver "Identidad — PyMEs, miembros, invitaciones y
   choferes".
+- PASO 2 — Viaje interno (la PyME asigna a un chofer vinculado, el chofer
+  confirma / rechaza / inicia en el origen; vencimiento, cancelacion,
+  reasignacion, edicion; la desvinculacion cancela los viajes vivos; sala de
+  socket por PyME) COMPLETO. Marketplace, gerente, empresas, afiliaciones y
+  calificaciones DORMIDOS detras de flags (no se borro nada). Ver "Viaje
+  interno (Paso 2)".
 
 ## Stack
 - Node.js 22, ES Modules (NUNCA require()). Async/await siempre.
@@ -55,6 +63,18 @@ MVP: CABA + GBA.
   prisma/schema.prisma --to-schema-datamodel prisma/schema.prisma --script`
   antes del db push (ojo: --from-url "$DATABASE_URL" no anda si la variable no
   esta exportada en el shell; --from-schema-datasource la lee del .env).
+- Paso 2 (viaje interno): EstadoViaje suma ASIGNADO, CONFIRMADO, RECHAZADO y
+  VENCIDO (ALTER TYPE ... ADD VALUE, los valores viejos quedan); enum nuevo
+  CausaCancelacion; 6 columnas NULLABLE en viajes (id_organizacion, id_creador,
+  metodo_cobro, fecha_confirmacion, fecha_rechazo, causa_cancelacion), 1 indice
+  (id_organizacion, estado) y 2 FKs (ON DELETE SET NULL). Revisado con el mismo
+  migrate diff: sin DROP ni ALTER destructivo. id_cliente sigue NOT NULL (ver
+  "Viaje interno").
+- OJO con agregar valores a un enum mientras la DB esta compartida: el Prisma
+  de un deploy VIEJO no conoce los valores nuevos y TIRA al leer una fila que
+  los tenga (p. ej. el panel admin de produccion antes de que main tenga el
+  codigo). Achicar la ventana entre el merge a develop y el merge a main, y no
+  dejar viajes con estados nuevos vivos en staging en el medio.
 
 ## Identidad — PyMEs, miembros, invitaciones y choferes (Paso 1)
 
@@ -181,33 +201,264 @@ interactiva (OPCIONES_TX: maxWait 10s, timeout 20s):
   (conductor_vehiculos: es de otra organizacion).
 - El chofer ve el nombre de sus PyMEs (GET /api/choferes/mis-organizaciones y
   `organizaciones` en /me).
-- desvincularChofer({ id_organizacion, id_conductor, actor }) es la UNICA
+- desvincularChofer({ id_organizacion, id_conductor, actor, io }) es la UNICA
   funcion que corta un vinculo; la usan los dos endpoints (desde la PyME, origen
   ORGANIZACION; desde el chofer, origen CHOFER). updateMany condicionado a
-  activo -> 0 filas = 404.
+  activo -> 0 filas = 404. Desde el Paso 2, en la MISMA transaccion cancela
+  todos los viajes no finales de ese chofer con esa PyME (ver "Viaje interno —
+  Desvinculacion"). Devuelve los ids cancelados (`viajes_cancelados`).
 
-### PENDIENTE para el Paso 2
-- ENGANCHE en desvincularChofer: cancelar TODOS los viajes de ese chofer con
-  esa PyME, INCLUSO uno en curso. Hoy solo cambia el vinculo. Es una sola
-  funcion justamente para que ese agregado no se olvide en uno de los dos
-  caminos.
-- Conectar viajes a Organizacion (hoy Viaje cuelga de Cliente) y reemplazar el
-  marketplace / gerente / empresas / afiliaciones por el modelo PyME + choferes
-  de confianza. Permisos de viajes por membresia.
-- Usar metodo_cobro / parametros_cobro del vinculo en el calculo del precio.
+### Pendientes que siguen abiertos
+- Usar metodo_cobro / parametros_cobro del vinculo en el calculo del precio
+  (hoy el viaje solo COPIA metodo_cobro del vinculo; el precio es el calculo de
+  siempre).
 - Cuando se agregue un endpoint de borrar cuenta: bloquearlo para el ultimo
   responsable (ver "Cuentas").
 - Transiciones de Organizacion.estado (TRIAL / ACTIVA / SUSPENDIDA): Paso 5.
+  Hoy SUSPENDIDA ya bloquea crear / editar / reasignar viajes (403).
 - Los campos legacy Cliente.cuit / nombre_empresa / direccion_principal se
   pueden dejar de pedir en el front; se limpian cuando se separen las DBs.
 
+## Viaje interno (Paso 2)
+
+La PyME asigna el viaje DIRECTO a un chofer vinculado, el chofer confirma
+(eligiendo vehiculo) o rechaza, lo inicia EN el origen y lo ejecuta. Reemplaza
+el ciclo del marketplace (que queda dormido, ver "Flags"). Un viaje es interno
+si `id_organizacion != null` (cicloDe en estado-viaje.service).
+
+Archivos: src/services/viaje-interno.service.js (acciones y transacciones),
+src/controllers/viajes-internos.controller.js (Zod + HTTP),
+src/services/ventana-inicio.js (ventana pura), src/services/viaje-validacion.js
+(schemas compartidos con la ruta legacy: paradas, condiciones, fecha con
+ANTICIPACION_MINIMA_MINUTOS), src/sockets/salas.js, src/middlewares/flags.middleware.js.
+
+### Modelo
+- Viaje: id_organizacion, id_creador (el miembro que lo creo), metodo_cobro
+  (COPIA del vinculo al crear y al reasignar), fecha_confirmacion,
+  fecha_rechazo, causa_cancelacion (CHOFER | ORGANIZACION | ADMIN |
+  DESVINCULACION). motivo_cancelacion sigue siendo el texto libre. Quien y cuando
+  cancelo estan en el historial: no hay columnas para eso.
+- id_cliente sigue NOT NULL (hacerlo nullable seria un ALTER, se evito): en un
+  viaje interno apunta al Cliente del CREADOR, solo porque el schema lo exige.
+  NINGUN permiso nuevo lo usa, y los viejos lo ignoran en viajes internos
+  (puedeVerViaje solo aplica "cliente dueño" si id_organizacion es null).
+- Se reusan id_conductor, id_vehiculo (null hasta confirmar), condiciones_req,
+  paradas, tarifas, precios, duracion_estimada_horas, fecha_inicio,
+  fecha_llegada_origen e iniciado_por.
+- "Vehiculo propio activo" = Vehiculo.id_conductor = el chofer. No hay columna
+  `activo`: el borrado es fisico y esta bloqueado con viajes no finales. La flota
+  de empresas (conductor_vehiculos) NO cuenta.
+
+### Ciclo — TRANSICIONES_INTERNO (estado -> destino -> quien)
+| Desde       | Hacia       | Quien                        | Accion |
+|-------------|-------------|------------------------------|--------|
+| (crear)     | ASIGNADO    | PYME                         | POST /api/organizaciones/:id/viajes |
+| ASIGNADO    | CONFIRMADO  | CHOFER                       | confirmar (elige vehiculo) |
+| ASIGNADO    | RECHAZADO   | CHOFER                       | rechazar (final) |
+| ASIGNADO    | ASIGNADO    | PYME                         | reasignar / editar — SIN fila de historial |
+| CONFIRMADO  | CARGANDO    | CHOFER                       | iniciar (UNICO camino; el PATCH /estado no lo permite) |
+| CONFIRMADO  | ASIGNADO    | PYME                         | reasignar / editar (hay que reconfirmar) |
+| ASIGNADO / CONFIRMADO | CANCELADO | CHOFER, PYME, ADMIN, SISTEMA | cancelar / desvinculacion |
+| ASIGNADO / CONFIRMADO | VENCIDO   | SISTEMA                | timer / barrido / chequeo perezoso |
+| CARGANDO    | EN_RUTA     | CHOFER                       | PATCH /api/viajes/:id/estado |
+| EN_RUTA     | DESCARGANDO | CHOFER                       | PATCH /estado |
+| EN_RUTA / DESCARGANDO | FINALIZADO | CHOFER              | confirmar la ULTIMA parada |
+| CARGANDO / EN_RUTA / DESCARGANDO | CANCELADO | PYME, ADMIN, SISTEMA | el chofer NO puede cancelar en curso |
+Finales: RECHAZADO, VENCIDO, CANCELADO, FINALIZADO. No existe
+EN_CAMINO_A_ORIGEN. EN_RUTA -> FINALIZADO esta porque es lo que ya hacia
+confirmar-parada (la tabla dice la verdad, no cambia el comportamiento).
+Validada fila por fila en estado-viaje.service.test.js.
+
+### Patron de escritura — TODA accion del ciclo
+1. Lectura previa -> 400 descriptivos del caso secuencial.
+2. $transaction (OPCIONES_TX): updateMany CONDICIONADO (estado esperado, y el
+   chofer y la fecha cuando importan) PRIMERO; count === 0 -> 409. Ese update
+   toma el lock de la fila: lo que otra tx pudo cambiar (condiciones del viaje,
+   vinculo) se re-valida DESPUES en la misma tx, y si falla, rollback.
+3. Fuera de la tx: historial, timers, Redis, eventos.
+- El vinculo se bloquea (SELECT ... FOR UPDATE ... activo) en crear y reasignar;
+  desvincular toma el mismo lock con su updateMany. Orden de locks siempre
+  vinculo -> viaje: no hay deadlock.
+- Un estado invalido en el caso secuencial da 400; la carrera real da 409.
+
+GUARDS VERIFICADOS REVIRTIENDOLOS (protocolo de reversion, test-viaje-interno.js
+CASO 17 con SUBCASOS=...): ver la tabla de resultados en el reporte del Paso 2.
+| Guard | Caso que se pone en rojo sin el |
+|-------|---------------------------------|
+| confirmar: `estado: 'ASIGNADO'` en el WHERE | 17c (doble confirmar: 200,200 y 2 filas CONFIRMADO) |
+| confirmar: `id_conductor` en el WHERE | 17d (reasignar vs confirmar: CONFIRMADO con el chofer nuevo y el vehiculo del viejo) |
+| confirmar: `fecha_programada >= limite` + su chequeo perezoso | 17b (se confirma un viaje vencido) |
+| vencer: `estado in [ASIGNADO, CONFIRMADO]` en el WHERE | 17b (dos filas VENCIDO) |
+| iniciar: `estado: 'CONFIRMADO'` en el WHERE | 17e / 17f (un viaje cancelado vuelve a CARGANDO) |
+| crear: lock + re-chequeo del vinculo en la tx | 17g (viaje vivo con un chofer desvinculado) |
+
+### Crear — POST /api/organizaciones/:id/viajes (cualquier miembro)
+Orden: PyME SUSPENDIDA -> 403; Zod (id_conductor, paradas, fecha con
+ANTICIPACION_MINIMA_MINUTOS, condiciones); vinculo ACTIVO -> si no 400; vehiculo
+propio que cumpla las condiciones -> si no 400 con la lista; precio con
+estimarCosto SIN cambios (fuera de la tx). Queda ASIGNADO sin vehiculo, ruta
+planeada best-effort, timer de vencimiento, viaje:asignado al chofer y a la PyME.
+
+### Chofer — /api/choferes/viajes
+- GET (grupo asignados | confirmados | en_curso | historial, o estado=): sus
+  viajes internos de TODAS sus PyMEs, cada uno con organizacion.nombre.
+- confirmar { id_vehiculo }: propio y que cumpla -> CONFIRMADO.
+- rechazar -> RECHAZADO. Las dos solo desde ASIGNADO.
+- iniciar { lat, lng }: CONFIRMADO, dentro de la ventana Y a <=
+  RADIO_CONFIRMACION_METROS de la parada de orden 1, con la MISMA distanciaMetros
+  y la misma fuente de ubicacion (body) que confirmar-parada. El 400 dice cual
+  falla, o las dos. Pasa DIRECTO a CARGANDO con fecha_inicio =
+  fecha_llegada_origen = ahora (duracion_aproximacion_origen sale 0: ese tramo
+  no existe). La puntualidad se sigue calculando en el read.
+- cancelar: solo ASIGNADO o CONFIRMADO; en curso -> 400 "pedile a la PyME".
+- Avanzar y cerrar NO tienen rutas nuevas: PATCH /api/viajes/:id/estado (solo
+  EN_RUTA / DESCARGANDO para un viaje interno), POST /api/viajes/:id/confirmar-parada
+  y el socket conductor:ubicacion.
+
+### PyME — /api/organizaciones/:id/viajes (requireMiembro)
+- GET lista (grupo activos | en_curso | historial, o estado=) y GET detalle.
+  Scoping SIEMPRE por id_organizacion, nunca por usuario. Viaje de otra PyME ->
+  404 (no se filtran ids).
+- PUT editar (paradas / fecha / condiciones / descripcion, al menos uno): solo
+  ASIGNADO o CONFIRMADO. Recalcula precio, zona y duracion si cambian paradas o
+  fecha, y la ruta si cambian paradas. CONFIRMADO -> ASIGNADO con vehiculo null.
+  El chofer actual tiene que seguir cumpliendo las condiciones (si no, 400:
+  reasignar). Reprograma el timer.
+- POST reasignar { id_conductor }: solo ASIGNADO o CONFIRMADO, mismas
+  validaciones que crear, mismo chofer -> 400. Vuelve a ASIGNADO con vehiculo
+  null y metodo_cobro del vinculo nuevo.
+- POST cancelar { motivo? }: cualquier estado no final, incluido en curso.
+  limpiarViajeActivo (ETA + GPS + Redis).
+- GET costo-acumulado (mismo calculo, extraido a calcularCostoAcumulado en
+  costo.service) y GET remito.
+- SUSPENDIDA bloquea crear, editar y reasignar (403). Cancelar sigue permitido.
+- Las rutas viejas por usuario (mis-viajes, mis-viajes-conductor, asignados,
+  unirseARoomsCliente) filtran id_organizacion null. GET /api/viajes/:id de un
+  viaje interno: solo el chofer asignado (el miembro va por la ruta de la PyME).
+  Los viajes internos no se califican.
+
+### Vencimiento — SIN pollers
+Un viaje ASIGNADO o CONFIRMADO cuyo fin de ventana (fecha_programada +
+VENTANA_INICIO_DESPUES_MINUTOS) ya paso pasa a VENCIDO (final). Tres
+mecanismos, todos terminan en vencerViajeInterno (vencimiento.service), cuyo
+updateMany condicionado (estado pre-inicio Y fecha vencida en el WHERE) hace
+inofensivo dispararse de mas o dos a la vez:
+1. Timer por viaje (programarVencimientoInterno), al crear, editar y reasignar.
+   Comparte el Map de los avisos legacy: cancelarAvisoVencimiento corta los
+   dos. Al disparar RELEE la fila y se re-arma si todavia no toca. Se cancela
+   al rechazar, cancelar, iniciar, desvincular, cancelar del admin y cerrar.
+2. Barrido de arranque (barridoInicialVencimientosInternos), UNA query. Vence
+   los atrasados (secuencial) y arma el resto. Kill-switch
+   VENCIMIENTO_BARRIDO_ARRANQUE=0 (solo tests): ESCRIBE en la DB compartida.
+3. Chequeo PEREZOSO (vencerSiCorresponde) antes de toda accion y de toda
+   lectura de la PyME o del chofer, scopeado a lo suyo. El panel admin NO lo
+   usa (no escribe sobre viajes ajenos con la env de otro proceso).
+Misma limitacion de un solo proceso que los demas timers.
+
+### El flag `vencido` — UNIFICADO
+esViajeVencido sirve a los dos ciclos (los estados no se pisan): VENCIDO -> true;
+ASIGNADO / CONFIRMADO -> true si el fin de ventana paso (cubre el hueco hasta el
+chequeo perezoso, p. ej. en el admin); legacy -> la regla de siempre, sin
+cambios (el viaje legacy sigue sin cambiar de estado). Un solo campo para el front.
+
+### Desvinculacion
+desvincularChofer, en UNA transaccion: corta el vinculo (lock) -> SELECT ...
+FOR UPDATE de los viajes no finales de ese chofer con ESA PyME -> CANCELADO con
+causa DESVINCULACION, incluso uno en curso. Fuera de la tx: historial (origen
+del actor), timers, limpiarViajeActivo y viaje:cancelado a la PyME y al chofer.
+Los viajes del chofer con OTRAS PyMEs no se tocan.
+
+### Salas de socket
+organizacion:{id} = miembros ACTIVOS. Al conectarse, un CLIENTE entra a las de
+sus membresias; se sincroniza (sincronizarSalaOrganizacion) al crear la PyME,
+canjear un codigo MIEMBRO, salir y ser eliminado. El chofer recibe lo suyo por
+usuario:{id}. Ver "Eventos WebSocket".
+
+### Carrera con un ping GPS en vuelo (arreglada en este paso)
+Cancelar (o cerrar) un viaje mientras un ping todavia se procesaba dejaba keys
+huerfanas en Redis (gps:{id}:acumulado, y gps:{id}:eta del calculo de ETA que
+el ping dispara), y podia re-arrancar el emisor de ETA de un viaje cancelado.
+Pasaba tambien en el legacy. Arreglo, sin queries extra por ping:
+- limpiarViajeActivo y el cierre anotan CUANDO limpiaron (en memoria, 60 s),
+  ANTES de limpiar. El handler de conductor:ubicacion anota cuando EMPEZO y,
+  despues de escribir y al final, re-limpia solo si hubo una limpieza
+  POSTERIOR a su inicio (relimpiarSiCerrado(id, inicioPing)).
+- OJO: comparar contra el inicio del ping NO es decorativo. Una limpieza no
+  siempre cierra el viaje: cancelar-conductor y liberarReserva lo devuelven al
+  mercado y sigue vivo. La primera version usaba un simple "fue cerrado hace
+  menos de 60 s" y rompia test-cancelacion-conductor PUNTO 4: el conductor que
+  reaceptaba el viaje veia su primer ping re-limpiado (acumulado ausente).
+- emitirEta, si al terminar de calcular el emisor ya fue detenido, borra la key
+  de ETA y no emite.
+Cubierto por CASO 8e de test-viaje-interno.js.
+
+### Remito
+bloqueSolicitante(viaje) (pura): en un viaje interno el encabezado es "PYME"
+con nombre, CUIT (XX-XXXXXXXX-X) y razon social; el creador no aparece. Legacy
+sin cambios.
+
+### Admin
+Lista y detalle con `organizacion` (y `creador` en el detalle); filtro y
+estadisticas con los 4 estados nuevos. El cancelar del admin es ahora un
+updateMany condicionado (409 si pierde una carrera); en un viaje interno setea
+causa ADMIN y emite viaje:cancelado a la PyME y al chofer.
+
+### Flags
+- MARKETPLACE_HABILITADO (default false). Con false dan 404 `{ "error": "No
+  encontrado" }` (el middleware va ANTES de verificarToken: 404 con o sin
+  token): POST /api/viajes (crear viejo), GET /api/viajes/disponibles,
+  POST /api/viajes/:id/{reservar,asignar,reasignar,cancelar-reserva}, todo
+  /api/empresas, todo /api/afiliaciones y POST /api/auth/registro-gerente. El
+  socket viaje:aceptar responde error "Funcion no disponible", publicarViaje no
+  emite viaje:disponible, el conductor no se une al pool al conectarse y no
+  corre barridoInicialReservas.
+- CALIFICACIONES_HABILITADAS (default false): POST /api/viajes/:id/calificacion
+  -> 404. Flag PROPIO: las calificaciones pueden volver sin el marketplace (una
+  PyME calificando a sus choferes encaja en el modelo nuevo).
+- Siguen SIN flag (sirven a viajes legacy vivos o son compartidas):
+  estimar-costo, mis-viajes*, asignados, cancelar-cliente, cancelar-conductor,
+  el iniciar legacy, PATCH /estado, confirmar-parada, costo-acumulado, remito y
+  GET /:id.
+- Con los dos en true todo lo viejo funciona igual que antes (regresion).
+- GET /health devuelve `capacidades: ['viaje-interno']` (ver "CI").
+
+### Decisiones de interpretacion (Paso 2)
+D1 id_cliente NOT NULL = el creador (ancla). D2 vehiculo activo = propio y
+existente. D3 dos tablas, un validarTransicion. D4 historial reusa ORIGENES
+(chofer CONDUCTOR, PyME CLIENTE). D5 iniciar dice que falla; pasada la ventana
+el viaje ya vencio; secuencial 400, carrera 409. D6 EN_RUTA -> FINALIZADO en la
+tabla. D7 aproximacion al origen = 0. D8 SUSPENDIDA bloquea crear / editar /
+reasignar. D9 flag propio de calificaciones. D10 el admin no hace chequeo
+perezoso. D11 iniciar legacy con fallback a VENTANA_INICIO_MINUTOS, sin limite
+superior. D12 causa_cancelacion enum; quien / cuando en el historial.
+
+### PENDIENTE para el Paso 3
+- Routes API (en vez de Directions / Distance Matrix), algoritmo de duracion y
+  503 en vez del mock de costo.service cuando Google falla.
+- Usar metodo_cobro / parametros_cobro del vinculo en el precio.
+- Validar que un chofer no tenga dos viajes en curso a la vez (fuera de alcance).
+- Migrar matching / cancelacion legacy a validarTransicion + updateMany
+  condicionado (cancelar-cliente y cancelar-conductor legacy siguen siendo
+  update plano).
+- Mover los timers (reservas, avisos, vencimientos) a una cola persistente el
+  dia que haya mas de una instancia.
+
 ## Maquina de estados — src/services/estado-viaje.service.js
+Hay DOS ciclos con su tabla cada uno: TRANSICIONES (este, el LEGACY del
+marketplace) y TRANSICIONES_INTERNO (el del viaje de PyME, que ademas dice
+QUIEN puede; ver "Viaje interno"). validarTransicion(actual, destino, contexto?)
+elige por el tercer parametro: sin contexto es la legacy, asi que los callers
+viejos no cambiaron; con { ciclo: 'INTERNO', quien } es la interna.
+ESTADOS_TERMINALES incluye los finales de los dos ciclos.
+
 TRANSICIONES como estructura de datos + validarTransicion(actual, destino),
 que tira error si la transicion no esta permitida. La usan:
 - El PATCH /api/viajes/:id/estado (antes permitia retrocesos invalidos).
 - Todos los endpoints de la estructura jerarquica que cambian estado.
 PENDIENTE: matching.service, cierre.service y cancelacion.service todavia
 setean un estado fijo directo, sin validarTransicion. Se migran despues.
+(Desde el Paso 2, cierre.service al menos escribe con un updateMany
+condicionado a EN_RUTA / DESCARGANDO: ya no puede pisar una cancelacion.)
 OJO: esos caminos SI registran historial de estados — justamente por eso el
 historial NO se centralizo dentro de validarTransicion, que no los ve. Ver
 "Historial de estados".
@@ -590,6 +841,26 @@ CONDUCTOR_ASIGNADO, asi que NO genera fila.
 | 12 | ejecutarDesafiliacion   | afiliacion.service.js     | CONDUCTOR_ASIGNADO -> RESERVADO_POR_EMPRESA   | GERENTE o CONDUCTOR |
 | —  | reasignarViaje          | reserva.controller.js     | SIN cambio de estado -> SIN fila              | —                 |
 
+Sitios del ciclo INTERNO (Paso 2). Todos en viaje-interno.service.js salvo los
+marcados. El origen reusa ORIGENES: el chofer es CONDUCTOR, el miembro de la
+PyME es CLIENTE.
+
+| #  | Funcion                    | Archivo                   | Transicion                                    | origen            |
+|----|----------------------------|---------------------------|-----------------------------------------------|-------------------|
+| 13 | crearViajeInterno          | viaje-interno.service.js  | — -> ASIGNADO                                 | CLIENTE           |
+| 14 | confirmarViaje             | viaje-interno.service.js  | ASIGNADO -> CONFIRMADO                        | CONDUCTOR         |
+| 15 | rechazarViaje              | viaje-interno.service.js  | ASIGNADO -> RECHAZADO                         | CONDUCTOR         |
+| 16 | iniciarViajeInterno        | viaje-interno.service.js  | CONFIRMADO -> CARGANDO                        | CONDUCTOR         |
+| 17 | cancelar (chofer / PyME)   | viaje-interno.service.js  | -> CANCELADO                                  | CONDUCTOR/CLIENTE |
+| 18 | reasignarViaje / editarViaje | viaje-interno.service.js | CONFIRMADO -> ASIGNADO (ASIGNADO -> ASIGNADO: SIN fila) | CLIENTE  |
+| 19 | vencerViajeInterno         | vencimiento.service.js    | ASIGNADO / CONFIRMADO -> VENCIDO              | SISTEMA           |
+| 20 | desvincularChofer          | vinculo-chofer.service.js | no final -> CANCELADO (uno por viaje)         | CLIENTE o CONDUCTOR |
+| —  | cambiarEstado (3), cerrarViaje (11), cancelarViaje admin (7) | | los mismos sitios de arriba, ahora tambien para viajes internos | |
+
+reasignar y editar leen el estado REAL con un SELECT ... FOR UPDATE dentro de su
+tx, para saber si la transicion fue CONFIRMADO -> ASIGNADO (fila) o ASIGNADO ->
+ASIGNADO (sin fila) aunque un confirmar concurrente se haya metido en el medio.
+
 Tres de ellos no conocen al actor y lo reciben por parametro:
 - liberarReserva(io, id_viaje, estadoActual, actor): gerente en cancelar-reserva,
   SISTEMA en el timer y en el barrido de arranque.
@@ -930,6 +1201,26 @@ viaje no cambia de estado. Payload { id_viaje, estado, fecha_programada }. Es
 BEST-EFFORT: la fuente de verdad es el flag `vencido` del read. Los
 destinatarios dependen del estado — ver "Viajes vencidos".
 
+### Eventos del ciclo INTERNO (Paso 2)
+Salas: `organizacion:{id}` (miembros activos de la PyME), `usuario:{id}` del
+chofer (por id_usuario, NO id_conductor) y `viaje:{id}`. Mismos NOMBRES que
+algunos eventos legacy, con payload propio (todos llevan id_viaje e
+id_organizacion):
+| Evento               | Destinatario                         | Cuando |
+|----------------------|--------------------------------------|--------|
+| viaje:asignado       | PyME + chofer nuevo                  | crear, reasignar |
+| viaje:desasignado    | PyME + chofer viejo                  | reasignar |
+| viaje:editado        | PyME + chofer                        | editar (`confirmacion_anulada` si estaba CONFIRMADO) |
+| viaje:confirmado     | PyME                                 | el chofer confirma |
+| viaje:rechazado      | PyME                                 | el chofer rechaza |
+| viaje:iniciado / viaje:estado_cambiado / viaje:finalizado | PyME + viaje:{id} | iniciar, avanzar, cierre |
+| viaje:cancelado      | PyME + chofer                        | cualquier cancelacion: `causa` CHOFER / ORGANIZACION / ADMIN / DESVINCULACION |
+| viaje:vencido        | PyME + chofer                        | VENCIDO (estado real; `estado_anterior`) |
+| mapa:actualizar, costo:actualizar, eta:actualizar, alerta:desvio, alerta:parada, ruta:recalculada | viaje:{id} + PyME | tracking; mapa y costo sumaron `id_viaje` al payload |
+
+El tracking llega a la sala de la PyME porque los emisores reciben las salas de
+salasDeViaje(viaje) (sockets/salas.js) en vez de armar `viaje:${id}` a mano.
+
 ## Variables de entorno
 RESERVA_TIMEOUT_MINUTOS=10        (default en codigo si no esta en .env;
                                    acepta FRACCIONARIOS: se lee con parseFloat
@@ -948,12 +1239,34 @@ RADIO_CONFIRMACION_METROS=50      (default en codigo si no esta en .env;
                                    DOS lugares y en ninguno mas: confirmar-parada
                                    y la deteccion de llegada al origen)
 
-VENTANA_INICIO_MINUTOS            (default 30 EN CODIGO, pero .env y
-                                   .env.example locales estan en 120. OJO: los
-                                   tests no pueden asumir el default —
-                                   test-iniciar-viaje lo LEE del entorno, porque
-                                   con un valor fijo su CASO 2 ("demasiado
-                                   temprano") daba 200 sin que hubiera bug)
+VENTANA_INICIO_MINUTOS            (REEMPLAZADA por VENTANA_INICIO_ANTES_MINUTOS.
+                                   Solo la lee el iniciar LEGACY, como fallback
+                                   si ANTES no esta definida o esta vacia
+                                   (ventanaInicioAntesMinutosLegacy). El ciclo
+                                   interno NO la usa. test-iniciar-viaje la LEE
+                                   del entorno: si ANTES esta seteada con otro
+                                   valor, su CASO 2 mide contra la equivocada)
+
+VENTANA_INICIO_ANTES_MINUTOS=60   (ventana para INICIAR un viaje de PyME:
+VENTANA_INICIO_DESPUES_MINUTOS=90  [fecha - ANTES, fecha + DESPUES]; viaje a
+                                   las 10 -> 9:00 a 11:30. El fin de la ventana
+                                   es tambien cuando un ASIGNADO / CONFIRMADO
+                                   VENCE. parseFloat (los tests usan 0.05 = 3 s);
+                                   basura / negativo / vacio -> default. Se leen
+                                   en cada uso. MISMO valor en staging y
+                                   produccion mientras la DB este compartida:
+                                   los dos procesos vencen viajes de la misma DB)
+VENCIMIENTO_BARRIDO_ARRANQUE=1    (SOLO tests: =0 apaga el barrido de arranque
+                                   de los viajes de PyME, que ESCRIBE (vence) y
+                                   arma timers con la ventana del proceso. Un
+                                   server efimero con ventana de segundos
+                                   venceria viajes reales. En produccion NO se
+                                   setea)
+MARKETPLACE_HABILITADO=false      (solo 'true' o '1' prenden; ver "Viaje
+CALIFICACIONES_HABILITADAS=false   interno — Flags". Se leen en cada request)
+TEST_USER_EMAIL / TEST_USER_PASSWORD (cuenta del e2e; mismos valores que los
+                                   secrets de GitHub. Las usa el e2e y
+                                   seed-cuentas-test.js)
 
 PUNTUALIDAD_TARDE_MINUTOS=30      (mismos umbrales de siempre, pero ahora se
 PUNTUALIDAD_MUY_TARDE_MINUTOS=120  aplican al retraso de la LLEGADA al origen,
@@ -1005,6 +1318,32 @@ MATCHING_TIMEOUT eliminado POR COMPLETO — no queda ningun rastro:
 ## Deploy
 - Railway: production (main) / staging (develop).
 - DB Neon COMPARTIDA entre ambos. Redis separado por environment.
+- Variables que tienen que valer LO MISMO en los dos environments mientras la
+  DB sea compartida: INVITACION_SECRETO, VENTANA_INICIO_ANTES_MINUTOS y
+  VENTANA_INICIO_DESPUES_MINUTOS (los dos procesos vencen viajes de la misma DB).
+
+## CI — .github/workflows/ci.yml
+- `quality` (PR y push a main / develop): lint + tests unitarios. NO pega
+  contra staging.
+- `deploy-staging` (push a develop) y `deploy-production` (push a main), sin
+  cambios.
+- `e2e-staging`: needs deploy-staging, SOLO en push a develop. Antes de correr
+  hace poll de GET /health cada 10 s, hasta 5 min, esperando que `capacidades`
+  incluya "viaje-interno" (solo existe en el deploy nuevo); si no aparece, falla
+  con "staging no tiene el deploy nuevo". Despues npm run test:e2e.
+- Por que /health y no una ruta nueva: organizaciones.routes hace
+  router.use(verificarToken, ...), asi que en el codigo VIEJO cualquier
+  /api/organizaciones/* sin token ya daba 401 — no distingue los deploys. Para
+  una capacidad futura: sumar el string en CAPACIDADES (app.js) y buscarlo en el
+  poll.
+- CONSECUENCIA ACEPTADA: el e2e ya NO bloquea el merge del PR. Antes corria en
+  `quality` y pegaba contra el codigo VIEJO de staging (en el PR y tambien en el
+  push, porque deploy-staging dependia de quality). Si falla, se ve en rojo en
+  Actions despues del push a develop y se arregla con otro PR.
+- El e2e usa los mismos secrets de siempre (TEST_API_URL, FIREBASE_WEB_API_KEY,
+  TEST_USER_EMAIL, TEST_USER_PASSWORD) y resuelve solo la PyME y el chofer (via
+  /api/auth/me y la lista de choferes). Crea un viaje y lo CANCELA (tambien en
+  afterAll): staging comparte la DB con produccion.
 
 ## Comandos
 npm run dev / npm run lint / npm run test
@@ -1088,11 +1427,38 @@ node scripts/seed-cuentas-test.js          (recrea las cuentas FIJAS de las suit
                                             si no, el registro de las suites da
                                             409 (el email sigue en Firebase) y
                                             todo request autenticado 404
-                                            "Usuario no registrado")
+                                            "Usuario no registrado").
+                                            Ademas deja la cuenta del E2E: el
+                                            usuario TEST_USER_EMAIL (si existe en
+                                            Firebase NO le toca la password), la
+                                            "PyME E2E" (CUIT 30999999995, ACTIVA,
+                                            el usuario como RESPONSABLE) y
+                                            chofer-e2e@test.com vinculado con el
+                                            vehiculo E2E000 (FRAGIL). Sin
+                                            TEST_USER_EMAIL / PASSWORD lo saltea
+                                            con un aviso)
+node scripts/test-viaje-interno.js         (Paso 2: crear, confirmar, rechazar,
+                                            iniciar (ventana y proximidad), ciclo
+                                            completo con remito, cancelar (chofer,
+                                            PyME, admin), reasignar, editar,
+                                            vencimiento por timer y perezoso,
+                                            desvinculacion, aislamiento entre
+                                            PyMEs, flags y 7 carreras (CASO 17,
+                                            5 rondas c/u). NO usa :3000 — levanta
+                                            3601 (y 3602 para el timer, con
+                                            ventana de 3 s). Acepta numeros de
+                                            caso, SUBCASOS=17b,17d para una sola
+                                            carrera (protocolo de reversion), y
+                                            --restos para borrar lo que haya
+                                            dejado una corrida cortada (p. ej.
+                                            si Neon se cae a la mitad). Borra
+                                            TODO lo suyo (DB, Firebase, Redis y
+                                            remitos en R2) y lo verifica)
 
 scripts/_server-efimero.js es el helper compartido que levanta src/app.js en un
 puerto propio con el env que se le pida. Lo usan el CASO 8 de test-jerarquia
-(puerto 3210), test-timeout-reserva y test-viajes-vencidos. test-anticipacion tiene su propia copia
+(puerto 3210), test-timeout-reserva, test-viajes-vencidos, test-identidad y
+test-viaje-interno. test-anticipacion tiene su propia copia
 inline, anterior a la extraccion. OJO: no hay adapter de Redis en socket.io, o
 sea que un socket conectado a :3000 NO recibe los eventos que emite un server
 efimero — los tests que verifican eventos conectan sus sockets al puerto efimero.

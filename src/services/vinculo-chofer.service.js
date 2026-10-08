@@ -1,5 +1,12 @@
+import { Prisma } from '@prisma/client';
 import prisma from '../config/prisma.js';
 import { ErrorNegocio } from './error-negocio.js';
+import { OPCIONES_TX } from './organizacion.service.js';
+import { ESTADOS_TERMINALES, ORIGEN_HISTORIAL } from './estado-viaje.service.js';
+import { registrarCambioEstado } from './historial-estado.service.js';
+import { cancelarAvisoVencimiento } from './vencimiento.service.js';
+import { limpiarViajeActivo } from './cancelacion.service.js';
+import { emitirViajeInterno } from '../sockets/salas.js';
 
 // ─── Lecturas ────────────────────────────────────────────────────────────────
 
@@ -59,29 +66,98 @@ export async function organizacionesDeChofer(id_conductor) {
 
 // ─── Desvinculacion ──────────────────────────────────────────────────────────
 
+const ESTADOS_FINALES_SQL = Prisma.join(ESTADOS_TERMINALES);
+
 // UNICA funcion que corta un vinculo PyME-chofer. La usan los DOS caminos:
 //   - DELETE /api/organizaciones/:id/choferes/:idConductor  (origen ORGANIZACION)
 //   - DELETE /api/choferes/mis-organizaciones/:id           (origen CHOFER)
 // actor = { id_usuario, origen: 'CHOFER' | 'ORGANIZACION' }.
 //
-// PASO 2 — PUNTO DE ENGANCHE: aca se va a sumar la cancelacion de TODOS los
-// viajes de este chofer con esta PyME, incluso uno en curso. Hoy solo cambia el
-// vinculo. Que sea una sola funcion es justamente para que ese agregado no se
-// pueda olvidar en uno de los dos caminos.
+// Que sea una sola funcion es lo que garantiza que el enganche del Paso 2 corre
+// en los dos caminos: en la MISMA transaccion que corta el vinculo, se cancelan
+// TODOS los viajes no finales de este chofer con esta PyME, INCLUSO uno en
+// curso, con causa DESVINCULACION. Los viajes del chofer con OTRAS PyMEs no se
+// tocan.
 //
-// updateMany condicionado a activo: dos desvinculaciones a la vez (el chofer y
-// la PyME) — gana una, la otra matchea 0 filas y recibe 404.
-export async function desvincularChofer({ id_organizacion, id_conductor, actor }) {
-  const r = await prisma.vinculoChofer.updateMany({
-    where: { id_organizacion, id_conductor, activo: true },
-    data: {
-      activo: false,
-      fecha_baja: new Date(),
-      desvinculado_por: actor.origen,
-      desvinculado_por_id_usuario: actor.id_usuario,
-    },
-  });
-  if (r.count === 0) {
-    throw new ErrorNegocio(404, 'No hay un vinculo activo con ese chofer');
+// Locks, en este orden (el mismo que crear / reasignar: vinculo -> viaje):
+//   1. updateMany del vinculo condicionado a activo: toma el lock de la fila.
+//      Dos desvinculaciones a la vez (el chofer y la PyME): gana una, la otra
+//      matchea 0 filas y recibe 404. Un crear / reasignar concurrente, que
+//      bloquea el mismo vinculo, espera y despues lo ve inactivo.
+//   2. SELECT ... FOR UPDATE de los viajes no finales: un iniciar / confirmar
+//      concurrente espera al commit y despues matchea 0 filas (409); si gano el
+//      iniciar, el viaje ya esta en CARGANDO y se cancela igual.
+//
+// Fuera de la tx: historial, timers, limpieza de ETA/GPS/Redis y eventos.
+// Devuelve los ids de los viajes cancelados.
+export async function desvincularChofer({ id_organizacion, id_conductor, actor, io = null }) {
+  const cancelados = await prisma.$transaction(async (tx) => {
+    const r = await tx.vinculoChofer.updateMany({
+      where: { id_organizacion, id_conductor, activo: true },
+      data: {
+        activo: false,
+        fecha_baja: new Date(),
+        desvinculado_por: actor.origen,
+        desvinculado_por_id_usuario: actor.id_usuario,
+      },
+    });
+    if (r.count === 0) {
+      throw new ErrorNegocio(404, 'No hay un vinculo activo con ese chofer');
+    }
+
+    const viajes = await tx.$queryRaw`
+      SELECT id_viaje, estado::text AS estado
+      FROM viajes
+      WHERE id_organizacion = ${id_organizacion}
+        AND id_conductor = ${id_conductor}
+        AND estado::text NOT IN (${ESTADOS_FINALES_SQL})
+      ORDER BY id_viaje
+      FOR UPDATE`;
+    if (viajes.length === 0) return [];
+
+    await tx.viaje.updateMany({
+      where: {
+        id_viaje: { in: viajes.map((v) => v.id_viaje) },
+        estado: { notIn: ESTADOS_TERMINALES },
+      },
+      data: { estado: 'CANCELADO', causa_cancelacion: 'DESVINCULACION' },
+    });
+    return viajes;
+  }, OPCIONES_TX);
+
+  if (cancelados.length > 0) {
+    const chofer = await prisma.conductor.findUnique({
+      where: { id_conductor },
+      select: { id_usuario: true },
+    });
+    const origen = actor.origen === 'CHOFER' ? ORIGEN_HISTORIAL.CHOFER : ORIGEN_HISTORIAL.PYME;
+
+    for (const { id_viaje, estado } of cancelados) {
+      await registrarCambioEstado({
+        id_viaje,
+        estado: 'CANCELADO',
+        id_usuario: actor.id_usuario,
+        origen,
+      });
+      cancelarAvisoVencimiento(id_viaje);
+      // Idempotente: en los pre-inicio no hay nada, en los en curso corta el
+      // emisor de ETA y borra todas las keys gps:{id}:*.
+      await limpiarViajeActivo(id_viaje);
+      emitirViajeInterno(
+        io,
+        { id_viaje, id_organizacion, id_usuario_chofer: chofer?.id_usuario },
+        'viaje:cancelado',
+        {
+          id_viaje,
+          id_organizacion,
+          estado: 'CANCELADO',
+          estado_anterior: estado,
+          causa: 'DESVINCULACION',
+          motivo: null,
+        }
+      );
+    }
   }
+
+  return cancelados.map((v) => v.id_viaje);
 }

@@ -20,7 +20,9 @@ const cooldownSeg = () => parseInt(process.env.RUTA_RECALCULO_COOLDOWN_SEGUNDOS)
 // Maneja un ping respecto de la ruta vigente: cuenta desvios consecutivos,
 // emite alerta:desvio y, al 2do ping consecutivo desviado (si pasa el cooldown),
 // recalcula la ruta. Un ping de vuelta en ruta resetea el contador.
-export async function manejarDesvio(io, id_viaje, lat, lng, ruta) {
+// `salas`: a donde se emiten las alertas (viaje:{id} y, si es de una PyME,
+// organizacion:{id}). Ver sockets/salas.js.
+export async function manejarDesvio(io, id_viaje, lat, lng, ruta, salas = [`viaje:${id_viaje}`]) {
   const desvio = verificarDesvio(lat, lng, ruta);
 
   if (!desvio.desviado) {
@@ -31,7 +33,7 @@ export async function manejarDesvio(io, id_viaje, lat, lng, ruta) {
   const consecutivos = await redis.incr(`gps:${id_viaje}:pings_desviado`);
   await redis.expire(`gps:${id_viaje}:pings_desviado`, 86400);
 
-  io.to(`viaje:${id_viaje}`).emit('alerta:desvio', {
+  io.to(salas).emit('alerta:desvio', {
     id_viaje,
     distancia_metros: Math.round(desvio.distancia_metros),
     mensaje: `El conductor se desvio ${Math.round(desvio.distancia_metros)}m de la ruta`,
@@ -54,14 +56,14 @@ export async function manejarDesvio(io, id_viaje, lat, lng, ruta) {
     };
   }
 
-  const recalc = await recalcularRutaPorDesvio(io, id_viaje, lat, lng);
+  const recalc = await recalcularRutaPorDesvio(io, id_viaje, lat, lng, salas);
   return { desviado: true, recalculo: recalc.ok, distancia_metros: desvio.distancia_metros };
 }
 
 // Recalcula la ruta desde la posicion actual del conductor hasta la ultima
 // parada pendiente (intermedias como waypoints), reemplaza la ruta en Redis,
 // emite ruta:recalculada y fuerza un recalculo de ETA inmediato.
-async function recalcularRutaPorDesvio(io, id_viaje, lat, lng) {
+async function recalcularRutaPorDesvio(io, id_viaje, lat, lng, salas) {
   const pendientes = await prisma.parada.findMany({
     where: { id_viaje, estado: 'PENDIENTE' },
     orderBy: { orden: 'asc' },
@@ -76,7 +78,7 @@ async function recalcularRutaPorDesvio(io, id_viaje, lat, lng) {
   await redis.del(`gps:${id_viaje}:pings_desviado`);
 
   const proxima = pendientes[0];
-  io.to(`viaje:${id_viaje}`).emit('ruta:recalculada', {
+  io.to(salas).emit('ruta:recalculada', {
     id_viaje,
     nueva_ruta: nuevaRuta,
     proxima_parada_id: proxima.id_parada,
@@ -84,7 +86,7 @@ async function recalcularRutaPorDesvio(io, id_viaje, lat, lng) {
   });
 
   // La ruta cambio: el ETA viejo ya no vale, recalculamos con la API.
-  await recalcularEtaInmediato(io, id_viaje);
+  await recalcularEtaInmediato(io, id_viaje, salas);
 
   console.log(`[desvio.service] ruta recalculada para viaje ${id_viaje} (${nuevaRuta.length} puntos)`);
   return { ok: true, nuevaRuta };

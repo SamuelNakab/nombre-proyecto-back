@@ -20,13 +20,6 @@ jobs:
       - run: npx prisma generate
       - name: Tests unitarios
         run: npm run test
-      - name: Test E2E (contra staging)
-        run: npm run test:e2e
-        env:
-          TEST_API_URL: ${{ secrets.TEST_API_URL }}
-          FIREBASE_WEB_API_KEY: ${{ secrets.FIREBASE_WEB_API_KEY }}
-          TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
-          TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
 
   deploy-staging:
     needs: quality
@@ -40,6 +33,39 @@ jobs:
           railway up --service nombre-proyecto-back
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN_STAGING }}
+
+  # E2E contra staging DESPUES del deploy: antes corria en `quality` y pegaba
+  # contra el codigo VIEJO de staging. Ya no bloquea el merge del PR; si falla,
+  # se ve en rojo en Actions despues del push a develop.
+  e2e-staging:
+    needs: deploy-staging
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - name: Esperar a que staging tenga el deploy nuevo
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS "$TEST_API_URL/health" | grep -q '"viaje-interno"'; then
+              echo "staging tiene el deploy nuevo"; exit 0
+            fi
+            echo "intento $i/30: staging todavia no tiene el deploy nuevo"; sleep 10
+          done
+          echo "::error::staging no tiene el deploy nuevo (5 min sin capacidad viaje-interno en /health)"
+          exit 1
+        env:
+          TEST_API_URL: ${{ secrets.TEST_API_URL }}
+      - name: Test E2E (contra staging)
+        run: npm run test:e2e
+        env:
+          TEST_API_URL: ${{ secrets.TEST_API_URL }}
+          FIREBASE_WEB_API_KEY: ${{ secrets.FIREBASE_WEB_API_KEY }}
+          TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+          TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
 
   deploy-production:
     needs: quality

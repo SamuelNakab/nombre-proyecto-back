@@ -9,6 +9,8 @@ export async function generarRemito(id_viaje) {
       paradas: { orderBy: { orden: 'asc' } },
       conductor: { include: { usuario: true } },
       cliente: { include: { usuario: true } },
+      // Viaje INTERNO: el remito muestra la PyME (nombre y CUIT), no el cliente.
+      organizacion: { select: { nombre: true, cuit: true, razon_social: true } },
       vehiculo: true,
     },
   });
@@ -22,6 +24,36 @@ export async function generarRemito(id_viaje) {
 function formatFecha(date) {
   if (!date) return '—';
   return new Date(date).toLocaleString('es-AR', { timeZone: 'America/Argentina/Buenos_Aires' });
+}
+
+// CUIT normalizado (11 digitos) -> XX-XXXXXXXX-X. Si no tiene 11 digitos se
+// devuelve tal cual.
+export function formatearCuit(cuit) {
+  if (!cuit || !/^\d{11}$/.test(cuit)) return cuit ?? '';
+  return `${cuit.slice(0, 2)}-${cuit.slice(2, 10)}-${cuit.slice(10)}`;
+}
+
+// Quien pidio el viaje, para el encabezado del remito. PURA, para poder
+// testearla sin generar ni parsear el PDF.
+//   - Viaje de PyME (ciclo interno): titulo PYME, con nombre, CUIT y razon
+//     social. El creador del viaje NO aparece: el remito es de la PyME.
+//   - Viaje legacy: titulo CLIENTE, como siempre.
+export function bloqueSolicitante(viaje) {
+  if (viaje.organizacion) {
+    const org = viaje.organizacion;
+    const lineas = [`Nombre: ${org.nombre}`, `CUIT: ${formatearCuit(org.cuit)}`];
+    if (org.razon_social) lineas.push(`Razón social: ${org.razon_social}`);
+    return { titulo: 'PYME', lineas };
+  }
+
+  const cliente = viaje.cliente?.usuario;
+  const lineas = [];
+  if (cliente) {
+    lineas.push(`Nombre: ${cliente.nombre} ${cliente.apellido}`);
+    if (viaje.cliente.nombre_empresa) lineas.push(`Empresa: ${viaje.cliente.nombre_empresa}`);
+    if (cliente.telefono) lineas.push(`Teléfono: ${cliente.telefono}`);
+  }
+  return { titulo: 'CLIENTE', lineas };
 }
 
 function formatPeso(n) {
@@ -50,15 +82,11 @@ async function generarPDF(viaje) {
     doc.moveTo(50, doc.y).lineTo(50 + W, doc.y).stroke();
     doc.moveDown(0.8);
 
-    // ── Cliente ──
-    const cliente = viaje.cliente?.usuario;
-    doc.fontSize(11).font('Helvetica-Bold').text('CLIENTE');
+    // ── Solicitante: la PyME (viaje interno) o el cliente (legacy) ──
+    const solicitante = bloqueSolicitante(viaje);
+    doc.fontSize(11).font('Helvetica-Bold').text(solicitante.titulo);
     doc.fontSize(10).font('Helvetica');
-    if (cliente) {
-      doc.text(`Nombre: ${cliente.nombre} ${cliente.apellido}`);
-      if (viaje.cliente.nombre_empresa) doc.text(`Empresa: ${viaje.cliente.nombre_empresa}`);
-      if (cliente.telefono) doc.text(`Teléfono: ${cliente.telefono}`);
-    }
+    for (const linea of solicitante.lineas) doc.text(linea);
     doc.moveDown(0.8);
 
     // ── Conductor ──

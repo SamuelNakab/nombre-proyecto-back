@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { esViajeVencido, ESTADOS_VENCIBLES } from './vencimiento.service.js';
 
 const AYER = new Date(Date.now() - 24 * 60 * 60 * 1000);
@@ -54,5 +54,44 @@ describe('esViajeVencido', () => {
     expect(() => esViajeVencido({ estado: 'BUSCANDO_CONDUCTOR' })).toThrow(
       /estado y fecha_programada/
     );
+  });
+});
+
+// ─── Ciclo INTERNO: el flag unificado ────────────────────────────────────────
+
+describe('esViajeVencido — ciclo interno', () => {
+  // La ventana se define aca, no en el .env (CI no lo tiene).
+  let anterior;
+  beforeEach(() => {
+    anterior = process.env.VENTANA_INICIO_DESPUES_MINUTOS;
+    process.env.VENTANA_INICIO_DESPUES_MINUTOS = '90';
+  });
+  afterEach(() => {
+    if (anterior === undefined) delete process.env.VENTANA_INICIO_DESPUES_MINUTOS;
+    else process.env.VENTANA_INICIO_DESPUES_MINUTOS = anterior;
+  });
+
+  const haceMin = (n) => new Date(Date.now() - n * 60000);
+
+  it('VENCIDO siempre es vencido', () => {
+    expect(esViajeVencido({ estado: 'VENCIDO', fecha_programada: MANIANA })).toBe(true);
+  });
+
+  it('ASIGNADO y CONFIRMADO vencen recien cuando cierra la ventana (fecha + 90 min)', () => {
+    for (const estado of ['ASIGNADO', 'CONFIRMADO']) {
+      expect(esViajeVencido({ estado, fecha_programada: haceMin(89) })).toBe(false);
+      expect(esViajeVencido({ estado, fecha_programada: haceMin(91) })).toBe(true);
+      expect(esViajeVencido({ estado, fecha_programada: MANIANA })).toBe(false);
+    }
+  });
+
+  it('el resto del ciclo interno no vence', () => {
+    for (const estado of ['CARGANDO', 'EN_RUTA', 'DESCARGANDO', 'FINALIZADO', 'CANCELADO', 'RECHAZADO']) {
+      expect(esViajeVencido({ estado, fecha_programada: AYER })).toBe(false);
+    }
+  });
+
+  it('el legacy no cambia: vence apenas pasa fecha_programada, sin ventana', () => {
+    expect(esViajeVencido({ estado: 'CONDUCTOR_ASIGNADO', fecha_programada: haceMin(1) })).toBe(true);
   });
 });

@@ -9,9 +9,15 @@ import { manejarDesvio } from '../services/desvio.service.js';
 import { obtenerRutaPlaneada, calcularYGuardarRuta } from '../services/ruta.service.js';
 import { verificarParadaSospechosa, distanciaMetros } from '../services/parada.service.js';
 import { iniciarEmisorEta } from '../services/eta-emisor.js';
+import { ESTADOS_EN_CURSO, ESTADOS_TERMINALES } from '../services/estado-viaje.service.js';
+import { salasDeViaje } from './salas.js';
+import { relimpiarSiCerrado } from '../services/cancelacion.service.js';
 
 export function registrarHandlersGPS(socket, io) {
   socket.on('conductor:ubicacion', async (data) => {
+    // Antes de leer el estado: si el viaje se limpia (cancela / cierra) DESPUES
+    // de este instante, las escrituras de este ping se re-limpian al final.
+    const inicioPing = Date.now();
     try {
       const { id_viaje, lat, lng, timestamp } = data ?? {};
 
@@ -64,17 +70,26 @@ export function registrarHandlersGPS(socket, io) {
         return;
       }
 
-      // El viaje debe estar iniciado con el boton "Iniciar viaje" (POST
-      // /api/viajes/:id/iniciar). Un ping de un viaje aun en BUSCANDO_CONDUCTOR o
-      // CONDUCTOR_ASIGNADO se rechaza SIN ningun efecto secundario: no toca Redis
+      // Un viaje terminado (FINALIZADO, CANCELADO, RECHAZADO, VENCIDO) ignora el
+      // ping en silencio, como siempre.
+      if (ESTADOS_TERMINALES.includes(viaje.estado)) return;
+
+      // El viaje debe estar iniciado con el boton "Iniciar viaje" (legacy: POST
+      // /api/viajes/:id/iniciar; PyME: POST /api/choferes/viajes/:id/iniciar).
+      // WHITELIST de estados en curso: un ping de un viaje que todavia no arranco
+      // (BUSCANDO_CONDUCTOR, RESERVADO_POR_EMPRESA, CONDUCTOR_ASIGNADO, ASIGNADO,
+      // CONFIRMADO) se rechaza SIN ningun efecto secundario: no toca Redis
       // (ultima/acumulado/historial), no emite mapa:actualizar, no arranca el ETA.
       // El flujo correcto del mobile es: boton → 200 → recien ahi arrancar el GPS.
-      if (viaje.estado === 'BUSCANDO_CONDUCTOR' || viaje.estado === 'CONDUCTOR_ASIGNADO') {
+      if (!ESTADOS_EN_CURSO.includes(viaje.estado)) {
         socket.emit('error', { error: 'El viaje no fue iniciado' });
         return;
       }
 
-      if (viaje.estado === 'FINALIZADO' || viaje.estado === 'CANCELADO') return;
+      // viaje:{id} y, si es de una PyME, organizacion:{id}: la PyME sigue el
+      // tracking de todos sus viajes por su sala (por eso los payloads llevan
+      // id_viaje).
+      const salas = salasDeViaje(viaje);
 
       // LLEGADA AL ORIGEN — la senial de la que sale la puntualidad.
       //
@@ -116,11 +131,18 @@ export function registrarHandlersGPS(socket, io) {
         ? calcularVelocidad(anterior.lat, anterior.lng, anterior.timestamp, lat, lng, timestamp)
         : 0;
 
+      // El viaje se cancelo / cerro mientras este ping estaba en vuelo (el estado
+      // se valido arriba, antes de las escrituras): la limpieza ya corrio, asi que
+      // las keys que acabamos de escribir quedarian huerfanas. Re-limpiar y cortar
+      // sin arrancar el ETA ni emitir.
+      if (await relimpiarSiCerrado(id_viaje, inicioPing)) return;
+
       // El viaje tiene GPS activo: arrancamos el emisor periodico de ETA
       // (idempotente — si ya corre, no hace nada). Se detiene al cerrar/cancelar.
-      iniciarEmisorEta(io, id_viaje);
+      iniciarEmisorEta(io, id_viaje, salas);
 
-      io.to(`viaje:${id_viaje}`).emit('mapa:actualizar', {
+      io.to(salas).emit('mapa:actualizar', {
+        id_viaje,
         lat,
         lng,
         timestamp,
@@ -147,7 +169,8 @@ export function registrarHandlersGPS(socket, io) {
           precio_acumulado = precio_por_tiempo + precio_por_distancia;
         }
 
-        io.to(`viaje:${id_viaje}`).emit('costo:actualizar', {
+        io.to(salas).emit('costo:actualizar', {
+          id_viaje,
           precio_acumulado,
           desglose: {
             precio_por_tiempo,
@@ -178,20 +201,24 @@ export function registrarHandlersGPS(socket, io) {
         // Deteccion de desvio + recalculo de ruta (2 pings consecutivos
         // desviados con cooldown). Lee/escribe la ruta vigente en Redis.
         if (ruta) {
-          await manejarDesvio(io, id_viaje, lat, lng, ruta);
+          await manejarDesvio(io, id_viaje, lat, lng, ruta, salas);
         }
 
         const parada_result = await verificarParadaSospechosa(
           id_viaje, viaje.zona, velocidad_kmh, lat, lng, viaje.paradas
         );
         if (parada_result.sospechosa) {
-          io.to(`viaje:${id_viaje}`).emit('alerta:parada', {
+          io.to(salas).emit('alerta:parada', {
             id_viaje,
             minutos_detenido: parada_result.minutos_detenido,
             mensaje: `El conductor lleva ${parada_result.minutos_detenido} minutos detenido`,
           });
         }
       }
+
+      // Segundo chequeo al final: si el cierre llego durante el resto del handler
+      // (ruta de fallback, desvio, emisor de ETA recien arrancado), lo mismo.
+      await relimpiarSiCerrado(id_viaje, inicioPing);
     } catch (err) {
       console.error('[gps.socket] Error en conductor:ubicacion:', err);
       socket.emit('error', { error: 'Error interno al procesar ubicacion' });

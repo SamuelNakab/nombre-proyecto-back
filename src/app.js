@@ -15,7 +15,11 @@ import choferesRoutes from './routes/choferes.routes.js';
 import { inicializarSockets } from './sockets/index.js';
 import { secretoInvitaciones } from './services/invitacion.service.js';
 import { barridoInicialReservas } from './services/reserva.service.js';
-import { barridoInicialVencimientos } from './services/vencimiento.service.js';
+import {
+  barridoInicialVencimientos,
+  barridoInicialVencimientosInternos,
+} from './services/vencimiento.service.js';
+import { marketplaceHabilitado } from './middlewares/flags.middleware.js';
 
 const app = express();
 
@@ -23,8 +27,15 @@ app.use(express.json());
 app.use(cors());
 app.use(helmet());
 
+// `capacidades`: lo que este deploy sabe hacer. Lo usa el job e2e-staging de CI
+// para esperar a que staging tenga el codigo nuevo antes de correr el e2e (una
+// ruta nueva no sirve de sonda: todo /api/organizaciones/* da 401 sin token
+// tambien en el codigo viejo). Para una capacidad futura: sumar el string aca y
+// buscarlo en el poll de ci.yml.
+const CAPACIDADES = ['viaje-interno'];
+
 app.get('/health', (_req, res) => {
-  res.json({ status: 'ok', timestamp: new Date() });
+  res.json({ status: 'ok', timestamp: new Date(), capacidades: CAPACIDADES });
 });
 
 app.use('/api/auth', authRoutes);
@@ -55,8 +66,12 @@ const io = inicializarSockets(httpServer);
 // Neon esta compartida con produccion, asi que un server efimero levantado con
 // RESERVA_TIMEOUT_MINUTOS=0.1 (6 segundos) barreria al arrancar TODA reserva de
 // mas de 6 segundos, incluidas las reales. En produccion no se setea nunca.
+// Con MARKETPLACE_HABILITADO en false tampoco corre: no hay reservas nuevas, y
+// las que quedaran se liberarian al pool dormido.
 if (process.env.RESERVA_BARRIDO_ARRANQUE === '0') {
   console.log('[reserva-timeout] barrido de arranque DESACTIVADO (RESERVA_BARRIDO_ARRANQUE=0)');
+} else if (!marketplaceHabilitado()) {
+  console.log('[reserva-timeout] barrido de arranque DESACTIVADO (MARKETPLACE_HABILITADO no esta en true)');
 } else {
   barridoInicialReservas(io).catch((e) =>
     console.error('[reserva-timeout] barrido de arranque fallo:', e.message)
@@ -77,6 +92,22 @@ if (process.env.RESERVA_BARRIDO_ARRANQUE === '0') {
 barridoInicialVencimientos(io).catch((e) =>
   console.error('[viaje-vencido] barrido de arranque fallo:', e.message)
 );
+
+// Tercer barrido UNICO: los viajes del ciclo INTERNO (Paso 2) en ASIGNADO o
+// CONFIRMADO. Los que vencieron mientras el proceso estaba caido pasan a VENCIDO
+// ahora; al resto se le arma el timer por el tiempo restante.
+//
+// ESTE si lleva kill-switch (VENCIMIENTO_BARRIDO_ARRANQUE=0, SOLO tests): a
+// diferencia del aviso legacy, ESCRIBE en la DB compartida con produccion y arma
+// timers con la VENTANA_INICIO_DESPUES_MINUTOS de ESTE proceso. Un server
+// efimero de test con una ventana de segundos venceria viajes reales.
+if (process.env.VENCIMIENTO_BARRIDO_ARRANQUE === '0') {
+  console.log('[viaje-vencido] barrido de arranque del ciclo interno DESACTIVADO (VENCIMIENTO_BARRIDO_ARRANQUE=0)');
+} else {
+  barridoInicialVencimientosInternos(io).catch((e) =>
+    console.error('[viaje-vencido] barrido de arranque del ciclo interno fallo:', e.message)
+  );
+}
 
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => {

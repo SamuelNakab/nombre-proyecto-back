@@ -9,6 +9,8 @@ import {
   registrarCambioEstado,
   INCLUDE_HISTORIAL,
 } from '../services/historial-estado.service.js';
+import { ESTADOS_TERMINALES } from '../services/estado-viaje.service.js';
+import { emitirViajeInterno } from '../sockets/salas.js';
 import { io } from '../sockets/index.js';
 
 // ─── Constantes ──────────────────────────────────────────────────────────────
@@ -23,6 +25,11 @@ const ESTADOS_VIAJE = [
   'DESCARGANDO',
   'FINALIZADO',
   'CANCELADO',
+  // Ciclo del viaje interno (Paso 2).
+  'ASIGNADO',
+  'CONFIRMADO',
+  'RECHAZADO',
+  'VENCIDO',
 ];
 const ZONAS = ['CABA', 'PROVINCIA', 'MIXTO'];
 
@@ -31,6 +38,9 @@ function feePorcentaje() {
   const raw = parseFloat(process.env.FEE_PORCENTAJE);
   return Number.isFinite(raw) ? raw : 10;
 }
+
+// La PyME de un viaje, tal como la muestra el admin.
+const ORGANIZACION_PUBLICA = { id_organizacion: true, nombre: true, cuit: true, estado: true };
 
 // Campos publicos del usuario (sin firebase_uid).
 const USUARIO_PUBLICO = {
@@ -146,7 +156,7 @@ export async function obtenerUsuario(req, res) {
       include: {
         viajes: {
           orderBy: { creado_en: 'desc' },
-          include: { paradas: { orderBy: { orden: 'asc' } } },
+          include: { paradas: { orderBy: { orden: 'asc' } }, organizacion: { select: ORGANIZACION_PUBLICA } },
         },
       },
     });
@@ -157,7 +167,7 @@ export async function obtenerUsuario(req, res) {
       include: {
         vehiculos_propios: { include: { condiciones: true } },
         conductor_vehiculos: { include: { vehiculo: { include: { condiciones: true } } } },
-        viajes: { orderBy: { creado_en: 'desc' } }, // historial de viajes aceptados
+        viajes: { orderBy: { creado_en: 'desc' }, include: { organizacion: { select: ORGANIZACION_PUBLICA } } }, // historial de viajes aceptados
       },
     });
     if (conductor) {
@@ -193,6 +203,8 @@ export async function obtenerUsuario(req, res) {
 // ─── 3. GET /api/admin/viajes ────────────────────────────────────────────────
 
 const INCLUDE_VIAJE_LISTA = {
+  // La PyME del viaje (null en los viajes legacy del marketplace).
+  organizacion: { select: ORGANIZACION_PUBLICA },
   cliente: { include: { usuario: { select: { nombre: true, apellido: true, email: true } } } },
   conductor: { include: { usuario: { select: { nombre: true, apellido: true } } } },
   _count: { select: { paradas: true } },
@@ -272,6 +284,8 @@ export async function obtenerViaje(req, res) {
       vehiculo: { include: { condiciones: true } },
       calificacion: true,
       cancelado_por_admin: { select: { id_usuario: true, nombre: true, apellido: true, email: true } },
+      organizacion: { select: ORGANIZACION_PUBLICA },
+      creador: { select: { id_usuario: true, nombre: true, apellido: true, email: true } },
       // Canal 4/6 de las metricas por etapa: la vista analitica del admin.
       ...INCLUDE_HISTORIAL,
     },
@@ -433,7 +447,10 @@ export async function cancelarViaje(req, res) {
   const id_viaje = Number(req.params.id);
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },
-    include: { cliente: { include: { usuario: { select: { id_usuario: true } } } } },
+    include: {
+      cliente: { include: { usuario: { select: { id_usuario: true } } } },
+      conductor: { select: { id_usuario: true } },
+    },
   });
 
   // 1. El viaje existe.
@@ -441,8 +458,9 @@ export async function cancelarViaje(req, res) {
     return res.status(404).json({ error: 'Viaje no encontrado' });
   }
 
-  // 2. No se puede cancelar un viaje ya terminal (FINALIZADO o CANCELADO).
-  if (viaje.estado === 'FINALIZADO' || viaje.estado === 'CANCELADO') {
+  // 2. No se puede cancelar un viaje ya terminal (FINALIZADO o CANCELADO, y
+  //    en el ciclo interno tambien RECHAZADO o VENCIDO).
+  if (ESTADOS_TERMINALES.includes(viaje.estado)) {
     return res.status(400).json({
       error: `No se puede cancelar un viaje en estado ${viaje.estado}`,
     });
@@ -452,16 +470,22 @@ export async function cancelarViaje(req, res) {
 
   // El viaje pasa a CANCELADO. Se guarda el motivo y quien lo cancelo. NO se
   // tocan id_conductor/id_vehiculo ni las paradas ya ENTREGADO (historial).
-  await prisma.$transaction([
-    prisma.viaje.update({
-      where: { id_viaje },
-      data: {
-        estado: 'CANCELADO',
-        motivo_cancelacion: motivo,
-        cancelado_por_admin_id: req.usuario.id_usuario,
-      },
-    }),
-  ]);
+  //
+  // GUARD ATOMICO: el estado leido va en el WHERE. Antes era un update plano y
+  // podia pisar una transicion concurrente (un cierre, otra cancelacion).
+  const esInterno = viaje.id_organizacion !== null;
+  const actualizado = await prisma.viaje.updateMany({
+    where: { id_viaje, estado: estadoAnterior },
+    data: {
+      estado: 'CANCELADO',
+      motivo_cancelacion: motivo,
+      cancelado_por_admin_id: req.usuario.id_usuario,
+      ...(esInterno ? { causa_cancelacion: 'ADMIN' } : {}),
+    },
+  });
+  if (actualizado.count === 0) {
+    return res.status(409).json({ error: 'El viaje cambio de estado mientras se cancelaba: volve a cargarlo' });
+  }
 
   // SITIO 7/12 del historial. FUERA de la $transaction a proposito: adentro, un
   // fallo del insert haria rollback de la cancelacion del admin.
@@ -493,9 +517,28 @@ export async function cancelarViaje(req, res) {
   if (io) {
     const payload = { id_viaje, motivo, estado: 'CANCELADO' };
     io.to(`viaje:${id_viaje}`).emit('viaje:cancelado_por_admin', payload);
-    const idUsuarioCliente = viaje.cliente?.usuario?.id_usuario;
-    if (idUsuarioCliente) {
-      io.to(`usuario:${idUsuarioCliente}`).emit('viaje:cancelado_por_admin', payload);
+    if (esInterno) {
+      // Viaje de PyME: el aviso va a la sala de la PyME y al chofer, con el
+      // mismo evento que las demas cancelaciones del ciclo interno. El creador
+      // NO recibe nada por su sala personal: el viaje es de la PyME.
+      emitirViajeInterno(
+        io,
+        { id_organizacion: viaje.id_organizacion, id_usuario_chofer: viaje.conductor?.id_usuario },
+        'viaje:cancelado',
+        {
+          id_viaje,
+          id_organizacion: viaje.id_organizacion,
+          estado: 'CANCELADO',
+          estado_anterior: estadoAnterior,
+          causa: 'ADMIN',
+          motivo,
+        }
+      );
+    } else {
+      const idUsuarioCliente = viaje.cliente?.usuario?.id_usuario;
+      if (idUsuarioCliente) {
+        io.to(`usuario:${idUsuarioCliente}`).emit('viaje:cancelado_por_admin', payload);
+      }
     }
   }
 

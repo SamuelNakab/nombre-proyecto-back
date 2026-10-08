@@ -1,4 +1,5 @@
 import { obtenerConductoresElegibles, obtenerGerentesElegibles } from './elegibilidad.service.js';
+import { marketplaceHabilitado } from '../middlewares/flags.middleware.js';
 
 // Resuelve los destinatarios elegibles del viaje (segun sus condiciones_req) y lo
 // publica con publicarViaje. Es el flujo de publicacion compartido entre la
@@ -11,7 +12,11 @@ import { obtenerConductoresElegibles, obtenerGerentesElegibles } from './elegibi
 //   que cumple las condiciones).
 // - Gerentes cuya empresa activa tiene un vehiculo de flota que cumple las
 //   condiciones (camino de elegibilidad a nivel empresa).
+//
+// Con MARKETPLACE_HABILITADO en false no publica nada: no hay pool abierto y no
+// se emite viaje:disponible (los viajes legacy que sigan vivos se cancelan a mano).
 export async function publicarViajeAConductoresElegibles(io, viaje, clienteIdUsuario) {
+  if (!marketplaceHabilitado()) return;
   const condiciones = viaje.condiciones_req.map((c) => c.condicion);
   const conductoresElegibles = await obtenerConductoresElegibles(condiciones);
   const gerentesElegibles = await obtenerGerentesElegibles(condiciones);
@@ -19,6 +24,7 @@ export async function publicarViajeAConductoresElegibles(io, viaje, clienteIdUsu
 }
 
 export async function publicarViaje(io, viaje, conductoresElegibles, gerentesElegibles, clienteIdUsuario) {
+  if (!marketplaceHabilitado()) return;
   const room = `viaje:${viaje.id_viaje}`;
   const conductoresIds = new Set(conductoresElegibles.map((c) => c.id_usuario));
   const gerentesIds = new Set(gerentesElegibles.map((g) => g.id_usuario));

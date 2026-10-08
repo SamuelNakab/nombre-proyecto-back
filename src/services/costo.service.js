@@ -1,5 +1,6 @@
 import { obtenerTarifas } from './tarifa.service.js';
 import { clasificarZona, repartirPorZona } from './zona.service.js';
+import { obtenerAcumulado } from './gps.service.js';
 
 async function getDistanciaYTiempo(origenLat, origenLng, destinoLat, destinoLng) {
   const apiKey = process.env.GOOGLE_MAPS_API_KEY;
@@ -88,6 +89,52 @@ export async function estimarCosto({ paradas, fecha_programada }) {
       fraccion_caba,
       tarifa_hora,
       tarifa_km,
+      es_hora_pico,
+    },
+  };
+}
+
+// Precio ACUMULADO de un viaje en curso, a partir del acumulado GPS en Redis.
+// Estaba inline en GET /api/viajes/:id/costo-acumulado; se extrajo para que la
+// ruta de la PyME (GET /api/organizaciones/:id/viajes/:idViaje/costo-acumulado)
+// use el MISMO calculo. El viaje tiene que traer id_viaje, zona, tarifa_hora,
+// tarifa_km y paradas (latitud, longitud).
+export async function calcularCostoAcumulado(viaje) {
+  const acumulado = await obtenerAcumulado(viaje.id_viaje);
+  if (!acumulado) {
+    return { precio_acumulado: 0, desglose: null };
+  }
+
+  // Mismo reparto que usan la estimacion y el cierre: en MIXTO se prorratea en
+  // vez de cobrar el tiempo total Y la distancia total.
+  const { tiempo_capital, distancia_provincia, fraccion_caba } = repartirPorZona({
+    zona: viaje.zona,
+    paradas: viaje.paradas,
+    tiempo_horas: acumulado.tiempo_horas,
+    distancia_km: acumulado.distancia_km,
+  });
+
+  const precio_por_tiempo =
+    tiempo_capital === null ? null : tiempo_capital * (viaje.tarifa_hora || 0);
+  const precio_por_distancia =
+    distancia_provincia === null ? null : distancia_provincia * (viaje.tarifa_km || 0);
+  const precio_acumulado = (precio_por_tiempo ?? 0) + (precio_por_distancia ?? 0);
+
+  const hora = new Date().getHours();
+  const es_hora_pico = (hora >= 7 && hora <= 10) || (hora >= 17 && hora <= 20);
+
+  return {
+    precio_acumulado,
+    desglose: {
+      precio_por_tiempo,
+      precio_por_distancia,
+      tiempo_horas: acumulado.tiempo_horas,
+      distancia_km: acumulado.distancia_km,
+      tiempo_capital,
+      distancia_provincia,
+      fraccion_caba,
+      tarifa_hora: viaje.tarifa_hora,
+      tarifa_km: viaje.tarifa_km,
       es_hora_pico,
     },
   };

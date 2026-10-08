@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import prisma from '../config/prisma.js';
+import { ESTADOS_TERMINALES } from '../services/estado-viaje.service.js';
 
 const TIPOS_CONDICION = ['FRAGIL', 'REFRIGERADO', 'CARGA_PESADA', 'PELIGROSO', 'VOLUMINOSO'];
 
@@ -125,7 +126,7 @@ export async function eliminarVehiculo(req, res) {
   const viajeActivo = await prisma.viaje.findFirst({
     where: {
       id_vehiculo,
-      estado: { notIn: ['FINALIZADO', 'CANCELADO'] },
+      estado: { notIn: ESTADOS_TERMINALES },
     },
   });
   if (viajeActivo) {

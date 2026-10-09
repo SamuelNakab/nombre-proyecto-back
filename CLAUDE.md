@@ -35,6 +35,12 @@ elegibles) queda DORMIDO detras de MARKETPLACE_HABILITADO. MVP: CABA + GBA.
   socket por PyME) COMPLETO. Marketplace, gerente, empresas, afiliaciones y
   calificaciones DORMIDOS detras de flags (no se borro nada). Ver "Viaje
   interno (Paso 2)".
+- PASO 3 — Google Maps por Routes API detras de una capa unica, duracion
+  estimada = tramos con trafico + peon por parada, fin del mock (503 / 400),
+  manejo y peon estimados y reales por viaje y por parada, distancia estimada
+  y real, y CICLO POR PARADA del viaje interno (iniciar / confirmar llegada /
+  salir) COMPLETO. El precio NO cambio. Ver "Google Maps, duracion y manejo /
+  peon (Paso 3)".
 
 ## Stack
 - Node.js 22, ES Modules (NUNCA require()). Async/await siempre.
@@ -70,6 +76,13 @@ elegibles) queda DORMIDO detras de MARKETPLACE_HABILITADO. MVP: CABA + GBA.
   (id_organizacion, estado) y 2 FKs (ON DELETE SET NULL). Revisado con el mismo
   migrate diff: sin DROP ni ALTER destructivo. id_cliente sigue NOT NULL (ver
   "Viaje interno").
+- Paso 3 (manejo / peon): 6 columnas NULLABLE en viajes (manejo_estimado_horas,
+  peon_estimado_horas, distancia_estimada_km, manejo_real_horas,
+  peon_real_horas, distancia_real_km) y 9 en paradas (llegada_estimada,
+  salida_estimada, peon_estimado_horas, manejo_estimado_horas,
+  distancia_estimada_km, llegada_real, salida_real, peon_real_horas,
+  manejo_real_horas). Sin enums, indices ni FKs. Revisado con el mismo migrate
+  diff: solo ADD COLUMN.
 - OJO con agregar valores a un enum mientras la DB esta compartida: el Prisma
   de un deploy VIEJO no conoce los valores nuevos y TIRA al leer una fila que
   los tenga (p. ej. el panel admin de produccion antes de que main tenga el
@@ -256,17 +269,18 @@ ANTICIPACION_MINIMA_MINUTOS), src/sockets/salas.js, src/middlewares/flags.middle
 | ASIGNADO    | CONFIRMADO  | CHOFER                       | confirmar (elige vehiculo) |
 | ASIGNADO    | RECHAZADO   | CHOFER                       | rechazar (final) |
 | ASIGNADO    | ASIGNADO    | PYME                         | reasignar / editar — SIN fila de historial |
-| CONFIRMADO  | CARGANDO    | CHOFER                       | iniciar (UNICO camino; el PATCH /estado no lo permite) |
+| CONFIRMADO  | CARGANDO    | CHOFER                       | iniciar = llega a la parada 1 (UNICO camino) |
 | CONFIRMADO  | ASIGNADO    | PYME                         | reasignar / editar (hay que reconfirmar) |
 | ASIGNADO / CONFIRMADO | CANCELADO | CHOFER, PYME, ADMIN, SISTEMA | cancelar / desvinculacion |
 | ASIGNADO / CONFIRMADO | VENCIDO   | SISTEMA                | timer / barrido / chequeo perezoso |
-| CARGANDO    | EN_RUTA     | CHOFER                       | PATCH /api/viajes/:id/estado |
-| EN_RUTA     | DESCARGANDO | CHOFER                       | PATCH /estado |
-| EN_RUTA / DESCARGANDO | FINALIZADO | CHOFER              | confirmar la ULTIMA parada |
+| CARGANDO / DESCARGANDO | EN_RUTA | CHOFER                      | salir de la parada actual (quedan paradas) |
+| EN_RUTA     | DESCARGANDO | CHOFER                       | confirmar-parada (llega a la SIGUIENTE) |
+| DESCARGANDO | FINALIZADO  | CHOFER                       | salir de la ULTIMA parada |
 | CARGANDO / EN_RUTA / DESCARGANDO | CANCELADO | PYME, ADMIN, SISTEMA | el chofer NO puede cancelar en curso |
 Finales: RECHAZADO, VENCIDO, CANCELADO, FINALIZADO. No existe
-EN_CAMINO_A_ORIGEN. EN_RUTA -> FINALIZADO esta porque es lo que ya hacia
-confirmar-parada (la tabla dice la verdad, no cambia el comportamiento).
+EN_CAMINO_A_ORIGEN. Desde el Paso 3 (ciclo por parada) EN_RUTA -> FINALIZADO ya
+NO existe, y PATCH /api/viajes/:id/estado NO aplica a viajes internos (400): todo
+va por iniciar, confirmar-parada y salir. Ver "Ciclo por parada" en el Paso 3.
 Validada fila por fila en estado-viaje.service.test.js.
 
 ### Patron de escritura — TODA accion del ciclo
@@ -309,11 +323,12 @@ planeada best-effort, timer de vencimiento, viaje:asignado al chofer y a la PyME
   y la misma fuente de ubicacion (body) que confirmar-parada. El 400 dice cual
   falla, o las dos. Pasa DIRECTO a CARGANDO con fecha_inicio =
   fecha_llegada_origen = ahora (duracion_aproximacion_origen sale 0: ese tramo
-  no existe). La puntualidad se sigue calculando en el read.
+  no existe). La puntualidad se sigue calculando en el read. Desde el Paso 3
+  tambien es la LLEGADA a la parada 1 (llegada_real, fecha_entrega, ENTREGADO).
 - cancelar: solo ASIGNADO o CONFIRMADO; en curso -> 400 "pedile a la PyME".
-- Avanzar y cerrar NO tienen rutas nuevas: PATCH /api/viajes/:id/estado (solo
-  EN_RUTA / DESCARGANDO para un viaje interno), POST /api/viajes/:id/confirmar-parada
-  y el socket conductor:ubicacion.
+- Recorrer las paradas (Paso 3): POST /api/choferes/viajes/:id/salir y
+  POST /api/viajes/:id/confirmar-parada. PATCH /api/viajes/:id/estado da 400 en
+  un viaje interno. El GPS sigue por el socket conductor:ubicacion.
 
 ### PyME — /api/organizaciones/:id/viajes (requireMiembro)
 - GET lista (grupo activos | en_curso | historial, o estado=) y GET detalle.
@@ -432,9 +447,8 @@ reasignar. D9 flag propio de calificaciones. D10 el admin no hace chequeo
 perezoso. D11 iniciar legacy con fallback a VENTANA_INICIO_MINUTOS, sin limite
 superior. D12 causa_cancelacion enum; quien / cuando en el historial.
 
-### PENDIENTE para el Paso 3
-- Routes API (en vez de Directions / Distance Matrix), algoritmo de duracion y
-  503 en vez del mock de costo.service cuando Google falla.
+### PENDIENTE (lo que quedo del Paso 2)
+- HECHO en el Paso 3: Routes API, algoritmo de duracion y 503 en vez del mock.
 - Usar metodo_cobro / parametros_cobro del vinculo en el precio.
 - Validar que un chofer no tenga dos viajes en curso a la vez (fuera de alcance).
 - Migrar matching / cancelacion legacy a validarTransicion + updateMany
@@ -442,6 +456,152 @@ superior. D12 causa_cancelacion enum; quien / cuando en el historial.
   update plano).
 - Mover los timers (reservas, avisos, vencimientos) a una cola persistente el
   dia que haya mas de una instancia.
+
+## Google Maps, duracion y manejo / peon (Paso 3)
+
+### Capa unica — src/services/maps/
+UNICO modulo que habla con Google: nadie mas hace fetch a routes.googleapis.com
+ni a maps.googleapis.com (verificable con grep). index.js expone tres funciones:
+| Funcion | Uso | routingPreference | FieldMask | SKU |
+|---|---|---|---|---|
+| calcularTramo({origen, destino, salida}) | crear / editar / estimar (algoritmo) | TRAFFIC_AWARE + departureTime | routes.duration, routes.distanceMeters, routes.polyline.encodedPolyline | Pro |
+| calcularEta({origen, destino}) | emisor de ETA | TRAFFIC_AWARE, sin departureTime (= ahora) | routes.duration, routes.distanceMeters | Pro |
+| calcularRuta(puntos) | desvio y fallback de ruta de gps.socket | TRAFFIC_UNAWARE + intermediates | routes.polyline.encodedPolyline | Essentials (Pro con > 10 intermedios) |
+- comun.js (PURO, testeado sin red): ErrorMaps, conversiones ("123s" -> s,
+  metros -> km), polilinea -> [lng, lat], concatenacion de tramos.
+- routes.js / legacy.js: solo ARMAN el pedido y LEEN la respuesta. index.js pone
+  el fetch, el timeout (AbortSignal.timeout(MAPS_TIMEOUT_MS), default 8000), el
+  log por llamada ("[maps] routes tramo 200 312ms (PRO=12 ESSENTIALS=3)") y el
+  contador por SKU (estadisticasMaps). NUNCA se loguea la URL (en legacy lleva
+  la key) ni la key; test unitario que lo verifica.
+- departureTime: Routes da 400 si es pasado ("Timestamp must be set to a future
+  time"); si la salida es <= ahora + 60 s NO se manda (Google usa "ahora").
+- MAPS_PROVIDER=legacy (Directions) es un ROLLBACK TEMPORAL: las tres
+  operaciones en ~80 lineas reusando todo comun.js. Distance Matrix ya no se
+  usa. Se borra cuando Routes lleve 1 a 2 semanas estable en produccion.
+- Doc: computeRoutes (https://developers.google.com/maps/documentation/routes/reference/rest/v2/TopLevel/computeRoutes),
+  field mask obligatoria (.../routes/choose_fields), SKUs
+  (.../routes/usage-and-billing): TRAFFIC_AWARE -> Pro; la polilinea no cambia
+  el SKU.
+
+### REGLA: nunca valores inventados
+Si Google falla, la capa TIRA ErrorMaps (extiende ErrorNegocio):
+- NO_DISPONIBLE -> 503 { error: 'No se pudo calcular la ruta. Probá de nuevo en
+  unos minutos.' }: sin key, timeout, red, 401 / 403 / 429 / 5xx, o un 4xx de
+  Google (un 400 de Google es un bug nuestro, no del usuario).
+- SIN_RUTA -> 400: Google respondio y routes vino vacio. El algoritmo lo
+  re-tira con "No hay una ruta en auto entre la parada N y la parada N+1".
+Cada caller:
+- crear interno, editar, estimar-costo y POST /api/viajes (dormido): el
+  calculo va ANTES de cualquier tx -> el error sale por responderErrorNegocio y
+  no se crea ni modifica nada.
+- ETA (eta-emisor): saltea ESE ciclo, loguea "[eta-emisor] viaje X: ciclo
+  salteado" y no emite. Ya no hay ETA por linea recta.
+- Desvio: mantiene la ruta anterior, loguea y consume el cooldown igual (sin
+  cooldown, durante una caida de Google se reintentaria en cada ping).
+- Fallback de ruta en gps.socket: sigue sin ruta (como antes).
+Se borraron el mock de costo.service (10 km / 0.5 h), obtenerRutaMock /
+obtenerRutaOptima (ruta recta) y el fallback de linea recta del ETA.
+
+### Algoritmo de duracion — src/services/estimacion.service.js
+estimarRecorrido({ paradas, inicio, peonMinutos, calcularTramo }) es PURA (el
+tramo se inyecta; tests sin red en estimacion.service.test.js):
+- Arranca en fecha_programada (si falta o ya paso, "ahora").
+- En CADA parada (origen, intermedias y destino) suma TIEMPO_PEON_MINUTOS (30)
+  de PEON: salida = llegada + peon.
+- Cada tramo es MANEJO, pedido con hora de salida = salida de la parada
+  anterior (secuencial: cada llamada depende de la anterior).
+- Ejemplo A -> B -> C a las 10:00: peon A 10:00-10:30; manejo A->B 40 min ->
+  11:10; peon B hasta 11:40; manejo B->C 25 min -> 12:05; peon C hasta 12:35.
+  Total 2 h 35 = manejo 1 h 05 + peon 1 h 30.
+- Devuelve por parada llegada / salida estimadas, peon y el manejo / distancia
+  del tramo que LLEGA (null en la 1); totales (distancia, manejo, peon, total,
+  inicio y fin); y la polilinea concatenada de los tramos.
+- Un error en un tramo se propaga: nunca se completa con valores inventados.
+- costo.service.estimarCosto lo usa. EL PRECIO NO CAMBIO: tarifa.service y
+  repartirPorZona reciben el MANEJO (ahora con trafico) y la distancia, como
+  antes. desglose.tiempo_horas sigue siendo el manejo. La zona sale de las
+  coordenadas de las paradas, no de la geometria.
+- duracion_estimada_horas pasa a ser el TOTAL (manejo + peon).
+- Ruta planeada: la polilinea concatenada de los MISMOS tramos (mismo SKU), se
+  guarda con guardarRutaPlaneada (misma key gps:{id}:ruta, [lng, lat]). Ya no
+  hay llamada aparte al crear / editar. calcularYGuardarRuta queda para el
+  fallback de gps.socket.
+- Llamadas a Google: crear / editar (si cambian paradas o fecha) / estimar =
+  paradas - 1 (Pro). ETA ~ 1 Pro cada ETA_RECALCULO_SEGUNDOS (360) de viaje en
+  curso + 1 por cada confirmacion / salida / desvio. Desvio = 1 Essentials.
+
+### Ciclo por parada (viaje interno)
+Cada parada tiene LLEGADA y SALIDA reales:
+| Accion | Ruta | Estado | Escribe |
+|---|---|---|---|
+| iniciar | POST /api/choferes/viajes/:id/iniciar | CONFIRMADO -> CARGANDO | parada 1: llegada_real, fecha_entrega, ENTREGADO |
+| salir | POST /api/choferes/viajes/:id/salir (sin body) | CARGANDO / DESCARGANDO -> EN_RUTA | parada abierta: salida_real, peon_real_horas; totales del viaje |
+| confirmar-parada | POST /api/viajes/:id/confirmar-parada | EN_RUTA -> DESCARGANDO | la SIGUIENTE: llegada_real, manejo_real_horas del tramo, fecha_entrega, ENTREGADO |
+| salir de la ULTIMA | POST /api/choferes/viajes/:id/salir | DESCARGANDO -> FINALIZADO | el cierre de siempre (precio real, remito, distancia real) + reales, en UNA tx |
+- DESCARGANDO ahora significa "en una parada" (carga o descarga).
+- Confirmar la ULTIMA ya NO finaliza; finaliza el "salir" de la ultima.
+- Orden obligatorio. Contrato de confirmar-parada en un viaje interno (legacy
+  sin cambios): 404 -> 403 -> parada ajena 400 -> ya confirmada 400 ->
+  estado != EN_RUTA 400 ("Todavia estas en una parada: toca Salir...") -> no es
+  la siguiente 400 ("Primero tenes que confirmar la parada N") -> distancia 400.
+- salir NO valida proximidad (la salida es irse; con GPS malo no se podria
+  salir). salir en EN_RUTA -> 400 "No estas en ninguna parada".
+- Guards (patron de siempre, en tx): salir = viaje.updateMany con el estado
+  leido + parada.updateMany { salida_real: null } de la abierta; confirmar =
+  viaje.updateMany { estado: EN_RUTA, id_conductor } + parada.updateMany
+  { llegada_real: null } + re-chequeo de que la anterior salio; cierre interno =
+  updateMany { estado: DESCARGANDO } + salida de la ultima. Cualquiera en 0 ->
+  409 y rollback. Cubiertos por CASO 17h (doble salir, de la 1 y de la ultima),
+  17i (salir vs cancelar) y 17j (confirmar vs cancelar).
+- La fila del historial se escribe con el MISMO instante que la llegada / salida
+  (registrarCambioEstado acepta `fecha` opcional): contra Neon el insert llega
+  ~1 s despues de la tx y si no, no coincidian.
+- Eventos: viaje:estado_cambiado suma id_parada (aditivo) en iniciar, salir y
+  confirmar; viaje:finalizado suma estimado, real y paradas. ETA inmediato al
+  confirmar y al salir (best-effort).
+
+### Manejo y peon REALES — tiempos-reales.js (puro) + medicion-real.service.js
+- Interno: peon de una parada = salida_real - llegada_real; manejo de un tramo =
+  llegada_real - salida_real de la anterior; totales = sumas. real total =
+  llegada a la 1 -> salida de la ultima = MISMO intervalo que el estimado.
+- Legacy (ciclo sin cambios): solo por viaje, desde el historial: CARGANDO +
+  DESCARGANDO = peon, EN_RUTA = manejo; se guardan al cerrar.
+- Se GUARDAN: en cada confirmar (manejo del tramo), en cada salir (peon de la
+  parada + totales), al cerrar (en la tx del cierre) y, si se cancela EN CURSO
+  (PyME, admin, desvinculacion), guardarMedicionParcial(id_viaje, fin) DESPUES
+  del commit y ANTES de limpiarViajeActivo. La parada abierta se cierra en `fin`
+  solo para el calculo (peon_real_horas si, salida_real queda null); si se
+  cancela manejando, el tramo parcial suma al manejo del VIAJE. Nunca tira.
+- distancia_real_km = el acumulado GPS de Redis, leido ANTES de limpiarGPS (al
+  cerrar, o el parcial al cancelar en curso). null si no hubo pings.
+- Metricas viejas en internos (calcularMetricasViaje elige por cicloDe):
+  duracion_real = real total en minutos (llegada 1 -> salida ultima),
+  duracion_carga = peon de la parada 1, duracion_descarga = peon de la ultima.
+  Legacy identico. Por eso mis-viajes-conductor (select explicito) pide
+  id_organizacion.
+
+### Persistencia y API
+- Horas en la base, minutos en la API (regla de duracion.service). Las columnas
+  de parada llevan _horas; la API expone _min enteros.
+- Estimado: se escribe al crear (interno y legacy) y se reescribe al editar
+  (paradas nuevas -> createMany con estimados; solo fecha -> update de cada
+  parada dentro de la tx, releyendolas con el lock). Reasignar no recalcula.
+- bloqueTiempos(viaje) -> estimado { manejo_horas, peon_horas, total_horas,
+  distancia_km } (null en viajes viejos) y real { ... } (null hasta FINALIZADO,
+  o CANCELADO con algo medido). tiemposParada(p) -> peon_estimado_min,
+  manejo_estimado_min, peon_real_min, manejo_real_min, diferencia_min
+  (llegada_real - llegada_estimada). Canales: detalle y listas de la PyME y del
+  chofer, admin (lista: bloque; detalle: bloque + paradas), respuesta de crear y
+  viaje:finalizado. estimar-costo devuelve estimado (con inicio / fin) y tramos.
+
+### PENDIENTES (Paso 4 o despues)
+- Si el chofer no toca "Salir" en la ULTIMA parada, el viaje queda en
+  DESCARGANDO indefinidamente y no vence. Se resuelve junto con notificaciones.
+- Borrar maps/legacy.js cuando Routes lleve 1 a 2 semanas estable.
+- Tarifario con peon y manejo por separado (las columnas ya estan).
+- Front mobile: boton Salir en cada parada (ver API.md "Cambio de contrato para
+  mobile").
 
 ## Maquina de estados — src/services/estado-viaje.service.js
 Hay DOS ciclos con su tabla cada uno: TRANSICIONES (este, el LEGACY del
@@ -483,6 +643,11 @@ Transiciones validas:
 | cualquiera (no final)  | CANCELADO                | Admin                                    |
 
 ## Confirmacion de paradas (sin QR)
+
+> Viajes INTERNOS: desde el Paso 3 confirmar-parada es la LLEGADA a la
+> siguiente parada (solo en EN_RUTA, orden obligatorio, pasa a DESCARGANDO) y
+> NO cierra el viaje: lo cierra "salir" de la ultima. Ver "Ciclo por parada".
+> Lo que sigue describe el ciclo LEGACY, sin cambios.
 
 El QR fue REEMPLAZADO por confirmacion por proximidad. Ya no existe el
 endpoint de qr-paradas ni la firma/validacion de tokens.
@@ -753,9 +918,10 @@ Regla sin excepciones, para no mezclar unidades en una misma respuesta:
   `*_horas` = horas float.
 
 - duracion_estimada_horas: columna en Viaje (Float?, aditiva y nullable).
-  Se llena en crearViaje con resultado.desglose.tiempo_horas — el MISMO
-  tiempo que se acaba de usar para estimar el precio, asi que
-  duracion_estimada y precio_estimado no se pueden desincronizar. Antes ese
+  DESDE EL PASO 3 es el TOTAL estimado (manejo con trafico + peon en cada
+  parada, ver "Algoritmo de duracion"); el precio sigue usando solo el manejo
+  (desglose.tiempo_horas = manejo_estimado_horas). Antes era el
+  desglose.tiempo_horas del precio. Antes ese
   valor se calculaba y se descartaba: salia una sola vez en la respuesta de
   creacion y no habia forma de recuperarlo (en PROVINCIA tarifa_hora es null y
   en MIXTO el precio mezcla los dos ejes, asi que NO es derivable del precio).
@@ -855,7 +1021,12 @@ PyME es CLIENTE.
 | 18 | reasignarViaje / editarViaje | viaje-interno.service.js | CONFIRMADO -> ASIGNADO (ASIGNADO -> ASIGNADO: SIN fila) | CLIENTE  |
 | 19 | vencerViajeInterno         | vencimiento.service.js    | ASIGNADO / CONFIRMADO -> VENCIDO              | SISTEMA           |
 | 20 | desvincularChofer          | vinculo-chofer.service.js | no final -> CANCELADO (uno por viaje)         | CLIENTE o CONDUCTOR |
-| —  | cambiarEstado (3), cerrarViaje (11), cancelarViaje admin (7) | | los mismos sitios de arriba, ahora tambien para viajes internos | |
+| 21 | salirDeParada              | viaje-interno.service.js  | CARGANDO / DESCARGANDO -> EN_RUTA (la ultima: cerrarViaje -> FINALIZADO) | CONDUCTOR |
+| 22 | confirmarParadaInterna     | viaje-interno.service.js  | EN_RUTA -> DESCARGANDO                        | CONDUCTOR         |
+| —  | cerrarViaje (11), cancelarViaje admin (7) | | los mismos sitios de arriba, ahora tambien para viajes internos | |
+cambiarEstado (3) ya NO aplica a viajes internos desde el Paso 3 (400). Los
+sitios 16, 21, 22 y el cierre pasan `fecha` al historial: el mismo instante que
+la llegada / salida de la parada.
 
 reasignar y editar leen el estado REAL con un SELECT ... FOR UPDATE dentro de su
 tx, para saber si la transicion fue CONFIRMADO -> ASIGNADO (fila) o ASIGNADO ->
@@ -1213,7 +1384,7 @@ id_organizacion):
 | viaje:editado        | PyME + chofer                        | editar (`confirmacion_anulada` si estaba CONFIRMADO) |
 | viaje:confirmado     | PyME                                 | el chofer confirma |
 | viaje:rechazado      | PyME                                 | el chofer rechaza |
-| viaje:iniciado / viaje:estado_cambiado / viaje:finalizado | PyME + viaje:{id} | iniciar, avanzar, cierre |
+| viaje:iniciado / viaje:estado_cambiado / viaje:finalizado | PyME + viaje:{id} | iniciar, salir, confirmar-parada, cierre. estado_cambiado trae id_parada; finalizado trae estimado, real y paradas (Paso 3) |
 | viaje:cancelado      | PyME + chofer                        | cualquier cancelacion: `causa` CHOFER / ORGANIZACION / ADMIN / DESVINCULACION |
 | viaje:vencido        | PyME + chofer                        | VENCIDO (estado real; `estado_anterior`) |
 | mapa:actualizar, costo:actualizar, eta:actualizar, alerta:desvio, alerta:parada, ruta:recalculada | viaje:{id} + PyME | tracking; mapa y costo sumaron `id_viaje` al payload |
@@ -1290,6 +1461,15 @@ y debuggearlo sin esperar una hora. Detalles:
 - La variable se lee en CADA request, no se cachea en el modulo.
 - NO aplica a POST /api/viajes/estimar-costo: ahi fecha_programada es opcional,
   solo define si es hora pico, y acepta cualquier fecha (incluso pasada).
+
+TIEMPO_PEON_MINUTOS=30            (Paso 3: peon estimado en CADA parada. 0 es
+                                   valido; basura / negativo -> 30. Se lee en
+                                   cada estimacion)
+MAPS_TIMEOUT_MS=8000              (timeout de cada llamada a Google)
+MAPS_PROVIDER=routes              (routes | legacy. legacy = Directions, rollback
+                                   temporal. Se lee en cada llamada)
+GOOGLE_MAPS_API_KEY               (con Routes API habilitada. Sin key, crear /
+                                   editar / estimar dan 503: no hay mock)
 
 INVITACION_SECRETO                (SIN default: es un secreto. Sin el, el server
                                    arranca y los endpoints de invitaciones dan
@@ -1437,6 +1617,16 @@ node scripts/seed-cuentas-test.js          (recrea las cuentas FIJAS de las suit
                                             vehiculo E2E000 (FRAGIL). Sin
                                             TEST_USER_EMAIL / PASSWORD lo saltea
                                             con un aviso)
+node scripts/test-maps.js                  (Paso 3, contra Google REAL: rutas
+                                            corta / larga / a provincia, 4 paradas
+                                            con llegadas crecientes y peon exacto,
+                                            tabla antes / despues de precio y
+                                            duracion, y servers efimeros 3701 /
+                                            3702 (key invalida): crear y estimar
+                                            -> 503 sin escribir nada, el ETA no
+                                            se emite. ~16 llamadas Pro + 9
+                                            elementos de Distance Matrix para la
+                                            columna "antes")
 node scripts/test-viaje-interno.js         (Paso 2: crear, confirmar, rechazar,
                                             iniciar (ventana y proximidad), ciclo
                                             completo con remito, cancelar (chofer,
@@ -1453,7 +1643,13 @@ node scripts/test-viaje-interno.js         (Paso 2: crear, confirmar, rechazar,
                                             dejado una corrida cortada (p. ej.
                                             si Neon se cae a la mitad). Borra
                                             TODO lo suyo (DB, Firebase, Redis y
-                                            remitos en R2) y lo verifica)
+                                            remitos en R2) y lo verifica.
+                                            Paso 3: usa Google REAL (~100
+                                            llamadas Pro por corrida, las imprime
+                                            al final); CASO 19 = 4 paradas de
+                                            punta a punta, CASO 20 = cancelar en
+                                            curso, 17h-j = carreras del ciclo
+                                            por parada)
 
 scripts/_server-efimero.js es el helper compartido que levanta src/app.js en un
 puerto propio con el env que se le pida. Lo usan el CASO 8 de test-jerarquia

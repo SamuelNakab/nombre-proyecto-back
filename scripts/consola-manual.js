@@ -12,12 +12,14 @@
 // PyMEs" del conductor y desvincular desde los dos lados. El CLIENTE de prueba
 // opera la PyME; el CONDUCTOR de prueba es el chofer.
 //
-// Viaje interno (Paso 2), opciones m-w: la PyME crea el viaje para un chofer
-// vinculado, el chofer confirma (eligiendo vehiculo) o rechaza, lo inicia en el
-// origen, y despues avanza con las opciones 5 (estado) y 6 (confirmar parada),
-// que son las mismas rutas para los dos ciclos. Tambien cancelar como chofer o
-// como PyME, reasignar y editar. Las opciones 1, 2, 7 y 8 son del marketplace:
-// con MARKETPLACE_HABILITADO en false, 1 y 2 dan 404 / error.
+// Viaje interno (Pasos 2 y 3), opciones m-x: la PyME crea el viaje para un
+// chofer vinculado, el chofer confirma (eligiendo vehiculo) o rechaza, lo inicia
+// en el origen (= llega a la parada 1) y despues recorre parada por parada: x
+// (salir de la parada actual) y 6 (confirmar la llegada a la siguiente). Salir de
+// la ULTIMA finaliza el viaje. La opcion 5 (PATCH /estado) NO aplica a viajes de
+// PyME (da 400). Tambien cancelar como chofer o como PyME, reasignar y editar.
+// Las opciones 1, 2, 7 y 8 son del marketplace: con MARKETPLACE_HABILITADO en
+// false, 1 y 2 dan 404 / error.
 //
 // No corre en CI: es interactivo, de uso manual local. Vive en scripts/, fuera
 // de los globs de lint y test.
@@ -503,6 +505,14 @@ async function accionIniciarViajePyme() {
     await api('POST', `/api/choferes/viajes/${estado.idViaje}/iniciar`, { lat, lng }, estado.conductorToken));
 }
 
+// Ciclo por parada (Paso 3): sale de la parada actual. Si era la ultima,
+// finaliza el viaje (remito, precio real, tiempos reales).
+async function accionSalirDeParada() {
+  if (!requiereViaje()) return;
+  mostrar('POST /api/choferes/viajes/:id/salir',
+    await api('POST', `/api/choferes/viajes/${estado.idViaje}/salir`, null, estado.conductorToken));
+}
+
 async function accionCancelarComoChofer() {
   if (!requiereViaje()) return;
   mostrar('POST /api/choferes/viajes/:id/cancelar',
@@ -565,14 +575,15 @@ function imprimirMenu() {
 ║  j) Mis PyMEs               (conductor)        ║
 ║  k) Desvincular chofer      (cliente)          ║
 ║  l) Desvincularme           (conductor)        ║
-╠═════════════ VIAJE DE PyME (Paso 2) ═══════════╣
+╠═════════════ VIAJE DE PyME (Pasos 2-3) ════════╣
 ║  m) Crear viaje para un chofer (cliente)       ║
 ║  n) Viajes de la PyME          (cliente)       ║
 ║  o) Mis viajes                 (conductor)     ║
 ║  p) Confirmar (elige vehiculo) (conductor)     ║
 ║  q) Rechazar                   (conductor)     ║
 ║  r) Iniciar en el origen       (conductor)     ║
-║     → avanzar: 5   confirmar parada: 6         ║
+║  x) Salir de la parada actual  (conductor)     ║
+║     → llegar a la siguiente: 6 (5 no aplica)   ║
 ║  s) Cancelar como chofer       (conductor)     ║
 ║  t) Cancelar como PyME         (cliente)       ║
 ║  u) Reasignar a otro chofer    (cliente)       ║
@@ -620,6 +631,7 @@ async function loopMenu(sCliente, sConductor) {
       case 'u': await accionReasignar(); break;
       case 'v': await accionEditar(); break;
       case 'w': await accionVerViajePyme(); break;
+      case 'x': await accionSalirDeParada(); break;
       case '0':
         console.log('  Cerrando…');
         try { sCliente.disconnect(); } catch { /* noop */ }

@@ -52,7 +52,10 @@ describe('validarTransicion', () => {
 const interno = (quien) => ({ ciclo: 'INTERNO', quien });
 const ACTORES = ['CHOFER', 'PYME', 'ADMIN', 'SISTEMA'];
 
-// La tabla completa, fila por fila: [desde, hacia, quienes pueden].
+// La tabla completa, fila por fila: [desde, hacia, quienes pueden]. Ciclo por
+// parada (Paso 3): salir = CARGANDO/DESCARGANDO -> EN_RUTA (o FINALIZADO en la
+// ultima); confirmar-parada = EN_RUTA -> DESCARGANDO. EN_RUTA -> FINALIZADO ya
+// no existe.
 const VALIDAS_INTERNO = [
   ['ASIGNADO', 'CONFIRMADO', ['CHOFER']],
   ['ASIGNADO', 'RECHAZADO', ['CHOFER']],
@@ -66,8 +69,8 @@ const VALIDAS_INTERNO = [
   ['CARGANDO', 'EN_RUTA', ['CHOFER']],
   ['CARGANDO', 'CANCELADO', ['PYME', 'ADMIN', 'SISTEMA']],
   ['EN_RUTA', 'DESCARGANDO', ['CHOFER']],
-  ['EN_RUTA', 'FINALIZADO', ['CHOFER']],
   ['EN_RUTA', 'CANCELADO', ['PYME', 'ADMIN', 'SISTEMA']],
+  ['DESCARGANDO', 'EN_RUTA', ['CHOFER']],
   ['DESCARGANDO', 'FINALIZADO', ['CHOFER']],
   ['DESCARGANDO', 'CANCELADO', ['PYME', 'ADMIN', 'SISTEMA']],
 ];
@@ -137,5 +140,16 @@ describe('cicloDe', () => {
 
   it('tira si el viaje no trae id_organizacion', () => {
     expect(() => cicloDe({})).toThrow(/id_organizacion/);
+  });
+});
+
+describe('ciclo por parada (Paso 3)', () => {
+  it('EN_RUTA ya no puede pasar directo a FINALIZADO', () => {
+    expect(() => validarTransicion('EN_RUTA', 'FINALIZADO', interno('CHOFER'))).toThrow(/Transicion invalida/);
+  });
+
+  it('el chofer alterna entre EN_RUTA y DESCARGANDO en cada parada', () => {
+    expect(() => validarTransicion('EN_RUTA', 'DESCARGANDO', interno('CHOFER'))).not.toThrow();
+    expect(() => validarTransicion('DESCARGANDO', 'EN_RUTA', interno('CHOFER'))).not.toThrow();
   });
 });

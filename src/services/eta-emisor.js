@@ -23,6 +23,19 @@ const recalculoSeg = () => parseInt(process.env.ETA_RECALCULO_SEGUNDOS) || 360;
 // que nunca finalizan: conductor que abandona, app cerrada, etc.).
 const idleSeg = () => parseInt(process.env.ETA_EMISOR_IDLE_SEGUNDOS) || 300;
 
+const FALLO = Symbol('fallo');
+
+// calcularEtaConApi tira si Google falla. Aca se loguea y se devuelve FALLO para
+// que el caller saltee el ciclo sin emitir.
+async function calcularConApi(id_viaje, ultima) {
+  try {
+    return await calcularEtaConApi(id_viaje, ultima.lat, ultima.lng);
+  } catch (err) {
+    console.error(`[eta-emisor] viaje ${id_viaje}: ciclo salteado, no se pudo calcular el ETA (${err.detalle ?? err.message})`);
+    return FALLO;
+  }
+}
+
 function construirPayload(id_viaje, resultado) {
   const segundos_restantes = Math.max(0, Math.round(resultado.segundos_restantes));
   return {
@@ -49,7 +62,10 @@ async function emitirEta(io, id_viaje) {
   }
 
   if (!resultado || resultado.necesita_recalculo) {
-    resultado = await calcularEtaConApi(id_viaje, ultima.lat, ultima.lng);
+    resultado = await calcularConApi(id_viaje, ultima);
+    // Google fallo: se saltea este ciclo (ya se logueo). El proximo tick
+    // reintenta; nunca se emite un ETA inventado.
+    if (resultado === FALLO) return;
   }
 
   // El viaje se cerro o se cancelo MIENTRAS se calculaba (detenerEmisorEta ya
@@ -60,7 +76,7 @@ async function emitirEta(io, id_viaje) {
     return;
   }
 
-  if (!resultado) return; // sin parada pendiente o fallo de calculo
+  if (!resultado) return; // sin parada pendiente
 
   io.to(salasDe(id_viaje)).emit('eta:actualizar', construirPayload(id_viaje, resultado));
 }
@@ -113,8 +129,8 @@ export async function recalcularEtaInmediato(io, id_viaje, salas = null) {
   const ultima = await obtenerUltimaCoordenada(id_viaje);
   if (!ultima) return;
 
-  const resultado = await calcularEtaConApi(id_viaje, ultima.lat, ultima.lng);
-  if (!resultado) return;
+  const resultado = await calcularConApi(id_viaje, ultima);
+  if (!resultado || resultado === FALLO) return;
 
   io.to(salas ?? salasDe(id_viaje)).emit('eta:actualizar', construirPayload(id_viaje, resultado));
 }

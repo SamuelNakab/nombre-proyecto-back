@@ -22,12 +22,21 @@ import prisma from '../config/prisma.js';
 import { ErrorNegocio } from './error-negocio.js';
 import { OPCIONES_TX } from './organizacion.service.js';
 import { estimarCosto } from './costo.service.js';
-import { calcularYGuardarRuta, obtenerRutaPlaneada } from './ruta.service.js';
+import {
+  columnasEstimadasViaje,
+  columnasEstimadasParada,
+  conEstimacionPorParada,
+} from './estimacion.service.js';
+import { escribirRealesInterno, guardarMedicionParcial } from './medicion-real.service.js';
+import { cerrarViaje } from './cierre.service.js';
+import { recalcularEtaInmediato } from './eta-emisor.js';
+import { guardarRutaPlaneada, obtenerRutaPlaneada } from './ruta.service.js';
 import { registrarCambioEstado, INCLUDE_HISTORIAL } from './historial-estado.service.js';
 import {
   validarTransicion,
   ESTADOS_TERMINALES,
   ESTADOS_PRE_INICIO_INTERNO,
+  ESTADOS_EN_PARADA_INTERNO,
   ORIGEN_HISTORIAL,
 } from './estado-viaje.service.js';
 import {
@@ -47,7 +56,12 @@ import {
   ventanaInicioDespuesMinutos,
   horaLocal,
 } from './ventana-inicio.js';
-import { horasAMinutos, calcularMetricasViaje } from './duracion.service.js';
+import {
+  horasAMinutos,
+  calcularMetricasViaje,
+  bloqueTiempos,
+  paradasConTiempos,
+} from './duracion.service.js';
 import { paradasParaCrear } from './viaje-validacion.js';
 import { emitirViajeInterno, salasDeViaje } from '../sockets/salas.js';
 
@@ -203,18 +217,33 @@ function mensajeEstado(accion, estado) {
   return `No se puede ${accion} un viaje en estado ${estado}`;
 }
 
+async function guardarRutaSinTirar(id_viaje, polilinea) {
+  try {
+    return await guardarRutaPlaneada(id_viaje, polilinea);
+  } catch (err) {
+    console.error(`[viaje-interno] No se pudo guardar la ruta del viaje ${id_viaje}:`, err.message);
+    return null;
+  }
+}
+
+const HORA_MS = 3_600_000;
+
 const remitoUrl = (id_viaje) => `${process.env.R2_PUBLIC_URL}/remitos/${id_viaje}.pdf`;
 
 // ─── Serializacion ───────────────────────────────────────────────────────────
 
 // Lo que devuelven las listas y el detalle, para la PyME y para el chofer. La
 // fila cruda + los campos calculados en el read (mismos que los canales
-// legacy): duracion_estimada, las cinco metricas del historial (puntualidad
-// incluida, que pisa a la columna MUERTA del mismo nombre) y vencido.
+// legacy): duracion_estimada (el TOTAL, manejo + peon), las cinco metricas
+// (puntualidad incluida, que pisa a la columna MUERTA del mismo nombre),
+// vencido, los bloques estimado / real y, en cada parada, sus tiempos en
+// minutos (ver duracion.service).
 export function serializarViajeInterno(viaje) {
   const { condiciones_req, conductor, ...resto } = viaje;
   return {
     ...resto,
+    paradas: paradasConTiempos(viaje.paradas),
+    ...bloqueTiempos(viaje),
     condiciones_requeridas: condiciones_req.map((c) => c.condicion),
     conductor: conductor
       ? {
@@ -360,15 +389,12 @@ export async function crearViajeInterno({ io, id_organizacion, id_usuario, datos
 
   await validarChoferAsignable(id_organizacion, id_conductor, condiciones_requeridas);
 
-  // Precio y duracion: el calculo actual de costo.service, sin cambios. Fuera
-  // de la tx: es una llamada a Google.
-  let resultado;
-  try {
-    resultado = await estimarCosto({ paradas, fecha_programada });
-  } catch {
-    throw new ErrorNegocio(503, 'No se pudo calcular la distancia');
-  }
+  // Precio, duracion (manejo + peon) y ruta: UNA estimacion (costo.service).
+  // Fuera de la tx y ANTES de escribir nada: llama a Google. Si Google falla,
+  // ErrorMaps (503, o 400 si no hay ruta posible) y no se crea nada.
+  const resultado = await estimarCosto({ paradas, fecha_programada });
   const { tarifa_hora, tarifa_km } = resultado.desglose;
+  const { recorrido } = resultado;
 
   const { id_viaje } = await transaccion(async (tx) => {
     const vinculo = await bloquearVinculoActivo(tx, id_organizacion, id_conductor);
@@ -388,8 +414,8 @@ export async function crearViajeInterno({ io, id_organizacion, id_usuario, datos
         fecha_programada: new Date(fecha_programada),
         descripcion: descripcion ?? null,
         precio_estimado: resultado.precio_estimado,
-        duracion_estimada_horas: resultado.desglose.tiempo_horas,
-        paradas: { create: paradasParaCrear(paradas) },
+        ...columnasEstimadasViaje(recorrido.totales),
+        paradas: { create: conEstimacionPorParada(paradasParaCrear(paradas), recorrido) },
         condiciones_req: { create: condiciones_requeridas.map((condicion) => ({ condicion })) },
       },
       select: { id_viaje: true },
@@ -403,14 +429,10 @@ export async function crearViajeInterno({ io, id_organizacion, id_usuario, datos
     origen: ORIGEN_HISTORIAL.PYME,
   });
 
-  // Best-effort, como en la ruta legacy: si Google falla, ruta_planeada queda
-  // null y se reintenta en el primer ping GPS.
-  let ruta_planeada = null;
-  try {
-    ruta_planeada = await calcularYGuardarRuta(id_viaje);
-  } catch (err) {
-    console.error(`[viaje-interno] No se pudo calcular la ruta del viaje ${id_viaje}:`, err.message);
-  }
+  // Ruta planeada: la polilinea de los tramos de la estimacion (sin otra
+  // llamada a Google). Si Redis falla el viaje ya existe: se loguea y la ruta
+  // se recalcula en el primer ping GPS (fallback de gps.socket).
+  const ruta_planeada = await guardarRutaSinTirar(id_viaje, recorrido.polilinea);
 
   programarVencimientoInterno(io, id_viaje, new Date(fecha_programada));
 
@@ -618,6 +640,15 @@ export async function iniciarViajeInterno({ io, id_usuario, id_viaje, lat, lng }
       },
     });
     if (r.count === 0) throw conflicto();
+
+    // Ciclo por parada: iniciar ES la llegada a la parada 1. Se marca tambien
+    // entregada (fecha_entrega): con el orden obligatorio nadie mas la puede
+    // confirmar, y el conteo de pendientes y el ETA dependen de eso.
+    const p = await tx.parada.updateMany({
+      where: { id_parada: origen.id_parada, id_viaje, llegada_real: null },
+      data: { llegada_real: ahora, fecha_entrega: ahora, estado: 'ENTREGADO' },
+    });
+    if (p.count === 0) throw conflicto();
   });
 
   await registrarCambioEstado({
@@ -625,6 +656,7 @@ export async function iniciarViajeInterno({ io, id_usuario, id_viaje, lat, lng }
     estado: 'CARGANDO',
     id_usuario,
     origen: ORIGEN_HISTORIAL.CHOFER,
+    fecha: ahora,
   });
   // Arranco: ya no puede vencer.
   cancelarAvisoVencimiento(id_viaje);
@@ -640,6 +672,7 @@ export async function iniciarViajeInterno({ io, id_usuario, id_viaje, lat, lng }
       id_viaje,
       estado_anterior: 'CONFIRMADO',
       estado_nuevo: 'CARGANDO',
+      id_parada: origen.id_parada,
     });
   }
 
@@ -649,6 +682,199 @@ export async function iniciarViajeInterno({ io, id_usuario, id_viaje, lat, lng }
     estado: 'CARGANDO',
     fecha_inicio: ahora,
     fecha_llegada_origen: ahora,
+    id_parada: origen.id_parada,
+    llegada_real: ahora,
+  };
+}
+
+// ─── Chofer: ciclo por parada (confirmar llegada / salir) ────────────────────
+//
+// En curso, el viaje alterna entre "en una parada" (CARGANDO en la 1,
+// DESCARGANDO en las demas) y EN_RUTA. Cada parada queda con llegada_real y
+// salida_real; de ahi salen el peon y el manejo reales (medicion-real.service).
+
+const etaSinTirar = (io, id_viaje, salas) =>
+  recalcularEtaInmediato(io, id_viaje, salas).catch((err) =>
+    console.error(`[viaje-interno] viaje ${id_viaje}: no se pudo recalcular el ETA: ${err.message}`)
+  );
+
+const ordenadas = (paradas) => [...paradas].sort((a, b) => a.orden - b.orden);
+
+// Salir de la parada actual. Si quedan paradas -> EN_RUTA; si era la ultima ->
+// FINALIZADO (el cierre de siempre: precio real, remito, distancia real).
+// GUARD: el estado leido Y la parada abierta (salida_real null) en el WHERE; dos
+// "salir" a la vez o un salir contra una cancelacion: gana uno, el otro 409.
+export async function salirDeParada({ io, id_usuario, id_viaje }) {
+  const id_conductor = await conductorDe(id_usuario);
+  const viaje = await viajeDeChofer(id_conductor, id_viaje, { paradas: { orderBy: { orden: 'asc' } } });
+
+  if (!ESTADOS_EN_PARADA_INTERNO.includes(viaje.estado)) {
+    if (viaje.estado === 'EN_RUTA') {
+      throw new ErrorNegocio(400, 'No estas en ninguna parada: confirma la llegada a la siguiente antes de salir');
+    }
+    throw new ErrorNegocio(400, `No se puede salir de una parada en un viaje en estado ${viaje.estado}`);
+  }
+
+  const paradas = ordenadas(viaje.paradas);
+  const abierta = paradas.find((p) => p.llegada_real && !p.salida_real);
+  if (!abierta) throw conflicto();
+  const quedan = paradas.some((p) => !p.llegada_real);
+  const destino = quedan ? 'EN_RUTA' : 'FINALIZADO';
+  validarTransicion(viaje.estado, destino, { ciclo: 'INTERNO', quien: 'CHOFER' });
+
+  const actor = { id_usuario, origen: ORIGEN_HISTORIAL.CHOFER };
+  const ahora = new Date();
+
+  if (!quedan) {
+    // Ultima parada: el cierre escribe la salida, los reales y FINALIZADO en
+    // UNA transaccion. null = perdio la carrera (otro salir, una cancelacion).
+    const cierre = await cerrarViaje(id_viaje, io, actor, { paradaQueSale: abierta.id_parada, ahora });
+    if (!cierre) throw conflicto();
+    return {
+      mensaje: 'Viaje finalizado',
+      id_viaje,
+      id_parada: abierta.id_parada,
+      estado: 'FINALIZADO',
+      salida_real: ahora,
+      viaje_finalizado: true,
+      precio_real: cierre.precio_real,
+      remito_url: cierre.remito_url,
+      estimado: cierre.estimado,
+      real: cierre.real,
+    };
+  }
+
+  await transaccion(async (tx) => {
+    const r = await tx.viaje.updateMany({
+      where: { id_viaje, id_conductor, estado: viaje.estado },
+      data: { estado: 'EN_RUTA' },
+    });
+    if (r.count === 0) throw conflicto();
+    const p = await tx.parada.updateMany({
+      where: { id_parada: abierta.id_parada, id_viaje, salida_real: null },
+      data: { salida_real: ahora },
+    });
+    if (p.count === 0) throw conflicto();
+    // Peon de esta parada y totales del viaje, con las paradas frescas.
+    const frescas = await tx.parada.findMany({
+      where: { id_viaje },
+      select: { id_parada: true, orden: true, llegada_real: true, salida_real: true },
+    });
+    await escribirRealesInterno(tx, id_viaje, frescas);
+  });
+
+  await registrarCambioEstado({ id_viaje, estado: 'EN_RUTA', ...actor, fecha: ahora });
+
+  if (io) {
+    const salas = salasDeViaje(viaje);
+    io.to(salas).emit('viaje:estado_cambiado', {
+      id_viaje,
+      estado_anterior: viaje.estado,
+      estado_nuevo: 'EN_RUTA',
+      id_parada: abierta.id_parada,
+    });
+    // La proxima parada cambio: ETA nuevo. Best-effort: el cambio de estado ya
+    // se hizo (si Google falla, el emisor ya saltea y loguea).
+    await etaSinTirar(io, id_viaje, salas);
+  }
+
+  return {
+    mensaje: 'Saliste de la parada',
+    id_viaje,
+    id_parada: abierta.id_parada,
+    estado: 'EN_RUTA',
+    salida_real: ahora,
+    viaje_finalizado: false,
+  };
+}
+
+// Confirmar la llegada a una parada de un viaje INTERNO. La llama
+// POST /api/viajes/:id/confirmar-parada despues de sus validaciones comunes
+// (viaje 404, chofer 403, parada ajena 400, ya confirmada 400). Aca, en este
+// orden: estado EN_RUTA -> 400; es la SIGUIENTE en orden -> 400; proximidad ->
+// 400. Pasa a DESCARGANDO ("en una parada"). Confirmar la ultima ya NO
+// finaliza: finaliza el "salir" de la ultima.
+export async function confirmarParadaInterna({ io, viaje, parada, id_usuario, lat, lng }) {
+  if (viaje.estado !== 'EN_RUTA') {
+    if (ESTADOS_EN_PARADA_INTERNO.includes(viaje.estado)) {
+      throw new ErrorNegocio(400, 'Todavia estas en una parada: toca "Salir" antes de confirmar la siguiente');
+    }
+    throw new ErrorNegocio(400, 'El viaje debe estar en estado EN_RUTA para confirmar una parada');
+  }
+
+  const paradas = ordenadas(viaje.paradas);
+  const siguiente = paradas.find((p) => !p.llegada_real);
+  if (!siguiente || siguiente.id_parada !== parada.id_parada) {
+    throw new ErrorNegocio(400, `Primero tenes que confirmar la parada ${siguiente?.orden ?? '-'}`);
+  }
+
+  const radio_metros = parseFloat(process.env.RADIO_CONFIRMACION_METROS || '50');
+  const distancia_metros = distanciaMetros(lat, lng, parada);
+  if (distancia_metros > radio_metros) {
+    throw new ErrorNegocio(
+      400,
+      `Estas a ${Math.round(distancia_metros)}m de la parada. Debes estar a menos de ${radio_metros}m`
+    );
+  }
+  validarTransicion('EN_RUTA', 'DESCARGANDO', { ciclo: 'INTERNO', quien: 'CHOFER' });
+
+  const ahora = new Date();
+  await transaccion(async (tx) => {
+    const r = await tx.viaje.updateMany({
+      where: { id_viaje: viaje.id_viaje, estado: 'EN_RUTA', id_conductor: viaje.id_conductor },
+      data: { estado: 'DESCARGANDO' },
+    });
+    if (r.count === 0) throw conflicto();
+
+    // Ya con el lock del viaje: la anterior tiene que haber salido. De su salida
+    // sale el manejo real del tramo que llega a esta.
+    const anterior = await tx.parada.findFirst({
+      where: { id_viaje: viaje.id_viaje, orden: { lt: parada.orden } },
+      orderBy: { orden: 'desc' },
+      select: { salida_real: true },
+    });
+    if (!anterior?.salida_real) throw conflicto();
+
+    const p = await tx.parada.updateMany({
+      where: { id_parada: parada.id_parada, id_viaje: viaje.id_viaje, llegada_real: null },
+      data: {
+        llegada_real: ahora,
+        // Compatibilidad: fecha_entrega y estado ENTREGADO como siempre (el
+        // ETA y el conteo de pendientes van por estado).
+        fecha_entrega: ahora,
+        estado: 'ENTREGADO',
+        manejo_real_horas: (ahora.getTime() - anterior.salida_real.getTime()) / HORA_MS,
+      },
+    });
+    if (p.count === 0) throw conflicto();
+  });
+
+  await registrarCambioEstado({
+    id_viaje: viaje.id_viaje,
+    estado: 'DESCARGANDO',
+    id_usuario,
+    origen: ORIGEN_HISTORIAL.CHOFER,
+    fecha: ahora,
+  });
+
+  if (io) {
+    const salas = salasDeViaje(viaje);
+    io.to(salas).emit('viaje:estado_cambiado', {
+      id_viaje: viaje.id_viaje,
+      estado_anterior: 'EN_RUTA',
+      estado_nuevo: 'DESCARGANDO',
+      id_parada: parada.id_parada,
+    });
+    await etaSinTirar(io, viaje.id_viaje, salas);
+  }
+
+  return {
+    confirmada: true,
+    viaje_finalizado: false,
+    id_viaje: viaje.id_viaje,
+    id_parada: parada.id_parada,
+    estado: 'DESCARGANDO',
+    llegada_real: ahora,
   };
 }
 
@@ -673,6 +899,7 @@ async function cancelar({ io, viaje, quien, id_usuario, motivo }) {
 
   const causa = quien === 'CHOFER' ? 'CHOFER' : 'ORGANIZACION';
   const id_viaje = viaje.id_viaje;
+  const ahora = new Date();
 
   const estado_anterior = await transaccion(async (tx) => {
     const estadoReal = await bloquearViaje(tx, id_viaje);
@@ -699,6 +926,12 @@ async function cancelar({ io, viaje, quien, id_usuario, motivo }) {
     origen: ORIGEN_HISTORIAL[quien],
   });
   cancelarAvisoVencimiento(id_viaje);
+  // Cancelado EN CURSO: se guarda lo medido hasta ahora (la parada abierta se
+  // cierra en este instante para el calculo). ANTES de limpiar Redis: la
+  // distancia real sale del acumulado GPS. Nunca tira.
+  if (ESTADOS_CURSO_INTERNO.includes(estado_anterior)) {
+    await guardarMedicionParcial(id_viaje, ahora);
+  }
   await limpiarViajeActivo(id_viaje);
 
   emitirViajeInterno(
@@ -869,22 +1102,21 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
     }
   }
 
-  // Precio, zona y duracion se recalculan si cambian las paradas o la fecha
-  // (la fecha define la hora pico). Mismo calculo que al crear.
+  // Precio, zona, duracion (manejo + peon) y ruta se recalculan si cambian las
+  // paradas o la fecha (la fecha define la hora pico y el trafico de cada
+  // tramo). Mismo calculo que al crear, ANTES de la tx: si Google falla,
+  // ErrorMaps y no se modifica nada.
   let costo = {};
+  let recorrido = null;
   if (datos.paradas || datos.fecha_programada) {
-    let resultado;
-    try {
-      resultado = await estimarCosto({ paradas, fecha_programada: fecha_programada.toISOString() });
-    } catch {
-      throw new ErrorNegocio(503, 'No se pudo calcular la distancia');
-    }
+    const resultado = await estimarCosto({ paradas, fecha_programada: fecha_programada.toISOString() });
+    recorrido = resultado.recorrido;
     costo = {
       zona: resultado.zona,
       tarifa_hora: resultado.desglose.tarifa_hora,
       tarifa_km: resultado.desglose.tarifa_km,
       precio_estimado: resultado.precio_estimado,
-      duracion_estimada_horas: resultado.desglose.tiempo_horas,
+      ...columnasEstimadasViaje(recorrido.totales),
     };
   }
 
@@ -908,8 +1140,23 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
     if (datos.paradas) {
       await tx.parada.deleteMany({ where: { id_viaje } });
       await tx.parada.createMany({
-        data: paradasParaCrear(datos.paradas).map((p) => ({ ...p, id_viaje })),
+        data: conEstimacionPorParada(paradasParaCrear(datos.paradas), recorrido).map((p) => ({
+          ...p,
+          id_viaje,
+        })),
       });
+    } else if (recorrido) {
+      // Solo cambio la fecha: mismas paradas, estimacion nueva. Se releen
+      // dentro de la tx (ya con el lock del viaje) por si otra edicion las
+      // reemplazo en el medio.
+      const actuales = await tx.parada.findMany({ where: { id_viaje }, orderBy: { orden: 'asc' } });
+      if (actuales.length !== recorrido.paradas.length) throw conflicto();
+      for (const [i, p] of actuales.entries()) {
+        await tx.parada.update({
+          where: { id_parada: p.id_parada },
+          data: columnasEstimadasParada(recorrido.paradas[i]),
+        });
+      }
     }
     if (datos.condiciones_requeridas) {
       await tx.condicionRequerida.deleteMany({ where: { id_viaje } });
@@ -929,13 +1176,8 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
     });
   }
 
-  if (datos.paradas) {
-    try {
-      await calcularYGuardarRuta(id_viaje);
-    } catch (err) {
-      console.error(`[viaje-interno] No se pudo recalcular la ruta del viaje ${id_viaje}:`, err.message);
-    }
-  }
+  // La ruta de la estimacion nueva (sin otra llamada a Google).
+  if (recorrido) await guardarRutaSinTirar(id_viaje, recorrido.polilinea);
 
   // La fecha pudo cambiar: el vencimiento se reprograma siempre.
   programarVencimientoInterno(io, id_viaje, fecha_programada);

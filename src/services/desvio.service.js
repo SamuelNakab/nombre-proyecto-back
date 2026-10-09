@@ -2,7 +2,7 @@ import * as turf from '@turf/turf';
 import redis from '../config/redis.js';
 import prisma from '../config/prisma.js';
 import { guardarRuta } from './gps.service.js';
-import { obtenerRutaOptima } from './ruta.service.js';
+import { calcularRuta } from './maps/index.js';
 import { recalcularEtaInmediato } from './eta-emisor.js';
 
 export function verificarDesvio(lat, lng, rutaPolilinea) {
@@ -63,6 +63,10 @@ export async function manejarDesvio(io, id_viaje, lat, lng, ruta, salas = [`viaj
 // Recalcula la ruta desde la posicion actual del conductor hasta la ultima
 // parada pendiente (intermedias como waypoints), reemplaza la ruta en Redis,
 // emite ruta:recalculada y fuerza un recalculo de ETA inmediato.
+//
+// Si Google falla, se MANTIENE la ruta anterior (no hay ruta recta de
+// emergencia), se loguea y se marca el cooldown igual: durante una caida de
+// Google, sin cooldown se reintentaria en cada ping desviado.
 async function recalcularRutaPorDesvio(io, id_viaje, lat, lng, salas) {
   const pendientes = await prisma.parada.findMany({
     where: { id_viaje, estado: 'PENDIENTE' },
@@ -71,7 +75,16 @@ async function recalcularRutaPorDesvio(io, id_viaje, lat, lng, salas) {
   if (pendientes.length === 0) return { ok: false };
 
   const origen = { latitud: lat, longitud: lng };
-  const nuevaRuta = await obtenerRutaOptima([origen, ...pendientes]);
+  let nuevaRuta;
+  try {
+    nuevaRuta = await calcularRuta([origen, ...pendientes]);
+  } catch (err) {
+    console.error(
+      `[desvio.service] viaje ${id_viaje}: no se pudo recalcular la ruta, se mantiene la anterior (${err.detalle ?? err.message})`
+    );
+    await redis.set(`gps:${id_viaje}:ultimo_recalculo`, String(Date.now()), 'EX', 86400);
+    return { ok: false };
+  }
 
   await guardarRuta(id_viaje, nuevaRuta);
   await redis.set(`gps:${id_viaje}:ultimo_recalculo`, String(Date.now()), 'EX', 86400);

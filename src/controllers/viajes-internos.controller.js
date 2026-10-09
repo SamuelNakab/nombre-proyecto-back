@@ -5,8 +5,10 @@
 //           req.id_organizacion; cualquier miembro activo)
 // - Chofer: /api/choferes/viajes...             (rol CONDUCTOR)
 //
-// Avanzar estado y confirmar paradas NO tienen rutas nuevas: el chofer usa
-// PATCH /api/viajes/:id/estado y POST /api/viajes/:id/confirmar-parada.
+// Ciclo por parada (Paso 3): la llegada a cada parada se confirma con
+// POST /api/viajes/:id/confirmar-parada y la salida con
+// POST /api/choferes/viajes/:id/salir. PATCH /api/viajes/:id/estado NO aplica a
+// viajes internos.
 import { z } from 'zod';
 import { responderErrorNegocio } from '../services/error-negocio.js';
 import { calcularCostoAcumulado } from '../services/costo.service.js';
@@ -29,6 +31,7 @@ import {
   confirmarViaje as confirmarViajeSrv,
   rechazarViaje as rechazarViajeSrv,
   iniciarViajeInterno,
+  salirDeParada,
   cancelarViajeChofer as cancelarViajeChoferSrv,
   cancelarViajeOrganizacion,
   reasignarViaje as reasignarViajeSrv,
@@ -253,6 +256,13 @@ export const iniciarViaje = manejar(async (req, res) => {
     lng: parsed.data.lng,
   });
   return res.status(200).json(r);
+});
+
+// POST /api/choferes/viajes/:id/salir — sin body.
+export const salirDeParadaHttp = manejar(async (req, res) => {
+  const id_viaje = idViajeDe(req, res, 'id');
+  if (!id_viaje) return;
+  return res.status(200).json(await salirDeParada({ io, id_usuario: req.usuario.id_usuario, id_viaje }));
 });
 
 // POST /api/choferes/viajes/:id/cancelar

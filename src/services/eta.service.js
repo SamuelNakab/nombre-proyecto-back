@@ -1,63 +1,22 @@
 import prisma from '../config/prisma.js';
 import redis from '../config/redis.js';
-import * as turf from '@turf/turf';
+import { calcularEta } from './maps/index.js';
 
-// Fuente de verdad del ETA: Google Maps Directions API con trafico, desde la
-// posicion actual del conductor hasta la proxima parada PENDIENTE. El estado se
-// cachea en Redis para servir un countdown local entre recalculos con la API.
+// Fuente de verdad del ETA: la capa de Google (calcularEta, Routes API con el
+// trafico de ahora), desde la posicion actual del conductor hasta la proxima
+// parada PENDIENTE. El estado se cachea en Redis para servir un countdown local
+// entre recalculos con la API.
+//
+// Si Google falla, calcularEtaConApi TIRA (ErrorMaps): el emisor saltea ese
+// ciclo y no emite. Ya no hay estimacion por linea recta: un ETA inventado es
+// peor que ninguno.
 
 const keyEta = (id_viaje) => `gps:${id_viaje}:eta`;
 
-// Consulta a Google Maps Directions. Devuelve { segundos, distancia_metros }.
-// Si no hay API key o la llamada falla, cae a una estimacion por linea recta
-// (velocidad urbana promedio) para no dejar el ETA sin valor.
-async function consultarDirections(origenLat, origenLng, destinoLat, destinoLng) {
-  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
-
-  const fallback = () => {
-    const metros = turf.distance(
-      [origenLng, origenLat],
-      [destinoLng, destinoLat],
-      { units: 'meters' }
-    );
-    const velocidad_ms = 25000 / 3600; // 25 km/h promedio urbano
-    return { segundos: Math.round(metros / velocidad_ms), distancia_metros: Math.round(metros) };
-  };
-
-  if (!apiKey) {
-    console.warn('[eta.service] Sin GOOGLE_MAPS_API_KEY — ETA estimado por linea recta');
-    return fallback();
-  }
-
-  try {
-    const url = new URL('https://maps.googleapis.com/maps/api/directions/json');
-    url.searchParams.set('origin', `${origenLat},${origenLng}`);
-    url.searchParams.set('destination', `${destinoLat},${destinoLng}`);
-    url.searchParams.set('mode', 'driving');
-    url.searchParams.set('departure_time', 'now'); // considera trafico actual
-    url.searchParams.set('key', apiKey);
-
-    const response = await fetch(url.toString());
-    const data = await response.json();
-
-    if (data.status !== 'OK') throw new Error(data.status);
-    const leg = data.routes?.[0]?.legs?.[0];
-    if (!leg) throw new Error('Sin legs en la respuesta');
-
-    const segundos = leg.duration_in_traffic?.value ?? leg.duration?.value;
-    const distancia_metros = leg.distance?.value ?? 0;
-    if (segundos == null) throw new Error('Sin duration en la respuesta');
-
-    return { segundos, distancia_metros };
-  } catch (err) {
-    console.error('[eta.service] Error en Directions — estimando por linea recta:', err.message);
-    return fallback();
-  }
-}
-
 // Recalcula el ETA con la API y persiste el estado en Redis.
 // Devuelve { segundos_restantes, proxima_parada_id, distancia_restante_metros }
-// o null si el viaje no tiene paradas pendientes.
+// o null si el viaje no tiene paradas pendientes. TIRA ErrorMaps si Google
+// falla (no se escribe nada en Redis).
 export async function calcularEtaConApi(id_viaje, lat, lng) {
   const proxima = await prisma.parada.findFirst({
     where: { id_viaje, estado: 'PENDIENTE' },
@@ -65,9 +24,10 @@ export async function calcularEtaConApi(id_viaje, lat, lng) {
   });
   if (!proxima) return null;
 
-  const { segundos, distancia_metros } = await consultarDirections(
-    lat, lng, proxima.latitud, proxima.longitud
-  );
+  const { segundos, distancia_metros } = await calcularEta({
+    origen: { lat, lng },
+    destino: proxima,
+  });
 
   const estado = {
     segundos_eta_api: segundos,

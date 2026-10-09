@@ -5,6 +5,9 @@ import {
   calcularDuracionCargaMinutos,
   calcularDuracionDescargaMinutos,
   calcularDuracionAproximacionMinutos,
+  calcularMetricasViaje,
+  bloqueTiempos,
+  tiemposParada,
 } from './duracion.service.js';
 
 const T0 = new Date('2026-03-10T12:00:00.000Z');
@@ -165,5 +168,94 @@ describe('calcularDuracionAproximacionMinutos', () => {
     expect(() => calcularDuracionAproximacionMinutos({ fecha_inicio: en(0) })).toThrow(
       /fecha_inicio y fecha_llegada_origen/
     );
+  });
+});
+
+// ─── Paso 3: manejo / peon ───────────────────────────────────────────────────
+
+
+const columnas = (extra = {}) => ({
+  manejo_estimado_horas: 1,
+  peon_estimado_horas: 1.5,
+  distancia_estimada_km: 12,
+  manejo_real_horas: 1.25,
+  peon_real_horas: 1,
+  distancia_real_km: 13.4,
+  ...extra,
+});
+
+describe('bloqueTiempos', () => {
+  it('estimado siempre; real solo cuando termino', () => {
+    const fin = bloqueTiempos({ estado: 'FINALIZADO', ...columnas() });
+    expect(fin.estimado).toEqual({ manejo_horas: 1, peon_horas: 1.5, total_horas: 2.5, distancia_km: 12 });
+    expect(fin.real).toEqual({ manejo_horas: 1.25, peon_horas: 1, total_horas: 2.25, distancia_km: 13.4 });
+    expect(bloqueTiempos({ estado: 'EN_RUTA', ...columnas() }).real).toBeNull();
+  });
+
+  it('cancelado en curso trae lo medido; cancelado sin arrancar, real null', () => {
+    expect(bloqueTiempos({ estado: 'CANCELADO', ...columnas() }).real).not.toBeNull();
+    expect(
+      bloqueTiempos({ estado: 'CANCELADO', ...columnas({ manejo_real_horas: null, peon_real_horas: null }) }).real
+    ).toBeNull();
+  });
+
+  it('viaje anterior al Paso 3: estimado null', () => {
+    const viejo = columnas({ manejo_estimado_horas: null, peon_estimado_horas: null, distancia_estimada_km: null });
+    expect(bloqueTiempos({ estado: 'ASIGNADO', ...viejo }).estimado).toBeNull();
+  });
+
+  it('tira si faltan las columnas', () => {
+    expect(() => bloqueTiempos({ estado: 'FINALIZADO' })).toThrow(/columnas/);
+  });
+});
+
+describe('tiemposParada', () => {
+  it('minutos enteros y diferencia de llegada', () => {
+    expect(
+      tiemposParada({
+        peon_estimado_horas: 0.5,
+        manejo_estimado_horas: 40 / 60,
+        peon_real_horas: 0.3,
+        manejo_real_horas: null,
+        llegada_estimada: en(0),
+        llegada_real: en(7),
+      })
+    ).toEqual({ peon_estimado_min: 30, manejo_estimado_min: 40, peon_real_min: 18, manejo_real_min: null, diferencia_min: 7 });
+  });
+
+  it('sin llegada real: diferencia null', () => {
+    expect(tiemposParada({ llegada_estimada: en(0), llegada_real: null }).diferencia_min).toBeNull();
+  });
+});
+
+describe('calcularMetricasViaje — viaje interno (ciclo por parada)', () => {
+  const interno = (estado, paradas) => ({
+    id_organizacion: 3,
+    estado,
+    fecha_programada: en(0),
+    fecha_inicio: en(0),
+    fecha_llegada_origen: en(0),
+    paradas,
+    historial_estados: [],
+  });
+  const paradas = [
+    { orden: 1, llegada_real: en(0), salida_real: en(20) },
+    { orden: 2, llegada_real: en(50), salida_real: en(65) },
+    { orden: 3, llegada_real: en(90), salida_real: en(105) },
+  ];
+
+  it('duracion_real = llegada a la 1 -> salida de la ultima; carga / descarga = peon de la primera / ultima', () => {
+    const m = calcularMetricasViaje(interno('FINALIZADO', paradas));
+    expect(m.duracion_real).toBe(105);
+    expect(m.duracion_carga).toBe(20);
+    expect(m.duracion_descarga).toBe(15);
+  });
+
+  it('en curso: duracion_real null', () => {
+    expect(calcularMetricasViaje(interno('EN_RUTA', paradas)).duracion_real).toBeNull();
+  });
+
+  it('tira si las paradas no traen llegada_real', () => {
+    expect(() => calcularMetricasViaje(interno('FINALIZADO', [{ orden: 1 }]))).toThrow(/llegada_real/);
   });
 });

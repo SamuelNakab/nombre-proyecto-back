@@ -3,9 +3,11 @@
 //
 // NO pega contra :3000: levanta servers efimeros propios (_server-efimero.js).
 //   - 3601: el principal. Ventana 60/90, ANTICIPACION 0 (para crear viajes que
-//     se pueden iniciar ya), marketplace y calificaciones en false, sin Google
-//     (GOOGLE_MAPS_API_KEY vacia -> costo y ETA por mock / linea recta: no gasta
-//     cuota y el calculo de costo no cambio en este paso).
+//     se pueden iniciar ya), marketplace y calificaciones en false, peon 30.
+//     USA GOOGLE DE VERDAD (la GOOGLE_MAPS_API_KEY del .env): desde el Paso 3 no
+//     hay mock, sin Google no se puede crear un viaje. Cada viaje creado gasta
+//     (paradas - 1) llamadas Pro de Routes API; el total sale al final, sumando
+//     los logs [maps] de los servers efimeros.
 //   - 3602: el del vencimiento por TIMER, con VENTANA_INICIO_DESPUES_MINUTOS=0.05
 //     (3 segundos).
 // Los dos con RESERVA_BARRIDO_ARRANQUE=0 y VENCIMIENTO_BARRIDO_ARRANQUE=0: la DB
@@ -34,9 +36,14 @@
 //  16. Flags en false -> 404 (y el socket viaje:aceptar da error).
 //  17. Concurrencia (5 rondas c/u): confirmar vs cancelar, confirmar vs vencer,
 //      doble confirmar, reasignar vs confirmar, iniciar vs cancelar (chofer y
-//      PyME), desvincular vs iniciar, crear vs desvincular. SUBCASOS=17b,17d
-//      corre solo esas.
+//      PyME), desvincular vs iniciar, crear vs desvincular, doble salir, salir vs
+//      cancelar, confirmar parada vs cancelar. SUBCASOS=17b,17d corre solo esas.
 //  18. Admin: la organizacion del viaje en el detalle y la lista.
+//  19. Ciclo por parada (Paso 3): viaje de 4 paradas de punta a punta con
+//      esperas controladas; peon y manejo reales por parada y totales exactos
+//      contra las paradas y contra el historial (±1 s); orden obligatorio;
+//      confirmar la ultima ya no finaliza.
+//  20. Cancelar en curso guarda lo medido (manejando y en una parada).
 //
 // Acepta numeros de caso (el setup corre siempre):
 //   node scripts/test-viaje-interno.js 17
@@ -71,7 +78,7 @@ const ENV_BASE = {
   CALIFICACIONES_HABILITADAS: 'false',
   INVITACION_INTENTOS_MAX: '1000',
   RADIO_CONFIRMACION_METROS: '50',
-  GOOGLE_MAPS_API_KEY: '',
+  TIEMPO_PEON_MINUTOS: '30',
 };
 
 const SOLO = process.argv.slice(2).map(Number).filter(Number.isFinite);
@@ -89,6 +96,7 @@ const LIC = '2030-01-01T00:00:00.000Z';
 const ORIGEN = { lat: -34.6037, lng: -58.3816, direccion: 'Plaza de Mayo, CABA' };
 const DESTINO = { lat: -34.5895, lng: -58.3974, direccion: 'Recoleta, CABA' };
 const INTERMEDIA = { lat: -34.5975, lng: -58.3923, direccion: 'Tribunales, CABA' };
+const TERCERA = { lat: -34.5934, lng: -58.4011, direccion: 'Plaza Vicente Lopez, CABA' };
 const LEJOS = { lat: ORIGEN.lat + 0.01, lng: ORIGEN.lng }; // ~1100 m
 
 // EJEMPLOS_JSON=ruta: guarda respuestas y payloads reales de los pasos clave
@@ -274,6 +282,14 @@ const listaPyme = (u, idOrg, q = '') => api('GET', `/api/organizaciones/${idOrg}
 const listaChofer = (k, q = '') => api('GET', `/api/choferes/viajes${q}`, null, k.token);
 const detalleChofer = (k, id) => api('GET', `/api/choferes/viajes/${id}`, null, k.token);
 const avanzar = (k, id, estado) => api('PATCH', `/api/viajes/${id}/estado`, { estado }, k.token);
+const salir = (k, id) => api('POST', `/api/choferes/viajes/${id}/salir`, null, k.token);
+const paradasDb = (id) => prisma.parada.findMany({ where: { id_viaje: id }, orderBy: { orden: 'asc' } });
+const filasHistorial = (id) =>
+  prisma.historialEstadoViaje.findMany({ where: { id_viaje: id }, orderBy: [{ fecha: 'asc' }, { id_historial: 'asc' }] });
+const HORA = 3_600_000;
+const horasEntre = (a, b) => (b.getTime() - a.getTime()) / HORA;
+const cerca = (a, b, tol = 1e-9) => a !== null && b !== null && Math.abs(a - b) <= tol;
+const segs = (h) => (h * 3600).toFixed(2) + 's';
 const confirmarParada = (k, id, id_parada, pos) =>
   api('POST', `/api/viajes/${id}/confirmar-parada`, { id_parada, lat: pos.lat, lng: pos.lng }, k.token);
 const desvincular = (u, idOrg, k) => api('DELETE', `/api/organizaciones/${idOrg}/choferes/${k.id_conductor}`, null, u.token);
@@ -501,6 +517,30 @@ async function casosPrincipales(ctx) {
       paso('CASO 1g: viaje:asignado al chofer y a la sala de la PyME (otro miembro)', alChofer && aOtroMiembro, `chofer=${alChofer} miembro=${aOtroMiembro}`);
       ejemplo('evento_viaje_asignado', eventoDe(sK1, 'viaje:asignado', v.id_viaje));
       paso('CASO 1h: la otra PyME no recibe nada', !recibio(sQ1, 'viaje:asignado', v.id_viaje), '');
+
+      // Paso 3: estimados por viaje y por parada, guardados al crear.
+      const db = await viajeDb(v.id_viaje);
+      const ps = await paradasDb(v.id_viaje);
+      const okViaje =
+        db.manejo_estimado_horas > 0 && db.peon_estimado_horas === 1 && db.distancia_estimada_km > 0 &&
+        cerca(db.duracion_estimada_horas, db.manejo_estimado_horas + db.peon_estimado_horas, 1e-9);
+      const okParadas =
+        ps.length === 2 && ps.every((x) => x.peon_estimado_horas === 0.5) &&
+        ps[0].llegada_estimada?.getTime() === db.fecha_programada.getTime() &&
+        ps[0].manejo_estimado_horas === null && ps[1].manejo_estimado_horas > 0 && ps[1].distancia_estimada_km > 0 &&
+        ps[1].llegada_estimada > ps[0].salida_estimada;
+      paso(
+        'CASO 1i: crear guarda manejo / peon / distancia estimados por viaje y por parada',
+        okViaje && okParadas,
+        `manejo=${db.manejo_estimado_horas?.toFixed(3)}h peon=${db.peon_estimado_horas}h total=${db.duracion_estimada_horas?.toFixed(3)}h km=${db.distancia_estimada_km}`
+      );
+      paso(
+        'CASO 1j: la respuesta trae estimado, real null, paradas en minutos y la ruta planeada',
+        v.estimado?.peon_horas === 1 && v.real === null && v.paradas?.[0]?.peon_estimado_min === 30 &&
+          v.paradas?.[1]?.manejo_estimado_min !== null && v.duracion_estimada === Math.round(db.duracion_estimada_horas * 60) &&
+          Array.isArray(v.ruta_planeada) && v.ruta_planeada.length > 2,
+        JSON.stringify(v.estimado)
+      );
     }
   }
 
@@ -589,12 +629,14 @@ async function casosPrincipales(ctx) {
     const errAntes = await pingGps(sK1, id, ORIGEN);
     paso('CASO 5a: ping GPS en CONFIRMADO → "El viaje no fue iniciado"', errAntes?.error === 'El viaje no fue iniciado', JSON.stringify(errAntes));
     const patch = await avanzar(K1, id, 'CARGANDO');
-    paso('CASO 5b: PATCH /estado a CARGANDO no saltea el iniciar → 400', patch.status === 400, r2s(patch));
+    paso('CASO 5b: PATCH /estado no aplica a un viaje interno → 400', patch.status === 400 && /iniciar/.test(patch.data.error), r2s(patch));
     const r = await iniciar(K1, id);
     const db = await viajeDb(id);
+    const [o] = await paradasDb(id);
     paso(
-      'CASO 5c: iniciar en el origen → CARGANDO, fecha_inicio = fecha_llegada_origen',
-      r.status === 200 && db.estado === 'CARGANDO' && db.fecha_inicio?.getTime() === db.fecha_llegada_origen?.getTime() && db.iniciado_por === 'CONDUCTOR',
+      'CASO 5c: iniciar en el origen → CARGANDO, fecha_inicio = fecha_llegada_origen = llegada_real de la parada 1',
+      r.status === 200 && db.estado === 'CARGANDO' && db.fecha_inicio?.getTime() === db.fecha_llegada_origen?.getTime() && db.iniciado_por === 'CONDUCTOR' &&
+        o.llegada_real?.getTime() === db.fecha_inicio.getTime() && o.estado === 'ENTREGADO' && o.salida_real === null,
       r2s(r)
     );
     ejemplo('iniciar_200', r);
@@ -610,30 +652,55 @@ async function casosPrincipales(ctx) {
   }
 
   if (correr(6) && enCurso) {
-    titulo('CASO 6: ciclo completo hasta FINALIZADO');
+    titulo('CASO 6: ciclo completo hasta FINALIZADO (ciclo por parada)');
     const id = enCurso;
     const err = await pingGps(sK1, id, ORIGEN);
     const trackingPyme = await esperarEvento(sP2, 'mapa:actualizar', id);
     paso('CASO 6a: ping en CARGANDO → mapa:actualizar con id_viaje en la sala de la PyME', !err && trackingPyme, JSON.stringify(err));
     paso('CASO 6b: la otra PyME no recibe el tracking', !recibio(sQ1, 'mapa:actualizar', id), '');
     ejemplo('evento_mapa_actualizar', eventoDe(sP2, 'mapa:actualizar', id));
-    const enRuta = await avanzar(K1, id, 'EN_RUTA');
-    paso('CASO 6c: PATCH EN_RUTA → 200 y estado_cambiado a la PyME', enRuta.status === 200 && (await esperarEvento(sP1, 'viaje:estado_cambiado', id, 4000, (d) => d.estado_nuevo === 'EN_RUTA')), r2s(enRuta));
+    const patch = await avanzar(K1, id, 'EN_RUTA');
+    ejemplo('patch_estado_400_interno', patch);
+    paso('CASO 6c: PATCH /estado EN_RUTA en un viaje interno → 400 (se sale con "salir")', patch.status === 400 && /salir/.test(patch.data.error), r2s(patch));
+    const s1 = await salir(K1, id);
+    ejemplo('salir_200_en_ruta', s1);
+    paso(
+      'CASO 6d: salir del origen → EN_RUTA y estado_cambiado (con id_parada) a la PyME',
+      s1.status === 200 && s1.data.estado === 'EN_RUTA' && s1.data.viaje_finalizado === false &&
+        (await esperarEvento(sP1, 'viaje:estado_cambiado', id, 4000, (d) => d.estado_nuevo === 'EN_RUTA' && d.id_parada)),
+      r2s(s1)
+    );
     const det = await detallePyme(P1, A, id);
     const [p1, p2] = det.data.paradas;
     const c1 = await confirmarParada(K1, id, p1.id_parada, ORIGEN);
-    paso('CASO 6d: confirmar la parada 1 → 200, no finaliza', c1.status === 200 && c1.data.viaje_finalizado === false, r2s(c1));
-    await okOFalla(avanzar(K1, id, 'DESCARGANDO'), 'DESCARGANDO');
+    paso('CASO 6e: la parada 1 ya quedo confirmada al iniciar → 400', c1.status === 400 && /ya fue confirmada/.test(c1.data.error), r2s(c1));
+    // Un ping en el destino suma distancia al acumulado de Redis.
+    await pingGps(sK1, id, DESTINO);
     const c2 = await confirmarParada(K1, id, p2.id_parada, DESTINO);
-    paso('CASO 6e: confirmar la ultima → FINALIZADO con remito_url', c2.status === 200 && c2.data.viaje_finalizado === true && Boolean(c2.data.remito_url), r2s(c2));
-    paso('CASO 6f: viaje:finalizado a la PyME', await esperarEvento(sP2, 'viaje:finalizado', id), '');
+    ejemplo('confirmar_parada_200_interno', c2);
+    paso(
+      'CASO 6f: confirmar la ULTIMA ya NO finaliza → DESCARGANDO',
+      c2.status === 200 && c2.data.viaje_finalizado === false && (await viajeDb(id)).estado === 'DESCARGANDO',
+      r2s(c2)
+    );
+    const s2 = await salir(K1, id);
+    ejemplo('salir_200_finaliza', s2);
+    paso('CASO 6g: salir de la ultima → FINALIZADO con remito_url', s2.status === 200 && s2.data.viaje_finalizado === true && s2.data.estado === 'FINALIZADO' && Boolean(s2.data.remito_url), r2s(s2));
+    paso('CASO 6h: viaje:finalizado a la PyME con estimado y real', await esperarEvento(sP2, 'viaje:finalizado', id, 4000, (d) => d.estimado && d.real && d.paradas?.length === 2), '');
     const det2 = await detallePyme(P1, A, id);
     ejemplo('detalle_pyme_finalizado', det2);
     ejemplo('evento_viaje_finalizado', eventoDe(sP2, 'viaje:finalizado', id));
     paso(
-      'CASO 6g: detalle FINALIZADO con remito y metricas por etapa',
+      'CASO 6i: detalle FINALIZADO con remito y metricas por etapa',
       det2.data.estado === 'FINALIZADO' && det2.data.remito_url && det2.data.duracion_carga !== null && det2.data.duracion_descarga !== null && det2.data.duracion_real !== null,
       `carga=${det2.data.duracion_carga} descarga=${det2.data.duracion_descarga} real=${det2.data.duracion_real}`
+    );
+    const db = await viajeDb(id);
+    paso(
+      'CASO 6j: guarda manejo_real, peon_real y distancia_real (del acumulado GPS)',
+      db.manejo_real_horas > 0 && db.peon_real_horas > 0 && db.distancia_real_km > 1 &&
+        det2.data.real?.distancia_km === db.distancia_real_km && cerca(det2.data.real.total_horas, db.manejo_real_horas + db.peon_real_horas),
+      `manejo=${segs(db.manejo_real_horas)} peon=${segs(db.peon_real_horas)} km=${db.distancia_real_km?.toFixed(2)}`
     );
     const rem = await api('GET', `/api/organizaciones/${A}/viajes/${id}/remito`, null, P2.token);
     let pdf = 'sin R2_PUBLIC_URL';
@@ -641,14 +708,16 @@ async function casosPrincipales(ctx) {
       const f = await fetch(rem.data.remito_url, { method: 'HEAD' }).catch(() => null);
       pdf = f ? String(f.status) : 'fetch fallo';
     }
-    paso('CASO 6h: GET remito de la PyME → 200 y el PDF existe en R2', rem.status === 200 && pdf === '200', `${r2s(rem)} pdf=${pdf}`);
+    paso('CASO 6k: GET remito de la PyME → 200 y el PDF existe en R2', rem.status === 200 && pdf === '200', `${r2s(rem)} pdf=${pdf}`);
     const hist = await listaChofer(K1, '?grupo=historial');
     ejemplo('lista_chofer_historial_item', hist.data.find?.((v) => v.id_viaje === id));
     ejemplo('remito_pyme_200', rem);
     const enHist = hist.data.find?.((v) => v.id_viaje === id);
-    paso('CASO 6i: el chofer lo ve en su historial con el nombre de la PyME', Boolean(enHist?.organizacion?.nombre), enHist?.organizacion?.nombre ?? r2s(hist));
-    paso('CASO 6j: historial completo', (await historial(id)).join() === 'ASIGNADO:CLIENTE,CONFIRMADO:CONDUCTOR,CARGANDO:CONDUCTOR,EN_RUTA:CONDUCTOR,DESCARGANDO:CONDUCTOR,FINALIZADO:CONDUCTOR', (await historial(id)).join());
-    paso('CASO 6k: Redis limpio al cerrar', (await keysGps(id)) === 0, `keys=${await keysGps(id)}`);
+    paso('CASO 6l: el chofer lo ve en su historial con el nombre de la PyME', Boolean(enHist?.organizacion?.nombre), enHist?.organizacion?.nombre ?? r2s(hist));
+    paso('CASO 6m: historial completo', (await historial(id)).join() === 'ASIGNADO:CLIENTE,CONFIRMADO:CONDUCTOR,CARGANDO:CONDUCTOR,EN_RUTA:CONDUCTOR,DESCARGANDO:CONDUCTOR,FINALIZADO:CONDUCTOR', (await historial(id)).join());
+    paso('CASO 6n: Redis limpio al cerrar', (await keysGps(id)) === 0, `keys=${await keysGps(id)}`);
+    const otra = await salir(K1, id);
+    paso('CASO 6o: salir de un FINALIZADO → 400', otra.status === 400, r2s(otra));
   }
 
   // CASO 7 + 8 ---------------------------------------------------------------
@@ -687,6 +756,12 @@ async function casosPrincipales(ctx) {
     ejemplo('cancelar_pyme_200', c);
     ejemplo('evento_viaje_cancelado', eventoDe(sK1, 'viaje:cancelado', id2));
     paso('CASO 8c: viaje:cancelado al chofer', await esperarEvento(sK1, 'viaje:cancelado', id2, 4000, (d) => d.causa === 'ORGANIZACION'), '');
+    const [o2] = await paradasDb(id2);
+    paso(
+      'CASO 8f: cancelado en CARGANDO → peon parcial de la parada 1, sin salida_real, manejo 0',
+      db2.peon_real_horas > 0 && db2.manejo_real_horas === 0 && cerca(o2.peon_real_horas, db2.peon_real_horas) && o2.salida_real === null,
+      `peon=${segs(db2.peon_real_horas ?? 0)} manejo=${db2.manejo_real_horas}`
+    );
     const err = await pingGps(sK1, id2, ORIGEN);
     paso('CASO 8d: un ping despues de cancelar se ignora (sin error, sin keys)', !err && (await keysGps(id2)) === 0, JSON.stringify(err));
 
@@ -756,6 +831,25 @@ async function casosPrincipales(ctx) {
     paso('CASO 10c: condiciones que el chofer no cumple → 400', incompat.status === 400 && /Reasigna/.test(incompat.data.error), r2s(incompat));
     const vacio = await editar(P1, A, id, {});
     paso('CASO 10d: body vacio → 400', vacio.status === 400, r2s(vacio));
+
+    // Paso 3: editar recalcula los estimados (por viaje y por parada).
+    const ps3 = await paradasDb(id);
+    paso(
+      'CASO 10g: editar con 3 paradas → peon 1.5 h, 3 paradas con estimados, llegada de la 1 = la fecha nueva',
+      db.peon_estimado_horas === 1.5 && ps3.length === 3 && ps3.every((x) => x.peon_estimado_horas === 0.5 && x.llegada_estimada) &&
+        ps3[0].llegada_estimada.getTime() === db.fecha_programada.getTime() &&
+        cerca(db.duracion_estimada_horas, db.manejo_estimado_horas + 1.5) && r.data.estimado?.peon_horas === 1.5,
+      `manejo=${db.manejo_estimado_horas?.toFixed(3)} peon=${db.peon_estimado_horas}`
+    );
+    const nuevaFecha = enMin(45);
+    const soloFecha = await editar(P1, A, id, { fecha_programada: nuevaFecha });
+    const ps3b = await paradasDb(id);
+    paso(
+      'CASO 10h: editar solo la fecha → mismas paradas, estimados corridos a la fecha nueva',
+      soloFecha.status === 200 && ps3b.length === 3 && ps3b[0].id_parada === ps3[0].id_parada &&
+        ps3b[0].llegada_estimada.toISOString() === nuevaFecha && ps3b[2].llegada_estimada > ps3[2].llegada_estimada,
+      r2s(soloFecha).slice(0, 80)
+    );
     const reconf = await confirmar(K1, id, v1a);
     paso('CASO 10e: el chofer vuelve a confirmar con un vehiculo que cumple las condiciones nuevas', reconf.status === 200, r2s(reconf));
     await okOFalla(iniciar(K1, id), 'iniciar');
@@ -818,6 +912,8 @@ async function casosPrincipales(ctx) {
     );
     ejemplo('desvincular_200', r);
     paso('CASO 13b: Redis del viaje en curso limpio', keysAntes > 0 && (await keysGps(curso)) === 0, `antes=${keysAntes}`);
+    const dbCurso = await viajeDb(curso);
+    paso('CASO 13g: el viaje en curso guarda lo medido hasta la desvinculacion', dbCurso.peon_real_horas > 0 && dbCurso.manejo_real_horas === 0, `peon=${segs(dbCurso.peon_real_horas ?? 0)}`);
     const alChofer = await Promise.all(ids.map((id) => esperarEvento(ctx.sK5, 'viaje:cancelado', id, 4000, (d) => d.causa === 'DESVINCULACION')));
     const aPyme = await Promise.all(ids.map((id) => esperarEvento(sP1, 'viaje:cancelado', id, 4000, (d) => d.causa === 'DESVINCULACION')));
     paso('CASO 13c: viaje:cancelado al chofer y a la PyME por los 4', alChofer.every(Boolean) && aPyme.every(Boolean), `chofer=${alChofer} pyme=${aPyme}`);
@@ -934,6 +1030,13 @@ async function casosPrincipales(ctx) {
         det.data.organizacion?.id_organizacion === A && lista.status === 200 && lista.data.viajes.find((v) => v.id_viaje === id)?.organizacion?.id_organizacion === A,
         `${det.status} ${lista.status}`
       );
+      const enLista = lista.data.viajes.find((v) => v.id_viaje === id);
+      paso(
+        'CASO 18d: admin detalle y lista con el bloque estimado; paradas con minutos',
+        det.data.estimado?.peon_horas === 1 && det.data.real === null && enLista?.estimado?.peon_horas === 1 &&
+          det.data.paradas?.[1]?.manejo_estimado_min !== undefined,
+        JSON.stringify(det.data.estimado)
+      );
       ejemplo('admin_detalle_organizacion', { status: det.status, body: { id_viaje: det.data.id_viaje, organizacion: det.data.organizacion, creador: det.data.creador, causa_cancelacion: det.data.causa_cancelacion } });
       const canc = await api('POST', `/api/admin/viajes/${id}/cancelar`, { motivo: 'admin' }, tokenAdmin);
       const db = await viajeDb(id);
@@ -946,13 +1049,174 @@ async function casosPrincipales(ctx) {
       paso('CASO 18c: estadisticas cuenta los estados nuevos', est.status === 200 && 'VENCIDO' in est.data.viajes.por_estado, '');
     }
   }
+
+  if (correr(19)) await casoCicloPorParada(ctx);
+  if (correr(20)) await casoCancelarEnCurso(ctx);
+}
+
+// CASO 19: viaje de 4 paradas de punta a punta, con esperas controladas.
+async function casoCicloPorParada(ctx) {
+  const { P1, K1, A, v1a, sP1 } = ctx;
+  titulo('CASO 19: ciclo por parada — 4 paradas de punta a punta');
+  const PARADAS = [ORIGEN, INTERMEDIA, TERCERA, DESTINO];
+  const id = await crearOk(P1, A, { id_conductor: K1.id_conductor, paradas: PARADAS });
+  await okOFalla(confirmar(K1, id, v1a), 'confirmar');
+  const ps = await paradasDb(id);
+  const conf = (n) => confirmarParada(K1, id, ps[n - 1].id_parada, PARADAS[n - 1]);
+
+  // Cada accion se cronometra del lado del cliente. El server efimero corre en
+  // ESTA maquina (mismo reloj): el instante que guarda tiene que caer dentro de
+  // la ventana [envio, respuesta] de su propio pedido.
+  const ventanas = {};
+  const medir = async (clave, promesa) => {
+    const desde = Date.now();
+    const r = await promesa();
+    ventanas[clave] = [desde, Date.now()];
+    if (r.status !== 200) throw new Error(`${clave} fallo: ${r2s(r)}`);
+    return r;
+  };
+
+  await medir('llega1', () => iniciar(K1, id));
+  await esperar(1500);
+  await medir('sale1', () => salir(K1, id));
+  const desordenada = await conf(3);
+  ejemplo('confirmar_parada_400_orden', desordenada);
+  paso('CASO 19a: confirmar la parada 3 sin haber pasado por la 2 → 400', desordenada.status === 400 && /parada 2/.test(desordenada.data.error), r2s(desordenada));
+  await esperar(2000);
+  await medir('llega2', () => conf(2));
+  const enParada = await conf(3);
+  ejemplo('confirmar_parada_400_en_parada', enParada);
+  paso('CASO 19b: confirmar la siguiente sin salir de la actual → 400', enParada.status === 400 && /Salir/.test(enParada.data.error), r2s(enParada));
+  await medir('sale2', () => salir(K1, id));
+  const otraVez = await salir(K1, id);
+  paso('CASO 19c: salir manejando (EN_RUTA, sin parada abierta) → 400', otraVez.status === 400 && /ninguna parada/.test(otraVez.data.error), r2s(otraVez));
+  await esperar(1200);
+  await medir('llega3', () => conf(3));
+  await esperar(1000);
+  await medir('sale3', () => salir(K1, id));
+  await esperar(800);
+  const ultima = await medir('llega4', () => conf(4));
+  paso('CASO 19d: confirmar la ultima → DESCARGANDO, no finaliza', ultima.data.viaje_finalizado === false && ultima.data.estado === 'DESCARGANDO', r2s(ultima));
+  await esperar(1000);
+  const fin = await medir('sale4', () => salir(K1, id));
+  paso('CASO 19e: salir de la ultima → FINALIZADO', fin.data.estado === 'FINALIZADO', r2s(fin));
+
+  const db = await viajeDb(id);
+  const pf = await paradasDb(id);
+  const h = await filasHistorial(id);
+
+  // Exactos contra los timestamps de las paradas.
+  let okParadas = pf.every((p) => p.llegada_real && p.salida_real && cerca(p.peon_real_horas, horasEntre(p.llegada_real, p.salida_real)));
+  for (let i = 1; i < 4; i++) okParadas &&= cerca(pf[i].manejo_real_horas, horasEntre(pf[i - 1].salida_real, pf[i].llegada_real));
+  okParadas &&= pf[0].manejo_real_horas === null;
+  paso(
+    'CASO 19f: peon por parada = salida - llegada y manejo por tramo = llegada - salida anterior (exactos)',
+    okParadas,
+    pf.map((p) => `${p.orden}:peon=${segs(p.peon_real_horas)}/manejo=${p.manejo_real_horas === null ? '-' : segs(p.manejo_real_horas)}`).join(' ')
+  );
+  const sumaPeon = pf.reduce((a, p) => a + p.peon_real_horas, 0);
+  const sumaManejo = pf.slice(1).reduce((a, p) => a + p.manejo_real_horas, 0);
+  paso(
+    'CASO 19g: totales del viaje = sumas; total = llegada a la 1 -> salida de la 4',
+    cerca(db.peon_real_horas, sumaPeon) && cerca(db.manejo_real_horas, sumaManejo) &&
+      cerca(db.peon_real_horas + db.manejo_real_horas, horasEntre(pf[0].llegada_real, pf[3].salida_real)),
+    `manejo=${segs(db.manejo_real_horas)} peon=${segs(db.peon_real_horas)}`
+  );
+
+  // Contra el historial: CARGANDO, EN_RUTA, DESCARGANDO, ... FINALIZADO. Cada
+  // llegada / salida coincide con su fila (±1 s; el ciclo pasa el mismo
+  // instante, asi que en la practica la diferencia es 0).
+  const esperados = ['ASIGNADO', 'CONFIRMADO', 'CARGANDO', 'EN_RUTA', 'DESCARGANDO', 'EN_RUTA', 'DESCARGANDO', 'EN_RUTA', 'DESCARGANDO', 'FINALIZADO'];
+  const enCurso = h.slice(2).map((x) => x.fecha);
+  const marcas = pf.flatMap((p) => [p.llegada_real, p.salida_real]);
+  const difs = marcas.map((m, i) => Math.abs(m.getTime() - (enCurso[i]?.getTime() ?? 0)));
+  paso(
+    'CASO 19h: historial completo y cada llegada / salida coincide con su fila (±1 s)',
+    h.map((x) => x.estado).join() === esperados.join() && difs.every((d) => d <= 1000),
+    `${h.map((x) => x.estado).join(',')} | max dif ${Math.max(...difs)}ms`
+  );
+  // Tiempos controlados: cada instante guardado cae en la ventana de su pedido,
+  // y cada intervalo medido es >= la espera que hizo el test entre los dos.
+  const claves = ['llega1', 'sale1', 'llega2', 'sale2', 'llega3', 'sale3', 'llega4', 'sale4'];
+  const dentro = claves.every((c, i) => marcas[i].getTime() >= ventanas[c][0] && marcas[i].getTime() <= ventanas[c][1]);
+  const esperas = { 0: 1.5, 1: 2, 3: 1.2, 4: 1, 5: 0.8, 6: 1 }; // intervalo i = marcas[i] -> marcas[i+1]
+  const cumplen = Object.entries(esperas).every(([i, e]) => (marcas[+i + 1] - marcas[+i]) / 1000 >= e);
+  paso(
+    'CASO 19i: cada llegada / salida cae dentro de la ventana de su pedido y los intervalos cubren las esperas',
+    dentro && cumplen,
+    marcas.slice(1).map((m, i) => ((m - marcas[i]) / 1000).toFixed(2)).join(' ')
+  );
+  const det = await detallePyme(P1, A, id);
+  ejemplo('detalle_pyme_4_paradas', det);
+  paso(
+    'CASO 19j: el detalle trae real con los totales y duracion_real = real.total en minutos',
+    det.data.real && cerca(det.data.real.total_horas, db.manejo_real_horas + db.peon_real_horas) &&
+      det.data.duracion_real === Math.round(det.data.real.total_horas * 60) &&
+      det.data.paradas.every((p) => p.llegada_real && p.diferencia_min !== null),
+    JSON.stringify(det.data.real)
+  );
+  paso('CASO 19k: la PyME recibio estado_cambiado por cada llegada y salida', sP1.eventos.filter((e) => e.ev === 'viaje:estado_cambiado' && e.d?.id_viaje === id).length >= 7, '');
+}
+
+// CASO 20: cancelar en curso guarda lo medido.
+async function casoCancelarEnCurso(ctx) {
+  const { P1, K1, A, v1a } = ctx;
+  titulo('CASO 20: cancelar en curso guarda lo parcial');
+
+  // Manejando: salio del origen y no llego al destino.
+  const a = await crearOk(P1, A, { id_conductor: K1.id_conductor });
+  await okOFalla(confirmar(K1, a, v1a), 'confirmar');
+  await okOFalla(iniciar(K1, a), 'iniciar');
+  await esperar(1000);
+  await okOFalla(salir(K1, a), 'salir');
+  await esperar(1500);
+  // El fin de lo medido es el instante de la cancelacion: tiene que caer en la
+  // ventana [envio, respuesta] del pedido (mismo reloj: server local).
+  const desdeA = Date.now();
+  await okOFalla(cancelarPyme(P1, A, a), 'cancelar');
+  const hastaA = Date.now();
+  const dbA = await viajeDb(a);
+  const [oa, da] = await paradasDb(a);
+  const hA = await filasHistorial(a);
+  const cancA = hA.find((x) => x.estado === 'CANCELADO').fecha;
+  const finA = oa.salida_real.getTime() + dbA.manejo_real_horas * HORA;
+  paso(
+    'CASO 20a: cancelado manejando → peon del origen + manejo parcial hasta la cancelacion',
+    cerca(dbA.peon_real_horas, oa.peon_real_horas) && da.llegada_real === null && da.manejo_real_horas === null &&
+      finA >= desdeA && finA <= hastaA && Math.abs(finA - cancA.getTime()) <= 1000 && dbA.manejo_real_horas * 3600 >= 1.5,
+    `peon=${segs(dbA.peon_real_horas)} manejo=${segs(dbA.manejo_real_horas)} (fin dentro de la ventana del cancelar: ${finA >= desdeA && finA <= hastaA})`
+  );
+  const detA = await detallePyme(P1, A, a);
+  ejemplo('detalle_pyme_cancelado_en_curso', detA);
+  paso('CASO 20b: el detalle de un CANCELADO en curso trae real con lo medido', detA.data.real && detA.data.real.manejo_horas === dbA.manejo_real_horas, JSON.stringify(detA.data.real));
+
+  // En una parada: llego al destino y no salio.
+  const b = await crearOk(P1, A, { id_conductor: K1.id_conductor });
+  await okOFalla(confirmar(K1, b, v1a), 'confirmar');
+  await okOFalla(iniciar(K1, b), 'iniciar');
+  await okOFalla(salir(K1, b), 'salir');
+  const pb = await paradasDb(b);
+  await okOFalla(confirmarParada(K1, b, pb[1].id_parada, DESTINO), 'confirmar destino');
+  await esperar(1500);
+  const desdeB = Date.now();
+  await okOFalla(cancelarPyme(P1, A, b), 'cancelar');
+  const hastaB = Date.now();
+  const dbB = await viajeDb(b);
+  const [, db2] = await paradasDb(b);
+  const finB = db2.llegada_real.getTime() + db2.peon_real_horas * HORA;
+  paso(
+    'CASO 20c: cancelado EN una parada → la parada abierta se cierra en la cancelacion (sin salida_real)',
+    db2.salida_real === null && db2.peon_real_horas * 3600 >= 1.5 && finB >= desdeB && finB <= hastaB &&
+      db2.manejo_real_horas > 0 && cerca(dbB.manejo_real_horas, db2.manejo_real_horas),
+    `peon destino=${segs(db2.peon_real_horas ?? 0)} manejo=${segs(dbB.manejo_real_horas ?? 0)}`
+  );
 }
 
 // CASO 11: vencimiento por TIMER, en un server propio con ventana de 3 s.
 async function casoTimer(ctx) {
   titulo('CASO 11: vencimiento por timer (server 3602, VENTANA_INICIO_DESPUES_MINUTOS=0.05)');
   const { P1, K1, A, v1a } = ctx;
-  await conServer({ ...ENV_BASE, VENTANA_INICIO_DESPUES_MINUTOS: '0.05' }, PUERTO_TIMER, async (base) => {
+  await conServer({ ...ENV_BASE, VENTANA_INICIO_DESPUES_MINUTOS: '0.05' }, PUERTO_TIMER, async (base, leerLog) => {
     const sP = await espia(base, P1.token);
     const sK = await espia(base, K1.token);
     await esperar(1000);
@@ -978,6 +1242,7 @@ async function casoTimer(ctx) {
     paso('CASO 11c: viaje:vencido al chofer y a la PyME', evChofer && evPyme, `chofer=${evChofer} pyme=${evPyme}`);
     sP.socket.disconnect();
     sK.socket.disconnect();
+    sumarLlamadasMaps(leerLog());
   });
 }
 
@@ -1148,6 +1413,80 @@ async function casosConcurrencia(ctx) {
     }
     paso('CASO 17g: nunca queda un viaje vivo con un chofer desvinculado', ok, det.join(' '));
   }
+
+  // Un viaje de 2 paradas ya iniciado (CARGANDO, en la parada 1).
+  const iniciado = async () => {
+    const id = await crearOk(P1, A, { id_conductor: K1.id_conductor });
+    await okOFalla(confirmar(K1, id, v1a), 'confirmar');
+    await okOFalla(iniciar(K1, id), 'iniciar');
+    return id;
+  };
+
+  if (corre17('17h')) titulo('CASO 17h: doble salir');
+  if (corre17('17h')) {
+    let ok = true;
+    const det = [];
+    for (let r = 0; r < RONDAS; r++) {
+      const id = await iniciado();
+      // Rondas pares: doble salir del origen; impares: doble salir de la ultima.
+      const deLaUltima = r % 2 === 1;
+      if (deLaUltima) {
+        await okOFalla(salir(K1, id), 'salir');
+        const ps = await paradasDb(id);
+        await okOFalla(confirmarParada(K1, id, ps[1].id_parada, DESTINO), 'confirmar destino');
+      }
+      const rs = await Promise.all([salir(K1, id), salir(K1, id)]);
+      const db = await viajeDb(id);
+      const h = await historial(id);
+      const destino = deLaUltima ? 'FINALIZADO' : 'EN_RUTA';
+      const ganadores = rs.filter((x) => x.status === 200).length;
+      ok &&= ganadores === 1 && db.estado === destino && fila(h, destino) === 1;
+      det.push(`r${r + 1}(${deLaUltima ? 'ultima' : 'origen'}):${statuses(rs)}/${db.estado}/filas=${fila(h, destino)}`);
+      if (!deLaUltima) await cancelarPyme(P1, A, id);
+    }
+    paso('CASO 17h: un solo ganador y una sola fila (EN_RUTA o FINALIZADO)', ok, det.join(' '));
+  }
+
+  if (corre17('17i')) titulo('CASO 17i: salir vs cancelar (PyME)');
+  if (corre17('17i')) {
+    let ok = true;
+    const det = [];
+    for (let r = 0; r < RONDAS; r++) {
+      const id = await iniciado();
+      const [sal, canc] = await Promise.all([salir(K1, id), cancelarPyme(P1, A, id)]);
+      const db = await viajeDb(id);
+      const h = await historial(id);
+      const [o] = await paradasDb(id);
+      const coherente = canc.status === 200 && db.estado === 'CANCELADO' && fila(h, 'CANCELADO') === 1 &&
+        (sal.status === 200 ? h.at(-2) === 'EN_RUTA:CONDUCTOR' && o.salida_real !== null : fila(h, 'EN_RUTA') === 0 && o.salida_real === null);
+      ok &&= coherente;
+      det.push(`r${r + 1}:${sal.status}/${canc.status}/${db.estado}`);
+    }
+    paso('CASO 17i: siempre termina CANCELADO; la salida existe solo si el salir gano', ok, det.join(' '));
+  }
+
+  if (corre17('17j')) titulo('CASO 17j: confirmar parada vs cancelar (PyME)');
+  if (corre17('17j')) {
+    let ok = true;
+    const det = [];
+    for (let r = 0; r < RONDAS; r++) {
+      const id = await iniciado();
+      await okOFalla(salir(K1, id), 'salir');
+      const ps = await paradasDb(id);
+      const [conf, canc] = await Promise.all([
+        confirmarParada(K1, id, ps[1].id_parada, DESTINO),
+        cancelarPyme(P1, A, id),
+      ]);
+      const db = await viajeDb(id);
+      const h = await historial(id);
+      const [, d] = await paradasDb(id);
+      const coherente = canc.status === 200 && db.estado === 'CANCELADO' && fila(h, 'CANCELADO') === 1 &&
+        (conf.status === 200 ? h.at(-2) === 'DESCARGANDO:CONDUCTOR' && d.llegada_real !== null : fila(h, 'DESCARGANDO') === 0 && d.llegada_real === null);
+      ok &&= coherente;
+      det.push(`r${r + 1}:${conf.status}/${canc.status}/${db.estado}`);
+    }
+    paso('CASO 17j: siempre termina CANCELADO; la llegada existe solo si el confirmar gano', ok, det.join(' '));
+  }
 }
 
 // -- Main ---------------------------------------------------------------------
@@ -1164,17 +1503,29 @@ async function limpiarRestos() {
   return limpiar(usuarios.map((u) => u.email), '-vin-');
 }
 
+// Llamadas a Google por SKU: el ultimo contador que loguea cada server efimero
+// ("[maps] ... (PRO=12 ESSENTIALS=3)").
+const llamadasMaps = {};
+function sumarLlamadasMaps(log) {
+  const ultimos = [...log.matchAll(/\[maps\][^\n]*\(([A-Z]+=\d+(?: [A-Z]+=\d+)*)\)/g)].at(-1);
+  if (!ultimos) return;
+  for (const par of ultimos[1].split(' ')) {
+    const [sku, n] = par.split('=');
+    llamadasMaps[sku] = (llamadasMaps[sku] ?? 0) + Number(n);
+  }
+}
+
 async function main() {
   if (process.argv.includes('--restos')) return limpiarRestos();
   console.log('\n╔══════════════════════════════════════════════╗');
-  console.log('║      TEST VIAJE INTERNO (PASO 2) — FLETER    ║');
+  console.log('║   TEST VIAJE INTERNO (PASOS 2 y 3) — FLETER  ║');
   console.log('╚══════════════════════════════════════════════╝\n');
   if (SOLO.length > 0) console.log(`  (solo los casos ${SOLO.join(', ')})\n`);
   if (!process.env.INVITACION_SECRETO) throw new Error('Falta INVITACION_SECRETO en el .env local');
 
   let limpio = false;
   try {
-    await conServer(ENV_BASE, PUERTO, async (base) => {
+    await conServer(ENV_BASE, PUERTO, async (base, leerLog) => {
       BASE = base;
       titulo('SETUP');
       const [P1, P2, Q1] = await nuevosUsuarios('cliente', 'Pym', 3);
@@ -1202,6 +1553,7 @@ async function main() {
       const ctx = { P1, P2, Q1, K1, K2, K3, K4, K5, K6, K7, A, B, v1a, v1b, v2, v5, v6, sP1, sP2, sQ1, sK1, sK2, sK5 };
       await casosPrincipales(ctx);
       await casosConcurrencia(ctx);
+      sumarLlamadasMaps(leerLog());
       if (correr(11)) await casoTimer(ctx);
     });
   } finally {
@@ -1220,6 +1572,7 @@ async function main() {
 
   const ok = pasos.filter((p) => p.ok).length;
   const fallaron = pasos.filter((p) => !p.ok);
+  console.log(`\n  llamadas a Google (por SKU): ${JSON.stringify(llamadasMaps)}`);
   console.log('\n╔══════════════════════════════════════════════╗');
   console.log('║                  RESUMEN                     ║');
   console.log('╚══════════════════════════════════════════════╝\n');

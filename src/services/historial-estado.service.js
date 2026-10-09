@@ -52,7 +52,12 @@ export const INCLUDE_HISTORIAL = {
 //   updateMany condicionados, recien despues de verificar count > 0.
 // - Siempre FUERA de la $transaction. Adentro, un fallo del historial haria
 //   rollback del cambio de estado — exactamente lo contrario de lo que queremos.
-export async function registrarCambioEstado({ id_viaje, estado, id_usuario, origen }) {
+//
+// `fecha` (opcional): el instante del cambio. Sin ella, el del insert. El ciclo
+// por parada (Paso 3) la pasa para que la fila del historial y la
+// llegada_real / salida_real de la parada sean EXACTAMENTE el mismo instante
+// (el insert va despues de la tx y, contra Neon, puede llegar 1 s mas tarde).
+export async function registrarCambioEstado({ id_viaje, estado, id_usuario, origen, fecha }) {
   try {
     await prisma.historialEstadoViaje.create({
       data: {
@@ -60,6 +65,7 @@ export async function registrarCambioEstado({ id_viaje, estado, id_usuario, orig
         estado,
         id_usuario: id_usuario ?? null,
         origen: origen ?? null,
+        ...(fecha ? { fecha } : {}),
       },
     });
     return true;

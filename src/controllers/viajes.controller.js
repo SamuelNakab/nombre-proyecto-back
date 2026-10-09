@@ -2,8 +2,11 @@ import { z } from 'zod';
 import prisma from '../config/prisma.js';
 import {
   estimarCosto as estimarCostoService,
+  serializarEstimacion,
   calcularCostoAcumulado,
 } from '../services/costo.service.js';
+import { columnasEstimadasViaje, conEstimacionPorParada } from '../services/estimacion.service.js';
+import { responderErrorNegocio } from '../services/error-negocio.js';
 import { conductorEsElegible } from '../services/elegibilidad.service.js';
 import { publicarViajeAConductoresElegibles } from '../services/matching.service.js';
 import { cerrarViaje } from '../services/cierre.service.js';
@@ -13,7 +16,7 @@ import {
   programarTimeoutReserva,
   cancelarTimeoutReserva,
 } from '../services/reserva.service.js';
-import { calcularYGuardarRuta, obtenerRutaPlaneada } from '../services/ruta.service.js';
+import { guardarRutaPlaneada, obtenerRutaPlaneada } from '../services/ruta.service.js';
 import { validarTransicion, cicloDe } from '../services/estado-viaje.service.js';
 import { ventanaInicioAntesMinutosLegacy } from '../services/ventana-inicio.js';
 import { salasDeViaje } from '../sockets/salas.js';
@@ -24,6 +27,7 @@ import {
   INCLUDE_HISTORIAL,
 } from '../services/historial-estado.service.js';
 import { distanciaMetros } from '../services/parada.service.js';
+import { confirmarParadaInterna } from '../services/viaje-interno.service.js';
 import {
   esViajeVencido,
   programarAvisoVencimiento,
@@ -69,11 +73,12 @@ export async function estimarCosto(req, res) {
   const { paradas, fecha_programada } = parsed.data;
   const fechaEfectiva = fecha_programada ?? new Date().toISOString();
 
+  // Si Google falla: 503 (o 400 si no hay ruta posible) via ErrorMaps.
   try {
     const resultado = await estimarCostoService({ paradas, fecha_programada: fechaEfectiva });
-    return res.status(200).json(resultado);
-  } catch {
-    return res.status(503).json({ error: 'No se pudo calcular la distancia' });
+    return res.status(200).json(serializarEstimacion(resultado));
+  } catch (err) {
+    return responderErrorNegocio(res, err);
   }
 }
 
@@ -94,11 +99,13 @@ export async function crearViaje(req, res) {
     return res.status(400).json({ error: 'El usuario no tiene perfil de cliente' });
   }
 
+  // Antes de escribir nada: si Google falla, 503 (o 400 sin ruta) y no se crea
+  // el viaje.
   let resultado;
   try {
     resultado = await estimarCostoService({ paradas, fecha_programada });
-  } catch {
-    return res.status(503).json({ error: 'No se pudo calcular la distancia' });
+  } catch (err) {
+    return responderErrorNegocio(res, err);
   }
 
   const { tarifa_hora, tarifa_km } = resultado.desglose;
@@ -112,11 +119,10 @@ export async function crearViaje(req, res) {
       fecha_programada: new Date(fecha_programada),
       descripcion: descripcion ?? null,
       precio_estimado: resultado.precio_estimado,
-      // Mismo tiempo_horas que se acaba de usar para estimar el precio. Se
-      // persiste (en HORAS) para que el detalle del viaje pueda devolver la
-      // duracion estimada sin volver a pegarle a Google en cada lectura.
-      duracion_estimada_horas: resultado.desglose.tiempo_horas,
-      paradas: { create: paradasParaCrear(paradas) },
+      // Duracion TOTAL (manejo + peon), manejo, peon y distancia de la MISMA
+      // estimacion que el precio, en HORAS / km. Ver estimacion.service.
+      ...columnasEstimadasViaje(resultado.recorrido.totales),
+      paradas: { create: conEstimacionPorParada(paradasParaCrear(paradas), resultado.recorrido) },
       condiciones_req: {
         create: condiciones_requeridas.map((condicion) => ({ condicion })),
       },
@@ -137,15 +143,9 @@ export async function crearViaje(req, res) {
     origen: 'CLIENTE',
   });
 
-  // Calcular la ruta planeada ahora, al crear el viaje. Si Google Maps falla,
-  // no bloqueamos la creacion: ruta_planeada queda null y se reintenta en el
-  // primer ping GPS (fallback en gps.socket.js).
-  let ruta_planeada = null;
-  try {
-    ruta_planeada = await calcularYGuardarRuta(viaje.id_viaje);
-  } catch (err) {
-    console.error(`[crearViaje] No se pudo calcular la ruta planeada para viaje ${viaje.id_viaje}:`, err.message);
-  }
+  // Ruta planeada: la polilinea de los tramos de la estimacion (sin otra
+  // llamada a Google). Misma key de Redis y mismo formato [lng, lat].
+  const ruta_planeada = await guardarRutaPlaneada(viaje.id_viaje, resultado.recorrido.polilinea);
 
   // Aviso de vencimiento: un setTimeout propio de ESTE viaje que dispara en su
   // fecha_programada y, si para entonces el viaje sigue colgado, emite
@@ -299,6 +299,9 @@ export async function obtenerViaje(req, res) {
   });
 }
 
+const MENSAJE_PATCH_INTERNO =
+  'En un viaje de PyME el estado cambia con iniciar (POST /api/choferes/viajes/:id/iniciar), confirmar parada (POST /api/viajes/:id/confirmar-parada) y salir (POST /api/choferes/viajes/:id/salir)';
+
 export async function cambiarEstado(req, res) {
   const schema = z.object({ estado: z.enum(['CARGANDO', 'DESCARGANDO', 'EN_RUTA']) });
   const parsed = schema.safeParse(req.body);
@@ -318,21 +321,18 @@ export async function cambiarEstado(req, res) {
     return res.status(403).json({ error: 'No sos el conductor de este viaje' });
   }
 
+  // Viaje INTERNO: este endpoint NO aplica. Desde el Paso 3 (ciclo por
+  // parada) todo cambio de estado va por iniciar, confirmar parada y salir,
+  // que registran la llegada y la salida de cada parada.
+  if (cicloDe(viaje) === 'INTERNO') {
+    return res.status(400).json({ error: MENSAJE_PATCH_INTERNO });
+  }
+
   // La maquina de estados es la unica fuente de verdad de que transiciones son
   // validas. Reemplaza el viejo chequeo ad-hoc de FINALIZADO/CANCELADO y ademas
   // rechaza retrocesos (p. ej. EN_RUTA -> CARGANDO).
-  //
-  // Viaje INTERNO: tabla del ciclo interno, y este endpoint solo AVANZA
-  // (EN_RUTA, DESCARGANDO). CARGANDO se alcanza unicamente por
-  // POST /api/choferes/viajes/:id/iniciar, que valida ventana y proximidad.
-  const interno = cicloDe(viaje) === 'INTERNO';
-  if (interno && estado === 'CARGANDO') {
-    return res.status(400).json({
-      error: 'En un viaje de PyME, CARGANDO se alcanza iniciando el viaje (POST /api/choferes/viajes/:id/iniciar)',
-    });
-  }
   try {
-    validarTransicion(viaje.estado, estado, interno ? { ciclo: 'INTERNO', quien: 'CHOFER' } : undefined);
+    validarTransicion(viaje.estado, estado);
   } catch (err) {
     return res.status(400).json({ error: err.message });
   }
@@ -755,6 +755,25 @@ export async function confirmarParada(req, res) {
     return res.status(400).json({ error: 'La parada ya fue confirmada' });
   }
 
+  // Viaje INTERNO (ciclo por parada, Paso 3): solo en EN_RUTA, solo la
+  // SIGUIENTE parada en orden, y pasa a DESCARGANDO; confirmar la ultima ya no
+  // finaliza (finaliza el "salir" de la ultima). Ver viaje-interno.service.
+  if (cicloDe(viaje) === 'INTERNO') {
+    try {
+      const r = await confirmarParadaInterna({
+        io,
+        viaje,
+        parada,
+        id_usuario: req.usuario.id_usuario,
+        lat,
+        lng,
+      });
+      return res.status(200).json(r);
+    } catch (err) {
+      return responderErrorNegocio(res, err);
+    }
+  }
+
   if (viaje.estado !== 'EN_RUTA' && viaje.estado !== 'DESCARGANDO') {
     return res.status(400).json({ error: 'El viaje debe estar en estado EN_RUTA o DESCARGANDO' });
   }
@@ -961,6 +980,8 @@ export async function listarMisViajesConductor(req, res) {
       // pedirlos a mano o calcularMetricasViaje tira.
       fecha_inicio: true,
       fecha_llegada_origen: true,
+      // calcularMetricasViaje elige el ciclo por este campo (siempre null aca).
+      id_organizacion: true,
       paradas: {
         select: { orden: true, direccion: true, estado: true, fecha_entrega: true },
         orderBy: { orden: 'asc' },

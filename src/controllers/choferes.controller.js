@@ -28,14 +28,17 @@ export async function desvincularme(req, res) {
   const conductor = await conductorDe(req.usuario.id_usuario);
   if (!conductor) return res.status(400).json({ error: 'El usuario no tiene perfil de conductor' });
   try {
-    // Mismo servicio: cancela tus viajes no finales con esa PyME.
-    const viajes_cancelados = await desvincularChofer({
+    // Mismo servicio: cancela tus viajes no finales con esa PyME y pasa a
+    // BORRADA tus series activas con ella.
+    const { viajes_cancelados, series_borradas } = await desvincularChofer({
       id_organizacion,
       id_conductor: conductor.id_conductor,
       actor: { id_usuario: req.usuario.id_usuario, origen: 'CHOFER' },
       io,
     });
-    return res.status(200).json({ mensaje: 'Te desvinculaste de la PyME', id_organizacion, viajes_cancelados });
+    return res
+      .status(200)
+      .json({ mensaje: 'Te desvinculaste de la PyME', id_organizacion, viajes_cancelados, series_borradas });
   } catch (err) {
     return responderErrorNegocio(res, err);
   }

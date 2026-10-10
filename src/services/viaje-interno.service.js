@@ -20,7 +20,9 @@
 // orden de locks es siempre vinculo -> viaje: no hay deadlock posible.
 import prisma from '../config/prisma.js';
 import { ErrorNegocio } from './error-negocio.js';
-import { OPCIONES_TX } from './organizacion.service.js';
+import { OPCIONES_TX, exigirPymeOperativa } from './organizacion.service.js';
+import { resolverParadas } from './lugar.service.js';
+import { paradaVistaChofer, paradaVistaPyme } from './vista-parada.js';
 import { estimarCosto } from './costo.service.js';
 import {
   columnasEstimadasViaje,
@@ -95,9 +97,14 @@ export const GRUPOS_CHOFER = {
   historial: ESTADOS_TERMINALES,
 };
 
-// El include de todo lo que devuelve un viaje interno (listas y detalle).
-const INCLUDE_VIAJE_INTERNO = {
-  paradas: { orderBy: { orden: 'asc' } },
+// El include de todo lo que devuelve un viaje interno (listas y detalle). Trae
+// el lugar guardado de cada parada para la PyME; serializarViajeChofer lo saca
+// (el chofer nunca ve el nombre del lugar, ver vista-parada.js).
+export const INCLUDE_VIAJE_INTERNO = {
+  paradas: {
+    orderBy: { orden: 'asc' },
+    include: { lugar: { select: { id_lugar: true, nombre: true, activo: true } } },
+  },
   condiciones_req: true,
   organizacion: { select: { id_organizacion: true, nombre: true, cuit: true } },
   creador: { select: { id_usuario: true, nombre: true, apellido: true } },
@@ -140,6 +147,8 @@ const vehiculosPropios = (db, id_conductor) =>
 
 const listaCondiciones = (condiciones) => (condiciones.length ? `: ${condiciones.join(', ')}` : '');
 
+export { exigirPymeOperativa };
+
 export async function conductorDe(id_usuario) {
   const conductor = await prisma.conductor.findUnique({
     where: { id_usuario },
@@ -149,23 +158,10 @@ export async function conductorDe(id_usuario) {
   return conductor.id_conductor;
 }
 
-// 403 si la PyME esta SUSPENDIDA: no puede generar trabajo nuevo (crear,
-// editar, reasignar). Cancelar sigue permitido.
-async function exigirPymeOperativa(id_organizacion) {
-  const org = await prisma.organizacion.findUnique({
-    where: { id_organizacion },
-    select: { estado: true },
-  });
-  if (!org) throw new ErrorNegocio(404, 'PyME no encontrada');
-  if (org.estado === 'SUSPENDIDA') {
-    throw new ErrorNegocio(403, 'La PyME esta suspendida: no puede crear ni modificar viajes');
-  }
-}
-
 // El chofer puede recibir este viaje: vinculo ACTIVO con la PyME y al menos un
 // vehiculo propio que cumpla las condiciones. Las mismas validaciones al crear,
-// reasignar y editar.
-async function validarChoferAsignable(id_organizacion, id_conductor, condiciones) {
+// reasignar y editar (y una vez por serie).
+export async function validarChoferAsignable(id_organizacion, id_conductor, condiciones) {
   const vinculo = await prisma.vinculoChofer.findFirst({
     where: { id_organizacion, id_conductor, activo: true },
     select: { id_vinculo: true },
@@ -186,7 +182,7 @@ async function validarChoferAsignable(id_organizacion, id_conductor, condiciones
 
 // Lock del vinculo ACTIVO (FOR UPDATE). Devuelve su metodo de cobro, o null si
 // ya no esta activo (lo cortaron entre la validacion previa y la tx).
-async function bloquearVinculoActivo(tx, id_organizacion, id_conductor) {
+export async function bloquearVinculoActivo(tx, id_organizacion, id_conductor) {
   const filas = await tx.$queryRaw`
     SELECT id_vinculo, metodo_cobro::text AS metodo_cobro
     FROM vinculos_chofer
@@ -205,7 +201,7 @@ async function bloquearViaje(tx, id_viaje) {
   return filas[0]?.estado ?? null;
 }
 
-async function transaccion(fn) {
+export async function transaccion(fn) {
   return prisma.$transaction(fn, OPCIONES_TX);
 }
 
@@ -217,7 +213,7 @@ function mensajeEstado(accion, estado) {
   return `No se puede ${accion} un viaje en estado ${estado}`;
 }
 
-async function guardarRutaSinTirar(id_viaje, polilinea) {
+export async function guardarRutaSinTirar(id_viaje, polilinea) {
   try {
     return await guardarRutaPlaneada(id_viaje, polilinea);
   } catch (err) {
@@ -232,17 +228,19 @@ const remitoUrl = (id_viaje) => `${process.env.R2_PUBLIC_URL}/remitos/${id_viaje
 
 // ─── Serializacion ───────────────────────────────────────────────────────────
 
-// Lo que devuelven las listas y el detalle, para la PyME y para el chofer. La
-// fila cruda + los campos calculados en el read (mismos que los canales
-// legacy): duracion_estimada (el TOTAL, manejo + peon), las cinco metricas
-// (puntualidad incluida, que pisa a la columna MUERTA del mismo nombre),
-// vencido, los bloques estimado / real y, en cada parada, sus tiempos en
-// minutos (ver duracion.service).
-export function serializarViajeInterno(viaje) {
+// Lo que devuelven las listas y el detalle. La fila cruda + los campos
+// calculados en el read (mismos que los canales legacy): duracion_estimada (el
+// TOTAL, manejo + peon), las cinco metricas (puntualidad incluida, que pisa a la
+// columna MUERTA del mismo nombre), vencido, los bloques estimado / real y, en
+// cada parada, sus tiempos en minutos (ver duracion.service).
+//
+// DOS vistas (Paso 4): la PyME ve el lugar guardado de cada parada (su nombre
+// actual); el chofer NO: sus paradas salen sin lugar ni id_lugar.
+function serializarViaje(viaje, vistaParada) {
   const { condiciones_req, conductor, ...resto } = viaje;
   return {
     ...resto,
-    paradas: paradasConTiempos(viaje.paradas),
+    paradas: paradasConTiempos(viaje.paradas).map(vistaParada),
     ...bloqueTiempos(viaje),
     condiciones_requeridas: condiciones_req.map((c) => c.condicion),
     conductor: conductor
@@ -261,8 +259,13 @@ export function serializarViajeInterno(viaje) {
   };
 }
 
-// Payload compacto de los eventos de socket.
-function resumenViaje(viaje) {
+export const serializarViajePyme = (viaje) => serializarViaje(viaje, paradaVistaPyme);
+export const serializarViajeChofer = (viaje) => serializarViaje(viaje, paradaVistaChofer);
+
+// Payload compacto de los eventos de socket. Lo reciben la PyME Y el chofer en
+// el MISMO emit: las paradas van con campos EXPLICITOS y NUNCA con el lugar
+// guardado (el chofer no ve su nombre). La PyME lo ve por REST.
+export function resumenViaje(viaje) {
   return {
     id_viaje: viaje.id_viaje,
     id_organizacion: viaje.id_organizacion,
@@ -273,6 +276,7 @@ function resumenViaje(viaje) {
     fecha_programada: viaje.fecha_programada,
     precio_estimado: viaje.precio_estimado,
     descripcion: viaje.descripcion,
+    id_serie: viaje.id_serie ?? null,
     paradas: viaje.paradas.map((p) => ({
       id_parada: p.id_parada,
       orden: p.orden,
@@ -284,7 +288,7 @@ function resumenViaje(viaje) {
   };
 }
 
-const leerViaje = (id_viaje) =>
+export const leerViaje = (id_viaje) =>
   prisma.viaje.findUnique({ where: { id_viaje }, include: INCLUDE_VIAJE_INTERNO });
 
 const destinosDe = (viaje) => ({
@@ -310,7 +314,7 @@ export async function listarViajesOrganizacion(io, id_organizacion, filtros = {}
     include: INCLUDE_VIAJE_INTERNO,
     orderBy: [{ fecha_programada: 'desc' }, { id_viaje: 'desc' }],
   });
-  return viajes.map(serializarViajeInterno);
+  return viajes.map(serializarViajePyme);
 }
 
 // Un viaje de OTRA PyME da 404, igual que uno que no existe: no se filtran ids.
@@ -323,7 +327,7 @@ async function viajeDeOrganizacion(id_organizacion, id_viaje, include = INCLUDE_
 export async function obtenerViajeOrganizacion(io, id_organizacion, id_viaje) {
   await vencerSiCorresponde(io, { id_viaje, id_organizacion });
   const viaje = await viajeDeOrganizacion(id_organizacion, id_viaje);
-  return { ...serializarViajeInterno(viaje), ruta_planeada: await obtenerRutaPlaneada(id_viaje) };
+  return { ...serializarViajePyme(viaje), ruta_planeada: await obtenerRutaPlaneada(id_viaje) };
 }
 
 // El chofer ve SOLO sus viajes internos, de todas sus PyMEs, cada uno con el
@@ -340,7 +344,7 @@ export async function listarViajesChofer(io, id_usuario, filtros = {}) {
     include: INCLUDE_VIAJE_INTERNO,
     orderBy: [{ fecha_programada: 'asc' }, { id_viaje: 'asc' }],
   });
-  return viajes.map(serializarViajeInterno);
+  return viajes.map(serializarViajeChofer);
 }
 
 async function viajeDeChofer(id_conductor, id_viaje, include = INCLUDE_VIAJE_INTERNO) {
@@ -356,7 +360,7 @@ export async function obtenerViajeChofer(io, id_usuario, id_viaje) {
   const id_conductor = await conductorDe(id_usuario);
   await vencerSiCorresponde(io, { id_viaje, id_conductor });
   const viaje = await viajeDeChofer(id_conductor, id_viaje);
-  return { ...serializarViajeInterno(viaje), ruta_planeada: await obtenerRutaPlaneada(id_viaje) };
+  return { ...serializarViajeChofer(viaje), ruta_planeada: await obtenerRutaPlaneada(id_viaje) };
 }
 
 export async function remitoOrganizacion(id_organizacion, id_viaje) {
@@ -376,7 +380,7 @@ export async function viajeParaCostoAcumulado(id_organizacion, id_viaje) {
 // ─── Crear ───────────────────────────────────────────────────────────────────
 
 export async function crearViajeInterno({ io, id_organizacion, id_usuario, datos }) {
-  const { id_conductor, paradas, fecha_programada, condiciones_requeridas, descripcion } = datos;
+  const { id_conductor, fecha_programada, condiciones_requeridas, descripcion } = datos;
 
   await exigirPymeOperativa(id_organizacion);
 
@@ -388,6 +392,10 @@ export async function crearViajeInterno({ io, id_organizacion, id_usuario, datos
   if (!cliente) throw new ErrorNegocio(400, 'El usuario no tiene perfil de cliente');
 
   await validarChoferAsignable(id_organizacion, id_conductor, condiciones_requeridas);
+
+  // Paradas { id_lugar } -> copia de direccion y coordenadas del lugar (400 si
+  // no existe, es de otra PyME o esta borrado).
+  const paradas = await resolverParadas(id_organizacion, datos.paradas);
 
   // Precio, duracion (manejo + peon) y ruta: UNA estimacion (costo.service).
   // Fuera de la tx y ANTES de escribir nada: llama a Google. Si Google falla,
@@ -440,7 +448,7 @@ export async function crearViajeInterno({ io, id_organizacion, id_usuario, datos
   emitirViajeInterno(io, destinosDe(viaje), 'viaje:asignado', resumenViaje(viaje));
 
   return {
-    ...serializarViajeInterno(viaje),
+    ...serializarViajePyme(viaje),
     ruta_planeada,
     desglose_estimado: resultado.desglose,
   };
@@ -1062,7 +1070,7 @@ export async function reasignarViaje({ io, id_organizacion, id_usuario, id_viaje
     resumenViaje(actualizado)
   );
 
-  return serializarViajeInterno(actualizado);
+  return serializarViajePyme(actualizado);
 }
 
 export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, datos }) {
@@ -1082,8 +1090,11 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
   }
   validarTransicion(viaje.estado, 'ASIGNADO', { ciclo: 'INTERNO', quien: 'PYME' });
 
+  // Paradas nuevas: { id_lugar } -> snapshot del lugar. Sin paradas nuevas, las
+  // actuales (con su snapshot, aunque el lugar haya cambiado despues).
+  const paradasNuevas = datos.paradas ? await resolverParadas(id_organizacion, datos.paradas) : null;
   const paradas =
-    datos.paradas ??
+    paradasNuevas ??
     viaje.paradas.map((p) => ({ lat: p.latitud, lng: p.longitud, direccion: p.direccion }));
   const fecha_programada = datos.fecha_programada
     ? new Date(datos.fecha_programada)
@@ -1137,10 +1148,10 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
     });
     if (r.count === 0) throw conflicto();
 
-    if (datos.paradas) {
+    if (paradasNuevas) {
       await tx.parada.deleteMany({ where: { id_viaje } });
       await tx.parada.createMany({
-        data: conEstimacionPorParada(paradasParaCrear(datos.paradas), recorrido).map((p) => ({
+        data: conEstimacionPorParada(paradasParaCrear(paradasNuevas), recorrido).map((p) => ({
           ...p,
           id_viaje,
         })),
@@ -1195,7 +1206,7 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
   );
 
   return {
-    ...serializarViajeInterno(actualizado),
+    ...serializarViajePyme(actualizado),
     ruta_planeada: await obtenerRutaPlaneada(id_viaje),
   };
 }

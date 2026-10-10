@@ -124,6 +124,25 @@ enum CausaCancelacion {
   DESVINCULACION
 }
 
+// ── Viajes recurrentes (Paso 4) ──
+
+// DIAS_SEMANA usa dias_semana (ISO, 1 = lunes ... 7 = domingo), SEMANAL usa
+// dia_semana y MENSUAL dia_mes. La generacion de fechas vive en serie-fechas.js.
+enum FrecuenciaSerie {
+  DIARIA
+  DIAS_SEMANA
+  SEMANAL
+  MENSUAL
+}
+
+// CANCELADA: la cancelo la PyME (los viajes ya creados no se tocan).
+// BORRADA: se desvinculo el chofer (sus viajes se cancelan en la misma tx).
+enum EstadoSerie {
+  ACTIVA
+  CANCELADA
+  BORRADA
+}
+
 // ─────────────────────────────────────────────
 // USUARIO BASE
 // ─────────────────────────────────────────────
@@ -150,6 +169,9 @@ model Usuario {
   membresias                  MiembroOrganizacion[]
   // Back-relation, NO una columna: la FK vive en viajes.id_creador.
   viajes_creados              Viaje[]               @relation("ViajesCreados")
+  // Back-relations (Paso 4), NO columnas: las FKs viven en lugares y series_viaje.
+  lugares_creados             Lugar[]
+  series_creadas              SerieViaje[]
 
   @@map("usuarios")
 }
@@ -191,6 +213,8 @@ model Conductor {
   calificaciones        Calificacion[]
   // Back-relation, NO una columna: la FK vive en vinculos_chofer.
   vinculos_organizacion VinculoChofer[]
+  // Back-relation (Paso 4), NO una columna: la FK vive en series_viaje.
+  series                SerieViaje[]
 
   @@map("conductores")
 }
@@ -217,8 +241,87 @@ model Organizacion {
   choferes     VinculoChofer[]
   // Back-relation, NO una columna: la FK vive en viajes.id_organizacion.
   viajes       Viaje[]
+  // Back-relations (Paso 4), NO columnas.
+  lugares      Lugar[]
+  series       SerieViaje[]
 
   @@map("organizaciones")
+}
+
+// ─────────────────────────────────────────────
+// LUGAR GUARDADO (Paso 4)
+// Direccion frecuente de una PyME con nombre ("Deposito Pilar"). El nombre es
+// unico entre los ACTIVOS de la PyME sin distinguir mayusculas: se valida en
+// lugar.service.js bajo un advisory lock, NO con un constraint (mismo criterio
+// que el CUIT). Borrar = activo false: las paradas que lo usaron guardan una
+// COPIA de direccion y coordenadas (snapshot), y el nombre nunca se copia.
+// ─────────────────────────────────────────────
+
+model Lugar {
+  id_lugar            Int       @id @default(autoincrement())
+  id_organizacion     Int
+  nombre              String
+  direccion           String
+  latitud             Float
+  longitud            Float
+  activo              Boolean   @default(true)
+  id_creador          Int
+  fecha_baja          DateTime?
+  // Sin FK, mismo criterio que miembros_organizacion.baja_por_id_usuario.
+  baja_por_id_usuario Int?
+  creado_en           DateTime  @default(now())
+  actualizado_en      DateTime  @updatedAt
+
+  organizacion Organizacion @relation(fields: [id_organizacion], references: [id_organizacion])
+  creador      Usuario      @relation(fields: [id_creador], references: [id_usuario])
+  // Back-relation, NO una columna: la FK vive en paradas.id_lugar.
+  paradas      Parada[]
+
+  @@index([id_organizacion, activo])
+  @@map("lugares")
+}
+
+// ─────────────────────────────────────────────
+// SERIE DE VIAJES (Paso 4)
+// Al crearla se generan de una vez TODOS sus viajes (fecha_desde .. fecha_hasta,
+// como maximo 31 dias), cada uno un viaje interno normal con id_serie. La serie
+// no se renueva sola. fecha_desde / fecha_hasta y hora son LOCALES de
+// America/Argentina/Buenos_Aires. paradas es la plantilla ya resuelta (snapshot
+// de los lugares): [{ orden, direccion, lat, lng, id_lugar | null }].
+// ─────────────────────────────────────────────
+
+model SerieViaje {
+  id_serie            Int             @id @default(autoincrement())
+  id_organizacion     Int
+  id_creador          Int
+  id_conductor        Int
+  frecuencia          FrecuenciaSerie
+  dias_semana         Int[]           @default([])
+  dia_semana          Int?
+  dia_mes             Int?
+  // "HH:MM" local.
+  hora                String
+  fecha_desde         DateTime        @db.Date
+  fecha_hasta         DateTime        @db.Date
+  paradas             Json
+  condiciones         TipoCondicion[] @default([])
+  descripcion         String?
+  estado              EstadoSerie     @default(ACTIVA)
+  fecha_baja          DateTime?
+  // Sin FK, mismo criterio que miembros_organizacion.baja_por_id_usuario.
+  baja_por_id_usuario Int?
+  creado_en           DateTime        @default(now())
+  actualizado_en      DateTime        @updatedAt
+
+  organizacion Organizacion @relation(fields: [id_organizacion], references: [id_organizacion])
+  creador      Usuario      @relation(fields: [id_creador], references: [id_usuario])
+  conductor    Conductor    @relation(fields: [id_conductor], references: [id_conductor])
+  // Back-relation, NO una columna: la FK vive en viajes.id_serie.
+  viajes       Viaje[]
+
+  @@index([id_organizacion, estado])
+  @@index([id_conductor, estado])
+  @@map("series_viaje")
 }
 
 // ─────────────────────────────────────────────
@@ -526,6 +629,11 @@ model Viaje {
   // Del acumulado GPS de Redis, leido ANTES de limpiarlo.
   distancia_real_km     Float?
 
+  // ── Serie (Paso 4) ──
+  // La serie que lo genero. Nullable: los viajes sueltos no tienen. Editar,
+  // reasignar o cancelar el viaje NO toca la serie ni a los otros viajes.
+  id_serie              Int?
+
   cliente             Cliente                @relation(fields: [id_cliente], references: [id_cliente])
   organizacion        Organizacion?          @relation(fields: [id_organizacion], references: [id_organizacion])
   creador             Usuario?               @relation("ViajesCreados", fields: [id_creador], references: [id_usuario])
@@ -540,8 +648,10 @@ model Viaje {
   // Back-relation, NO una columna: no genera DDL sobre la tabla viajes.
   // La FK vive en historial_estado_viaje.
   historial_estados   HistorialEstadoViaje[]
+  serie               SerieViaje?            @relation(fields: [id_serie], references: [id_serie], onDelete: SetNull)
 
   @@index([id_organizacion, estado])
+  @@index([id_serie])
   @@map("viajes")
 }
 
@@ -605,7 +715,15 @@ model Parada {
   peon_real_horas       Float?
   manejo_real_horas     Float?
 
-  viaje Viaje @relation(fields: [id_viaje], references: [id_viaje])
+  // ── Lugar guardado (Paso 4) ──
+  // El lugar del que salio esta parada, si vino como { id_lugar }. direccion,
+  // latitud y longitud son una COPIA (snapshot): editar o borrar el lugar
+  // despues no cambia el viaje. El NOMBRE del lugar no se copia: la PyME lo ve
+  // por join y el chofer nunca (ver vista-parada.js).
+  id_lugar              Int?
+
+  viaje Viaje  @relation(fields: [id_viaje], references: [id_viaje])
+  lugar Lugar? @relation(fields: [id_lugar], references: [id_lugar], onDelete: SetNull)
 
   @@map("paradas")
 }

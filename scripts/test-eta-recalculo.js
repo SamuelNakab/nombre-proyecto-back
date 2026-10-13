@@ -1,5 +1,7 @@
+import 'dotenv/config';
 import { io } from 'socket.io-client';
 import redis from '../src/config/redis.js';
+import prisma from '../src/config/prisma.js';
 
 const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
 const BASE = 'http://localhost:3000';
@@ -25,6 +27,15 @@ function check(nombre, ok, detalle = '') {
   console.log(`  ${ok ? '✅' : '❌'} ${nombre}${detalle ? '  →  ' + detalle : ''}`);
 }
 const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Espera a que se cumpla `cond` (hasta `ms`). Reemplaza las esperas fijas: cada
+// ping hace varios viajes a Neon en serie y, con la latencia de una base remota,
+// 2-3 s fijos no alcanzaban (el evento llegaba despues de que el test siguiera).
+async function esperarHasta(cond, ms = 10000) {
+  const limite = Date.now() + ms;
+  while (Date.now() < limite && !cond()) await esperar(200);
+  return cond();
+}
 
 async function getToken(email, password) {
   const res = await fetch(
@@ -138,8 +149,18 @@ async function main() {
   check('Viaje en CONDUCTOR_ASIGNADO', vAsig.estado === 'CONDUCTOR_ASIGNADO', vAsig.estado);
   if (vAsig.estado !== 'CONDUCTOR_ASIGNADO') { await cleanup(sConductor, sCliente); process.exit(1); }
 
-  // ── PASO 4: Pings iniciales → arranca ETA ───────────────────────────────────
-  console.log('\n── PASO 4: Pings iniciales (lejos de parada 1) ────────\n');
+  // ── PASO 4: Iniciar + pings iniciales → arranca ETA ─────────────────────────
+  console.log('\n── PASO 4: Iniciar y pings iniciales (lejos de parada 1) ─\n');
+
+  // Desde el boton "Iniciar viaje" el primer ping ya NO arranca el viaje: los
+  // pings de un viaje sin iniciar se rechazan. Se trae la fecha a la ventana de
+  // inicio (se creo con la anticipacion minima) y se inicia a mano.
+  await prisma.viaje.update({
+    where: { id_viaje },
+    data: { fecha_programada: new Date(Date.now() + 5 * 60 * 1000) },
+  });
+  const ini = await api('POST', `/api/viajes/${id_viaje}/iniciar`, null, conductorToken);
+  check('POST /api/viajes/:id/iniciar → 200', ini.status === 200, `${ini.status} ${JSON.stringify(ini.data)}`);
 
   let ts = Date.now();
   sConductor.emit('conductor:ubicacion', { id_viaje, lat: INICIO_1.lat, lng: INICIO_1.lng, timestamp: ts });
@@ -148,7 +169,7 @@ async function main() {
   await esperar(2500);
 
   const { data: vGps } = await api('GET', `/api/viajes/${id_viaje}`, null, clienteToken);
-  check('Primer ping → EN_CAMINO_A_ORIGEN', vGps.estado === 'EN_CAMINO_A_ORIGEN', vGps.estado);
+  check('Iniciado → EN_CAMINO_A_ORIGEN', vGps.estado === 'EN_CAMINO_A_ORIGEN', vGps.estado);
 
   const primerEta = etaEvents[0];
   check('Llego al menos un eta:actualizar con segundos_restantes > 0',
@@ -206,7 +227,9 @@ async function main() {
     rutaEvents.length === rutaRecalcAntes, `recalculos: ${rutaEvents.length - rutaRecalcAntes}`);
 
   sConductor.emit('conductor:ubicacion', { id_viaje, lat: DESVIO_A.lat + 0.0005, lng: DESVIO_A.lng + 0.0005, timestamp: ts + 3000 });
-  await esperar(3000);
+  await esperarHasta(() => rutaEvents.length > rutaRecalcAntes);
+  // Despues del recalculo de ruta llega el ETA inmediato.
+  await esperarHasta(() => etaEvents.slice(etaAntesRecalc).some((e) => e.t >= rutaEvents[rutaEvents.length - 1]?.t));
 
   const recalc1 = rutaEvents[rutaEvents.length - 1];
   check('2do ping desviado → llego ruta:recalculada',
@@ -255,6 +278,7 @@ async function main() {
     console.log('\n  Fallaron:');
     fallaron.forEach((c) => console.log(`    ❌ ${c.nombre}${c.detalle ? ': ' + c.detalle : ''}`));
   }
+  await prisma.$disconnect().catch(() => {});
   process.exit(fallaron.length === 0 ? 0 : 1);
 }
 

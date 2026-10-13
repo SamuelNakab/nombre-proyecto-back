@@ -354,10 +354,14 @@ async function main() {
     det.duracion_estimada === Math.round(det.duracion_estimada_horas * 60),
     `horas=${det.duracion_estimada_horas} minutos=${det.duracion_estimada}`
   );
+  // Paso 3: duracion_estimada es el TOTAL (manejo + peon). desglose.tiempo_horas
+  // sigue siendo solo el MANEJO (el input del precio), asi que ya no coinciden:
+  // coincide el manejo con manejo_estimado_horas, y el total con manejo + peon.
   paso(
-    'CASO 2d: duracion_estimada coincide con desglose_estimado.tiempo_horas de la creacion',
-    det.duracion_estimada === Math.round(rCaba.desglose_estimado.tiempo_horas * 60),
-    `tiempo_horas=${rCaba.desglose_estimado.tiempo_horas} → ${Math.round(rCaba.desglose_estimado.tiempo_horas * 60)} min`
+    'CASO 2d: duracion_estimada = manejo (desglose_estimado.tiempo_horas) + peon de la creacion',
+    Math.abs(det.manejo_estimado_horas - rCaba.desglose_estimado.tiempo_horas) < 1e-9 &&
+      det.duracion_estimada === Math.round((rCaba.desglose_estimado.tiempo_horas + det.peon_estimado_horas) * 60),
+    `manejo=${rCaba.desglose_estimado.tiempo_horas} peon=${det.peon_estimado_horas} → ${det.duracion_estimada} min`
   );
   paso(
     'CASO 2e: el detalle trae el vehiculo asignado (no null) con patente',

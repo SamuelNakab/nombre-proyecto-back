@@ -1,5 +1,7 @@
+import 'dotenv/config';
 import { io } from 'socket.io-client';
 import { spawn } from 'child_process';
+import prisma from '../src/config/prisma.js';
 
 const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
 const BASE = (port = 3000) => `http://localhost:${port}`;
@@ -15,6 +17,15 @@ function check(nombre, ok, detalle = '') {
   console.log(`  ${ok ? '✅' : '❌'} ${nombre}${detalle ? '  →  ' + detalle : ''}`);
 }
 const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Espera a que se cumpla `cond` (hasta `ms`). Reemplaza las esperas fijas: cada
+// ping hace varios viajes a Neon en serie y, con la latencia de una base remota,
+// 2-3 s fijos no alcanzaban (el evento llegaba despues de que el test siguiera).
+async function esperarHasta(cond, ms = 10000) {
+  const limite = Date.now() + ms;
+  while (Date.now() < limite && !cond()) await esperar(200);
+  return cond();
+}
 
 // Distancia geometrica simple (haversine) en metros.
 function distanciaMetros(lat1, lng1, lat2, lng2) {
@@ -75,13 +86,24 @@ async function cleanup(sockets) {
 }
 
 // ── PART 7: server descartable con API key invalida ─────────────────────────────
+//
+// Desde el Paso 3 no hay mock ni ruta "best-effort": si Google falla al crear,
+// el viaje NO se crea (503) — nunca se guardan valores inventados.
 
-async function testFallbackMapsCaido(clienteToken) {
-  console.log('\n── PASO 7: Maps caido al crear → ruta_planeada null ───\n');
+async function testMapsCaido(clienteToken) {
+  console.log('\n── PASO 7: Maps caido al crear → 503 y no se crea nada ───\n');
 
   const child = spawn('node', ['src/app.js'], {
     cwd: process.cwd(),
-    env: { ...process.env, PORT: '3001', GOOGLE_MAPS_API_KEY: 'CLAVE_INVALIDA_PARA_TEST_FALLBACK' },
+    env: {
+      ...process.env,
+      PORT: '3001',
+      GOOGLE_MAPS_API_KEY: 'CLAVE_INVALIDA_PARA_TEST',
+      // POST /api/viajes es la ruta dormida del marketplace.
+      MARKETPLACE_HABILITADO: 'true',
+      RESERVA_BARRIDO_ARRANQUE: '0',
+      VENCIMIENTO_BARRIDO_ARRANQUE: '0',
+    },
   });
   let childLog = '';
   child.stdout.on('data', (d) => { childLog += d.toString(); });
@@ -95,25 +117,30 @@ async function testFallbackMapsCaido(clienteToken) {
   }
   if (!arranco) {
     child.kill();
-    check('Server de fallback (key invalida) arranco en :3001', false, 'no arranco — ' + childLog.slice(0, 200));
+    check('Server con key invalida arranco en :3001', false, 'no arranco — ' + childLog.slice(0, 200));
     return;
   }
   await esperar(500); // que termine de inicializar sockets/redis
 
+  const antes = await api('GET', '/api/viajes/mis-viajes', null, clienteToken, 3001);
   const fechaViaje = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
   const { status, data } = await api('POST', '/api/viajes', {
     zona: 'CABA', fecha_programada: fechaViaje, condiciones_requeridas: [],
     paradas: [PARADA_1, PARADA_2],
   }, clienteToken, 3001);
+  const despues = await api('GET', '/api/viajes/mis-viajes', null, clienteToken, 3001);
 
-  await esperar(900); // dar tiempo a que el server loguee el error de ruta
-
-  check('POST /api/viajes igual devuelve 201 con Maps caido', status === 201, `status ${status}`);
-  check('ruta_planeada es null cuando Maps falla al crear',
-    data.ruta_planeada === null, `ruta_planeada = ${JSON.stringify(data.ruta_planeada)}`);
-  check('El error de ruta se logueo en el servidor',
-    /No se pudo calcular la ruta planeada/.test(childLog),
-    /No se pudo calcular la ruta planeada/.test(childLog) ? 'log encontrado' : 'log NO encontrado');
+  check('POST /api/viajes con Maps caido → 503 con el mensaje de ruta',
+    status === 503 && data.error === 'No se pudo calcular la ruta. Probá de nuevo en unos minutos.',
+    `status ${status} ${JSON.stringify(data)}`);
+  check('No se creo ningun viaje (mis-viajes igual que antes)',
+    antes.status === 200 && despues.status === 200 && antes.data.length === despues.data.length,
+    `antes=${antes.data.length} despues=${despues.data.length}`);
+  check('El fallo de Google se logueo en el servidor (sin la key)',
+    // Una key invalida le da 400 INVALID_ARGUMENT de Google; la capa lo
+    // convierte en 503 igual.
+    /\[maps\] routes tramo \d+ .*NO_DISPONIBLE/.test(childLog) && !childLog.includes('CLAVE_INVALIDA_PARA_TEST'),
+    /\[maps\] routes tramo/.test(childLog) ? 'log encontrado' : 'log NO encontrado');
 
   child.kill();
   await esperar(500);
@@ -216,11 +243,21 @@ async function main() {
   // ── PASO 6: ETA + recalculo siguen funcionando ─────────────────────────────
   console.log('\n── PASO 6: ETA y recalculo por desvio intactos ────────\n');
 
-  // 1 ping sobre la ruta → arranca emisor de ETA.
+  // Desde el boton "Iniciar viaje" los pings de un viaje sin iniciar se
+  // rechazan. El viaje se creo con la anticipacion minima (2 h): se trae su
+  // fecha a dentro de 5 min para que este en la ventana de inicio, y se inicia.
+  await prisma.viaje.update({
+    where: { id_viaje },
+    data: { fecha_programada: new Date(Date.now() + 5 * 60 * 1000) },
+  });
+  const ini = await api('POST', `/api/viajes/${id_viaje}/iniciar`, null, conductorToken);
+  check('POST /api/viajes/:id/iniciar → 200', ini.status === 200, `${ini.status} ${JSON.stringify(ini.data)}`);
+
+  // 1 ping sobre la ruta → arranca emisor de ETA (Routes API, con trafico).
   const medio = rutaPost[Math.floor(rutaPost.length / 2)];
   let ts = Date.now();
   sConductor.emit('conductor:ubicacion', { id_viaje, lat: medio[1], lng: medio[0], timestamp: ts });
-  await esperar(2500);
+  await esperarHasta(() => etaEvents.length >= 1);
   check('Llega eta:actualizar tras ping sobre la ruta',
     etaEvents.length >= 1, `${etaEvents.length} eventos`);
 
@@ -233,7 +270,7 @@ async function main() {
   sConductor.emit('conductor:ubicacion', { id_viaje, lat: DESVIO.lat, lng: DESVIO.lng, timestamp: ts });
   await esperar(1500);
   sConductor.emit('conductor:ubicacion', { id_viaje, lat: DESVIO.lat + 0.0005, lng: DESVIO.lng + 0.0005, timestamp: ts + 3000 });
-  await esperar(3000);
+  await esperarHasta(() => rutaRecalcEvents.length >= 1);
 
   const recalc = rutaRecalcEvents[rutaRecalcEvents.length - 1];
   check('2 pings desviados → llega ruta:recalculada',
@@ -245,8 +282,8 @@ async function main() {
 
   await cleanup(sockets);
 
-  // ── PASO 7: fallback Maps caido ─────────────────────────────────────────────
-  await testFallbackMapsCaido(clienteToken);
+  // ── PASO 7: Maps caido → 503 ────────────────────────────────────────────────
+  await testMapsCaido(clienteToken);
 
   // ── RESUMEN ─────────────────────────────────────────────────────────────────
   const ok = checks.filter((c) => c.ok).length;
@@ -261,6 +298,7 @@ async function main() {
     console.log('\n  Fallaron:');
     fallaron.forEach((c) => console.log(`    ❌ ${c.nombre}${c.detalle ? ': ' + c.detalle : ''}`));
   }
+  await prisma.$disconnect().catch(() => {});
   process.exit(fallaron.length === 0 ? 0 : 1);
 }
 

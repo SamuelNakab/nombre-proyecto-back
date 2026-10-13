@@ -447,6 +447,12 @@ camino cuando se desplegó esto sí consigue las etapas cuyas **dos** transicion
 ocurrieron después (por ejemplo, uno que estaba en `EN_RUTA` obtiene
 `duracion_descarga`, pero no `duracion_real`).
 
+> **Viajes de PyME (ciclo por parada, Paso 3):** `duracion_real` = de la **llegada a la parada 1**
+> (iniciar) a la **salida de la última** = `real.total_horas` en minutos, el mismo intervalo que la
+> duración estimada; `duracion_carga` = peón de la parada 1; `duracion_descarga` = peón de la última.
+> Ver [Manejo y peón](#duración-estimada-manejo-y-peón-paso-3). `duracion_estimada` es ahora el
+> **total** estimado (manejo + peón) en los dos ciclos.
+
 **Dónde aparecen (seis canales):** `GET /api/viajes/:id`,
 `GET /api/viajes/mis-viajes`, `GET /api/viajes/mis-viajes-conductor`,
 `GET /api/admin/viajes/:id`, `GET /api/empresas/:id/viajes` y el evento
@@ -495,8 +501,9 @@ perjudica.
 
 ### POST /api/viajes/estimar-costo
 
-Calcula el costo estimado de un viaje sin crearlo.
-Si `GOOGLE_MAPS_API_KEY` no está configurada usa valores mock (10 km, 0.5 h).
+Calcula el costo y la duración estimados de un viaje sin crearlo, con el
+[algoritmo de duración](#algoritmo-de-duración-estimada) (tramos con tráfico + peón en cada parada).
+**No hay valores de reemplazo:** si Google falla responde `503` (ver errores).
 
 **Rol requerido:** `CLIENTE`
 
@@ -520,32 +527,71 @@ Si `GOOGLE_MAPS_API_KEY` no está configurada usa valores mock (10 km, 0.5 h).
   **No** tiene mínimo de anticipación: a diferencia de [`POST /api/viajes`](#post-apiviajes), acá
   no aplica `ANTICIPACION_MINIMA_MINUTOS` y se acepta cualquier fecha, incluso pasada.
 
-**Respuesta exitosa — 200:**
+**Respuesta exitosa — 200** (real: Plaza de Mayo → Tribunales → Recoleta, hora pico):
 ```json
 {
   "zona": "CABA",
-  "precio_estimado": 2500,
+  "precio_estimado": 1409.7222222222222,
   "desglose": {
-    "precio_por_tiempo": 2500,
+    "precio_por_tiempo": 1409.7222222222222,
     "precio_por_distancia": null,
-    "tiempo_horas": 0.5,
-    "distancia_km": 2.3,
-    "tiempo_capital": 0.5,
+    "tiempo_horas": 0.28194444444444444,
+    "distancia_km": 3.607,
+    "tiempo_capital": 0.28194444444444444,
     "distancia_provincia": null,
     "fraccion_caba": 1,
     "tarifa_hora": 5000,
     "tarifa_km": null,
     "es_hora_pico": true
-  }
+  },
+  "estimado": {
+    "manejo_horas": 0.28194444444444444,
+    "peon_horas": 1.5,
+    "total_horas": 1.7819444444444446,
+    "distancia_km": 3.607,
+    "inicio_estimado": "2026-10-09T23:05:53.166Z",
+    "fin_estimado": "2026-10-10T00:52:48.166Z"
+  },
+  "tramos": [
+    {
+      "orden": 1,
+      "llegada_estimada": "2026-10-09T23:05:53.166Z",
+      "salida_estimada": "2026-10-09T23:35:53.166Z",
+      "peon_estimado_min": 30,
+      "manejo_estimado_min": null,
+      "distancia_estimada_km": null
+    },
+    {
+      "orden": 2,
+      "llegada_estimada": "2026-10-09T23:44:29.166Z",
+      "salida_estimada": "2026-10-10T00:14:29.166Z",
+      "peon_estimado_min": 30,
+      "manejo_estimado_min": 9,
+      "distancia_estimada_km": 1.825
+    },
+    {
+      "orden": 3,
+      "llegada_estimada": "2026-10-10T00:22:48.166Z",
+      "salida_estimada": "2026-10-10T00:52:48.166Z",
+      "peon_estimado_min": 30,
+      "manejo_estimado_min": 8,
+      "distancia_estimada_km": 1.782
+    }
+  ]
 }
 ```
 
 - `zona`: la zona **calculada por el servidor**. Si mandaste una `zona` distinta en el body, esta
   es la que vale.
-- `tiempo_horas` / `distancia_km`: totales medidos de la ruta completa.
+- `desglose`: **el cálculo del precio, sin cambios.** `tiempo_horas` es el **manejo** (ahora con
+  tráfico) y `distancia_km` la distancia de la ruta; el peón **no** se cobra (todavía).
 - `tiempo_capital` / `distancia_provincia`: las magnitudes que **efectivamente se facturan**
   (`null` = no se cobra por ese concepto).
 - `fraccion_caba`: proporción de paradas que caen dentro de CABA (`1` en CABA, `0` en PROVINCIA).
+- `estimado` (Paso 3): la duración separada en manejo y peón, en **horas**. `total_horas` =
+  `manejo_horas + peon_horas` = `fin_estimado − inicio_estimado`.
+- `tramos` (Paso 3): una entrada por parada, con su llegada y salida estimadas, el peón en esa parada
+  y el manejo / distancia del tramo que **llega** a ella (`null` en la primera), en **minutos**.
 
 **Errores posibles:**
 | Status | Body | Causa |
@@ -553,7 +599,8 @@ Si `GOOGLE_MAPS_API_KEY` no está configurada usa valores mock (10 km, 0.5 h).
 | 400 | `{ "error": "mensaje de validación" }` | Campo faltante o inválido |
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
 | 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CLIENTE |
-| 503 | `{ "error": "No se pudo calcular la distancia" }` | Error en Google Maps API |
+| 400 | `{ "error": "No hay una ruta en auto entre la parada 1 y la parada 2. Revisá las direcciones." }` | Google no encuentra una ruta en auto entre dos paradas consecutivas |
+| 503 | `{ "error": "No se pudo calcular la ruta. Probá de nuevo en unos minutos." }` | Google no respondió (caído, timeout, key inválida o sin cuota). No se creó ni modificó nada |
 
 ---
 
@@ -691,7 +738,8 @@ Las tarifas se calculan automáticamente según la zona y si la `fecha_programad
 | 400 | `{ "error": "El usuario no tiene perfil de cliente" }` | El usuario no tiene registro de cliente |
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
 | 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CLIENTE |
-| 503 | `{ "error": "No se pudo calcular la distancia" }` | Error en Google Maps API |
+| 400 | `{ "error": "No hay una ruta en auto entre la parada 1 y la parada 2. Revisá las direcciones." }` | Google no encuentra una ruta en auto entre dos paradas consecutivas |
+| 503 | `{ "error": "No se pudo calcular la ruta. Probá de nuevo en unos minutos." }` | Google no respondió (caído, timeout, key inválida o sin cuota). No se creó ni modificó nada |
 
 ---
 
@@ -1316,6 +1364,10 @@ socket.on('viaje:vencido', (data) => {
 ---
 
 ### PATCH /api/viajes/:id/estado
+
+> **No aplica a viajes de PyME (Paso 3).** Responde `400` (real):
+> `{ "error": "En un viaje de PyME el estado cambia con iniciar (POST /api/choferes/viajes/:id/iniciar), confirmar parada (POST /api/viajes/:id/confirmar-parada) y salir (POST /api/choferes/viajes/:id/salir)" }`.
+> Lo que sigue es el ciclo del marketplace, sin cambios.
 
 Cambia el estado del viaje manualmente. Solo puede ejecutarlo el conductor asignado al viaje.
 Estados válidos para este endpoint: `CARGANDO`, `EN_RUTA`, `DESCARGANDO`.
@@ -2224,6 +2276,19 @@ Authorization: Bearer <firebase-id-token>
 
 ### POST /api/viajes/:id/confirmar-parada
 
+> **Viajes de PyME (ciclo por parada, Paso 3):** confirmar es **llegar a la siguiente parada**. Solo en
+> `EN_RUTA`, solo la siguiente en orden, y pasa a `DESCARGANDO` (guarda `llegada_real` y el manejo real
+> del tramo). **Confirmar la última ya no finaliza:** lo hace [`salir`](#post-apichoferesviajesidsalir).
+> La parada 1 queda confirmada al iniciar. Orden de validaciones: viaje `404` → chofer `403` → parada
+> ajena `400` → ya confirmada `400` → estado `400` → **no es la siguiente `400`** → distancia `400`.
+> Respuesta real:
+> ```json
+> {"confirmada": true, "viaje_finalizado": false, "id_viaje": 883, "id_parada": 1788, "estado": "DESCARGANDO", "llegada_real": "2026-10-09T21:36:22.624Z"}
+> ```
+> Errores nuevos (reales): `400 {"error": "Todavia estas en una parada: toca \"Salir\" antes de confirmar la siguiente"}` (está en una parada:
+> primero "Salir") y `400 {"error": "Primero tenes que confirmar la parada 2"}` (salteó una).
+> Lo que sigue describe el ciclo del marketplace, sin cambios.
+
 > **Compartido por los dos ciclos.** Un viaje de PyME confirma sus paradas acá, igual que uno del
 > marketplace. Si al confirmar la última parada el viaje ya no está en `EN_RUTA`/`DESCARGANDO` (p. ej.
 > la PyME lo canceló en ese instante), responde `409 { "error": "El viaje cambio de estado y no se
@@ -2346,6 +2411,9 @@ en la parada, se sube la variable.
 
 
 ### WebSocket — Evento: viaje:finalizado
+
+> **Paso 3:** suma `estimado`, `real` y `paradas` (los tiempos de cada parada). Ver el payload real en
+> [eventos del viaje interno](#websocket--eventos-del-viaje-interno).
 
 
 **Dirección:** servidor → room del viaje  
@@ -3716,6 +3784,166 @@ El chofer se desvincula de una PyME (`:id` = `id_organizacion`).
 
 ---
 
+## Duración estimada, manejo y peón (Paso 3)
+
+Toda llamada a Google pasa por una capa única (Routes API). El paso 3 cambia **cómo se estima la
+duración**, separa el tiempo de **manejo** del de **peón** (carga / descarga), estimados y reales, por
+viaje y por parada, y guarda la distancia estimada y la real. **El precio no cambia.**
+
+<a id="algoritmo-de-duración-estimada"></a>
+### Algoritmo de duración estimada
+
+- Arranca en `fecha_programada` (si no hay, o ya pasó, en "ahora").
+- En **cada** parada (origen, intermedias y destino) suma `TIEMPO_PEON_MINUTOS` (default 30) de **peón**.
+- Cada tramo es **manejo**, calculado con el tráfico de su hora de salida = llegada a la parada anterior
+  + peón. Los tramos se piden en orden: cada uno depende del anterior.
+
+Ejemplo, A → B → C a las 10:00:
+
+| Parada | Llega | Peón | Sale | Manejo del tramo que llega |
+|---|---|---|---|---|
+| A (origen) | 10:00 | 30 min | 10:30 | — |
+| B | 11:10 | 30 min | 11:40 | A→B saliendo 10:30: 40 min |
+| C (destino) | 12:05 | 30 min | 12:35 | B→C saliendo 11:40: 25 min |
+
+**Total 2 h 35 = manejo 1 h 05 + peón 1 h 30.** `duracion_estimada_horas` (y `duracion_estimada` en
+minutos) es ese **total**. El precio se sigue calculando con el **manejo** (`desglose.tiempo_horas`) y la
+distancia, igual que antes; lo único que cambia es que el manejo ahora tiene tráfico.
+
+### Errores de Google — nunca valores inventados
+
+Crear un viaje, editarlo (si cambian paradas o fecha) y `estimar-costo` responden:
+
+| Status | Body | Causa |
+|---|---|---|
+| 400 | `{ "error": "No hay una ruta en auto entre la parada 1 y la parada 2. Revisá las direcciones." }` | Google no encuentra una ruta en auto entre dos paradas consecutivas |
+| 503 | `{ "error": "No se pudo calcular la ruta. Probá de nuevo en unos minutos." }` | Google no respondió (caído, timeout, key inválida o sin cuota). No se creó ni modificó nada |
+
+Antes, si Google fallaba, se guardaba en silencio 10 km / 0,5 h por tramo. Eso ya no existe. En el
+tracking en vivo, si Google falla, **no se emite** `eta:actualizar` en ese ciclo (antes se estimaba por
+línea recta) y un desvío mantiene la ruta anterior.
+
+### Bloques `estimado` y `real` (por viaje)
+
+Las listas y el detalle de la PyME y del chofer, la respuesta de crear y de editar, el admin (lista y
+detalle) y `viaje:finalizado` suman:
+
+| Campo | Qué es |
+|---|---|
+| `estimado` | `{ manejo_horas, peon_horas, total_horas, distancia_km }`. `null` en viajes anteriores al Paso 3. |
+| `real` | Lo mismo, medido. **`null` mientras el viaje no terminó.** En un `FINALIZADO`, el viaje entero; en un `CANCELADO` en curso, lo medido hasta la cancelación; en uno que nunca arrancó, `null`. |
+
+En horas (los nombres llevan la unidad). La fila del viaje trae además las columnas
+`manejo_estimado_horas`, `peon_estimado_horas`, `distancia_estimada_km`, `manejo_real_horas`,
+`peon_real_horas` y `distancia_real_km` (la distancia real es la del GPS).
+
+### Tiempos por parada
+
+Cada parada trae, además de sus columnas (`llegada_estimada`, `salida_estimada`, `llegada_real`,
+`salida_real` y los `*_horas`), los campos en **minutos**:
+
+| Campo | Qué es |
+|---|---|
+| `peon_estimado_min` | Peón estimado en esta parada |
+| `manejo_estimado_min` / `distancia_estimada_km` | Manejo / distancia estimados del tramo que **llega** a esta parada (`null` en la primera) |
+| `peon_real_min` | `salida_real − llegada_real` (en un cancelado estando en la parada: hasta la cancelación) |
+| `manejo_real_min` | `llegada_real − salida_real` de la parada anterior |
+| `diferencia_min` | `llegada_real − llegada_estimada` (positivo = llegó tarde). `null` mientras no llegó |
+
+Detalle real de un viaje de 4 paradas finalizado (recortado; el test hace las paradas en segundos, por
+eso los reales son chicos):
+```json
+{
+  "id_viaje": 888,
+  "estado": "FINALIZADO",
+  "duracion_estimada_horas": 2.343333333333333,
+  "manejo_estimado_horas": 0.3433333333333334,
+  "peon_estimado_horas": 2,
+  "distancia_estimada_km": 4.085,
+  "manejo_real_horas": 0.002185277777777778,
+  "peon_real_horas": 0.001925277777777778,
+  "distancia_real_km": null,
+  "duracion_estimada": 141,
+  "duracion_real": 0,
+  "estimado": {
+    "manejo_horas": 0.3433333333333334,
+    "peon_horas": 2,
+    "total_horas": 2.3433333333333333,
+    "distancia_km": 4.085
+  },
+  "real": {
+    "manejo_horas": 0.002185277777777778,
+    "peon_horas": 0.001925277777777778,
+    "total_horas": 0.0041105555555555565,
+    "distancia_km": null
+  }
+}
+```
+Una parada de ese viaje:
+```json
+{
+  "id_parada": 1801,
+  "orden": 2,
+  "direccion": "Tribunales, CABA",
+  "estado": "ENTREGADO",
+  "fecha_entrega": "2026-10-09T21:36:55.614Z",
+  "llegada_estimada": "2026-10-09T22:18:09.777Z",
+  "salida_estimada": "2026-10-09T22:48:09.777Z",
+  "peon_estimado_horas": 0.5,
+  "manejo_estimado_horas": 0.1566666666666667,
+  "distancia_estimada_km": 1.825,
+  "llegada_real": "2026-10-09T21:36:55.614Z",
+  "salida_real": "2026-10-09T21:36:56.797Z",
+  "peon_real_horas": 0.0003286111111111111,
+  "manejo_real_horas": 0.0009641666666666667,
+  "peon_estimado_min": 30,
+  "manejo_estimado_min": 9,
+  "peon_real_min": 0,
+  "manejo_real_min": 0,
+  "diferencia_min": -41
+}
+```
+Un viaje cancelado por la PyME **manejando** hacia la parada 2 (el tramo parcial suma al manejo del
+viaje, no a la parada):
+```json
+{
+  "estado": "CANCELADO",
+  "causa_cancelacion": "ORGANIZACION",
+  "estimado": {
+    "manejo_horas": 0.2422222222222222,
+    "peon_horas": 1,
+    "total_horas": 1.2422222222222221,
+    "distancia_km": 4.337
+  },
+  "real": {
+    "manejo_horas": 0.0006897222222222222,
+    "peon_horas": 0.0004258333333333333,
+    "total_horas": 0.0011155555555555554,
+    "distancia_km": null
+  }
+}
+```
+
+<a id="cambio-de-contrato-para-mobile"></a>
+### Cambio de contrato para mobile (viajes de PyME)
+
+Para medir la llegada y la salida de **cada** parada, el ciclo en curso cambió:
+
+1. **Botón "Salir" en cada parada:** [`POST /api/choferes/viajes/:id/salir`](#post-apichoferesviajesidsalir)
+   (sin body). Iniciar = llegaste a la parada 1; "Salir" = te vas de la parada en la que estás.
+2. **Confirmar parada** = llegaste a la **siguiente** parada (solo en `EN_RUTA`, en orden). Pasa a
+   `DESCARGANDO`, que ahora significa "en una parada" (carga o descarga).
+3. **Confirmar la última ya NO finaliza el viaje**: lo finaliza "Salir" de la última.
+4. **`PATCH /api/viajes/:id/estado` ya no aplica** a viajes de PyME: responde `400`.
+
+```
+iniciar (parada 1) → CARGANDO ─salir→ EN_RUTA ─confirmar parada 2→ DESCARGANDO ─salir→ EN_RUTA ─ … ─confirmar última→ DESCARGANDO ─salir→ FINALIZADO
+```
+
+Los viajes del marketplace (legacy) no cambian.
+
+---
+
 ## Viaje interno — la PyME asigna, el chofer confirma (Paso 2)
 
 Ciclo nuevo del viaje: una **PyME** crea el viaje y lo asigna **directo** a un chofer vinculado; el
@@ -3725,7 +3953,8 @@ ejecuta. Reemplaza al marketplace, que queda dormido (ver [Flags](#flags--lo-que
 **Estados del ciclo:**
 
 ```
-ASIGNADO ──confirmar──▶ CONFIRMADO ──iniciar──▶ CARGANDO ──▶ EN_RUTA ──▶ DESCARGANDO ──▶ FINALIZADO
+ASIGNADO ──confirmar──▶ CONFIRMADO ──iniciar──▶ CARGANDO ──salir──▶ EN_RUTA ◀──salir── DESCARGANDO ──salir (última)──▶ FINALIZADO
+                                                                       └──confirmar parada──▶┘
    │  ▲                     │  │
    │  └──reasignar/editar───┘  │
    ├──rechazar──▶ RECHAZADO    │
@@ -3734,7 +3963,9 @@ ASIGNADO ──confirmar──▶ CONFIRMADO ──iniciar──▶ CARGANDO ─
 ```
 
 Finales: `RECHAZADO`, `VENCIDO`, `CANCELADO`, `FINALIZADO`. No existe `EN_CAMINO_A_ORIGEN`: el chofer
-inicia el viaje **estando en el origen** y pasa directo a `CARGANDO`.
+inicia el viaje **estando en el origen** y pasa directo a `CARGANDO`. Desde el Paso 3 el viaje en curso
+se recorre **parada por parada** (ver [Cambio de contrato para mobile](#cambio-de-contrato-para-mobile))
+y `PATCH /api/viajes/:id/estado` no aplica a estos viajes.
 
 | Desde | Hacia | Quién | Cómo |
 |---|---|---|---|
@@ -3743,8 +3974,9 @@ inicia el viaje **estando en el origen** y pasa directo a `CARGANDO`.
 | `ASIGNADO` | `RECHAZADO` | Chofer | [`POST /api/choferes/viajes/:id/rechazar`](#post-apichoferesviajesidrechazar) |
 | `ASIGNADO` / `CONFIRMADO` | `ASIGNADO` | PyME | reasignar o editar (si estaba `CONFIRMADO`, hay que reconfirmar) |
 | `CONFIRMADO` | `CARGANDO` | Chofer | [`POST /api/choferes/viajes/:id/iniciar`](#post-apichoferesviajesidiniciar) (única forma) |
-| `CARGANDO` → `EN_RUTA` → `DESCARGANDO` | | Chofer | [`PATCH /api/viajes/:id/estado`](#patch-apiviajesidestado) |
-| `EN_RUTA` / `DESCARGANDO` | `FINALIZADO` | Chofer | confirmar la **última** parada ([`POST /api/viajes/:id/confirmar-parada`](#post-apiviajesidconfirmar-parada)) |
+| `CARGANDO` / `DESCARGANDO` | `EN_RUTA` | Chofer | salir de la parada actual ([`POST /api/choferes/viajes/:id/salir`](#post-apichoferesviajesidsalir)) |
+| `EN_RUTA` | `DESCARGANDO` | Chofer | llegar a la **siguiente** parada ([`POST /api/viajes/:id/confirmar-parada`](#post-apiviajesidconfirmar-parada)) |
+| `DESCARGANDO` | `FINALIZADO` | Chofer | salir de la **última** parada (`POST /api/choferes/viajes/:id/salir`) |
 | `ASIGNADO` / `CONFIRMADO` | `CANCELADO` | Chofer, PyME, admin | cancelar, o desvincular al chofer |
 | `CARGANDO` / `EN_RUTA` / `DESCARGANDO` | `CANCELADO` | PyME, admin | el chofer **no** puede cancelar en curso |
 | `ASIGNADO` / `CONFIRMADO` | `VENCIDO` | Sistema | la ventana de inicio cerró |
@@ -3771,6 +4003,8 @@ viaje); el front ve `estado: "VENCIDO"` y `vencido: true`, y recibe `viaje:venci
   (array de strings).
 - `metodo_cobro` (copiado del vínculo con el chofer), `fecha_confirmacion`, `fecha_rechazo`,
   `causa_cancelacion` (`CHOFER` | `ORGANIZACION` | `ADMIN` | `DESVINCULACION`) y `motivo_cancelacion`.
+- Paso 3: `estimado` / `real` y, en cada parada, sus tiempos (ver
+  [Manejo y peón](#duración-estimada-manejo-y-peón-paso-3)).
 - Los campos calculados de siempre: `duracion_estimada` (min), `duracion_real`, `duracion_carga`,
   `duracion_descarga`, `duracion_aproximacion_origen` (siempre `0` en este ciclo: el viaje se inicia en
   el origen), `puntualidad_inicio` (contra `fecha_programada`, medida en la llegada al origen =
@@ -3810,23 +4044,24 @@ lo elige el chofer al confirmar.
   (ahí se inicia el viaje). `zona` se acepta y se ignora (la calcula el servidor).
 - `fecha_programada`: futura, con al menos `ANTICIPACION_MINIMA_MINUTOS` de anticipación (mismo mensaje
   que la ruta vieja).
-- El precio y la duración salen del mismo cálculo de siempre. `metodo_cobro` se copia del vínculo.
+- El precio sale del mismo cálculo de siempre; la duración, del [algoritmo nuevo](#algoritmo-de-duración-estimada).
+  Todo antes de escribir: si Google falla no se crea nada. `metodo_cobro` se copia del vínculo.
 
-**Respuesta exitosa — 201** (viaje real de una corrida del test, recortado):
+**Respuesta exitosa — 201** (viaje real de una corrida del test; `ruta_planeada` recortada):
 ```json
 {
-  "id_viaje": 457,
-  "id_cliente": 172,
-  "id_conductor": 189,
+  "id_viaje": 882,
+  "id_cliente": 300,
+  "id_conductor": 287,
   "id_vehiculo": null,
   "id_empresa": null,
   "zona": "CABA",
-  "tarifa_hora": 3500,
+  "tarifa_hora": 5000,
   "tarifa_km": null,
   "distancia_provincia": null,
   "tiempo_capital": null,
-  "duracion_estimada_horas": 0.5,
-  "fecha_programada": "2026-10-04T02:04:48.340Z",
+  "duracion_estimada_horas": 1.244722222222222,
+  "fecha_programada": "2026-10-09T21:38:09.241Z",
   "descripcion": null,
   "estado": "ASIGNADO",
   "fecha_inicio": null,
@@ -3834,92 +4069,148 @@ lo elige el chofer al confirmar.
   "fecha_llegada_origen": null,
   "fecha_reserva": null,
   "iniciado_por": null,
-  "precio_estimado": 1750,
+  "precio_estimado": 1223.611111111111,
   "precio_real": null,
-  "creado_en": "2026-10-04T02:02:48.956Z",
+  "creado_en": "2026-10-09T21:36:10.010Z",
   "motivo_cancelacion": null,
   "cancelado_por_admin_id": null,
-  "id_organizacion": 77,
-  "id_creador": 369,
+  "id_organizacion": 127,
+  "id_creador": 611,
   "metodo_cobro": "CALCULO_PLATAFORMA",
   "fecha_confirmacion": null,
   "fecha_rechazo": null,
   "causa_cancelacion": null,
+  "manejo_estimado_horas": 0.2447222222222222,
+  "peon_estimado_horas": 1,
+  "distancia_estimada_km": 4.337,
+  "manejo_real_horas": null,
+  "peon_real_horas": null,
+  "distancia_real_km": null,
   "paradas": [
     {
-      "id_parada": 918,
-      "id_viaje": 457,
+      "id_parada": 1785,
+      "id_viaje": 882,
       "orden": 1,
       "direccion": "Plaza de Mayo, CABA",
       "latitud": -34.6037,
       "longitud": -58.3816,
+      "qr_token": "cmv1hj1220000x9u4giaqa3je",
       "estado": "PENDIENTE",
-      "fecha_entrega": null
+      "fecha_entrega": null,
+      "llegada_estimada": "2026-10-09T21:38:09.241Z",
+      "salida_estimada": "2026-10-09T22:08:09.241Z",
+      "peon_estimado_horas": 0.5,
+      "manejo_estimado_horas": null,
+      "distancia_estimada_km": null,
+      "llegada_real": null,
+      "salida_real": null,
+      "peon_real_horas": null,
+      "manejo_real_horas": null,
+      "peon_estimado_min": 30,
+      "manejo_estimado_min": null,
+      "peon_real_min": null,
+      "manejo_real_min": null,
+      "diferencia_min": null
     },
     {
-      "id_parada": 919,
-      "id_viaje": 457,
+      "id_parada": 1786,
+      "id_viaje": 882,
       "orden": 2,
       "direccion": "Recoleta, CABA",
       "latitud": -34.5895,
       "longitud": -58.3974,
+      "qr_token": "cmv1hj1220001x9u417vgap6v",
       "estado": "PENDIENTE",
-      "fecha_entrega": null
+      "fecha_entrega": null,
+      "llegada_estimada": "2026-10-09T22:22:50.241Z",
+      "salida_estimada": "2026-10-09T22:52:50.241Z",
+      "peon_estimado_horas": 0.5,
+      "manejo_estimado_horas": 0.2447222222222222,
+      "distancia_estimada_km": 4.337,
+      "llegada_real": null,
+      "salida_real": null,
+      "peon_real_horas": null,
+      "manejo_real_horas": null,
+      "peon_estimado_min": 30,
+      "manejo_estimado_min": 15,
+      "peon_real_min": null,
+      "manejo_real_min": null,
+      "diferencia_min": null
     }
   ],
   "organizacion": {
-    "id_organizacion": 77,
-    "nombre": "PyME A 1791079343293",
-    "cuit": "30343343074"
+    "id_organizacion": 127,
+    "nombre": "PyME A 1791581743355",
+    "cuit": "30743405079"
   },
   "creador": {
-    "id_usuario": 369,
+    "id_usuario": 611,
     "nombre": "Pym1",
     "apellido": "Vin"
   },
   "vehiculo": null,
   "historial_estados": [
     {
-      "id_historial": 1363,
-      "id_viaje": 457,
+      "id_historial": 2706,
+      "id_viaje": 882,
       "estado": "ASIGNADO",
-      "fecha": "2026-10-04T02:02:49.526Z",
-      "id_usuario": 369,
+      "fecha": "2026-10-09T21:36:10.478Z",
+      "id_usuario": 611,
       "origen": "CLIENTE"
     }
   ],
+  "estimado": {
+    "manejo_horas": 0.2447222222222222,
+    "peon_horas": 1,
+    "total_horas": 1.2447222222222223,
+    "distancia_km": 4.337
+  },
+  "real": null,
   "condiciones_requeridas": [
     "FRAGIL"
   ],
   "conductor": {
-    "id_conductor": 189,
-    "id_usuario": 373,
+    "id_conductor": 287,
+    "id_usuario": 614,
     "nombre": "Cho1",
     "apellido": "Vin",
-    "telefono": "+5491132930004"
+    "telefono": "+5491133550004"
   },
-  "duracion_estimada": 30,
+  "duracion_estimada": 75,
   "duracion_real": null,
   "duracion_carga": null,
   "duracion_descarga": null,
   "duracion_aproximacion_origen": null,
   "vencido": false,
   "remito_url": null,
-  "ruta_planeada": null,
+  "ruta_planeada": [
+    [
+      -58.38162,
+      -34.60361
+    ],
+    [
+      -58.38125,
+      -34.60359
+    ],
+    "... (60 puntos [lng, lat])"
+  ],
   "desglose_estimado": {
-    "precio_por_tiempo": 1750,
+    "precio_por_tiempo": 1223.611111111111,
     "precio_por_distancia": null,
-    "tiempo_horas": 0.5,
-    "distancia_km": 10,
-    "tiempo_capital": 0.5,
+    "tiempo_horas": 0.24472222222222223,
+    "distancia_km": 4.337,
+    "tiempo_capital": 0.24472222222222223,
     "distancia_provincia": null,
     "fraccion_caba": 1,
-    "tarifa_hora": 3500,
+    "tarifa_hora": 5000,
     "tarifa_km": null,
-    "es_hora_pico": false
+    "es_hora_pico": true
   }
 }
 ```
+- `ruta_planeada` sale de la **misma** estimación (las polilíneas de los tramos), ya no es `null`.
+- `duracion_estimada` / `duracion_estimada_horas` = manejo + peón; `estimado`, `real` (`null`) y los
+  tiempos por parada: ver [Manejo y peón](#duración-estimada-manejo-y-peón-paso-3).
 
 **Errores posibles:**
 | Status | Body | Causa |
@@ -3929,7 +4220,8 @@ lo elige el chofer al confirmar.
 | 400 | `{ "error": "El chofer no tiene vehiculos propios registrados" }` | El chofer no tiene vehículos |
 | 400 | `{ "error": "id_conductor es requerido" }` / errores de `paradas` / `fecha_programada` | Body inválido |
 | 403 | `{"error": "La PyME esta suspendida: no puede crear ni modificar viajes"}` | La PyME está `SUSPENDIDA` |
-| 503 | `{ "error": "No se pudo calcular la distancia" }` | Falló el cálculo de costo |
+| 400 | `{ "error": "No hay una ruta en auto entre la parada 1 y la parada 2. Revisá las direcciones." }` | Google no encuentra una ruta en auto entre dos paradas consecutivas |
+| 503 | `{ "error": "No se pudo calcular la ruta. Probá de nuevo en unos minutos." }` | Google no respondió (caído, timeout, key inválida o sin cuota). No se creó ni modificó nada |
 
 Emite `viaje:asignado` al chofer y a la sala de la PyME.
 
@@ -4796,20 +5088,23 @@ Valida las dos cosas y, si fallan, el `400` dice cuál (o las dos):
 - estar dentro de la **ventana de inicio**;
 - estar a ≤ `RADIO_CONFIRMACION_METROS` (50 m) de la **primera parada** (el origen).
 
-**Respuesta exitosa — 200:**
+**Respuesta exitosa — 200** (real):
 ```json
 {
   "mensaje": "Viaje iniciado",
-  "id_viaje": 464,
+  "id_viaje": 883,
   "estado": "CARGANDO",
-  "fecha_inicio": "2026-10-04T02:03:11.939Z",
-  "fecha_llegada_origen": "2026-10-04T02:03:11.939Z"
+  "fecha_inicio": "2026-10-09T21:36:15.690Z",
+  "fecha_llegada_origen": "2026-10-09T21:36:15.690Z",
+  "id_parada": 1787,
+  "llegada_real": "2026-10-09T21:36:15.690Z"
 }
 ```
-Recién después de este `200` el mobile tiene que arrancar el GPS (`conductor:ubicacion`). Los pings de
-un viaje `ASIGNADO` o `CONFIRMADO` se rechazan con `error { "error": "El viaje no fue iniciado" }`.
-Después se avanza con [`PATCH /api/viajes/:id/estado`](#patch-apiviajesidestado) y se cierra con
-[`POST /api/viajes/:id/confirmar-parada`](#post-apiviajesidconfirmar-parada), igual que antes.
+Iniciar es también la **llegada a la parada 1** (`llegada_real`; queda confirmada). Recién después de
+este `200` el mobile tiene que arrancar el GPS (`conductor:ubicacion`). Los pings de un viaje `ASIGNADO`
+o `CONFIRMADO` se rechazan con `error { "error": "El viaje no fue iniciado" }`. Después se recorre parada
+por parada con [`salir`](#post-apichoferesviajesidsalir) y
+[`confirmar-parada`](#post-apiviajesidconfirmar-parada).
 
 **Errores posibles** (reales):
 | Status | Body | Causa |
@@ -4823,6 +5118,67 @@ Después se avanza con [`PATCH /api/viajes/:id/estado`](#patch-apiviajesidestado
 | 409 | `{ "error": "El viaje cambio de estado mientras se procesaba tu pedido: volve a cargarlo" }` | Carrera (lo cancelaron o lo desvincularon en ese instante) |
 
 Emite `viaje:iniciado` y `viaje:estado_cambiado` a la PyME.
+
+---
+
+### POST /api/choferes/viajes/:id/salir
+
+El chofer **sale de la parada en la que está** (Paso 3). Sin body. Guarda `salida_real` y el peón real
+de esa parada.
+
+- Desde `CARGANDO` (parada 1) o `DESCARGANDO` (cualquier otra) → **`EN_RUTA`** si quedan paradas.
+- Desde la **última** parada → **`FINALIZADO`**: el cierre de siempre (precio real, remito, distancia
+  real) más los tiempos reales. Emite `viaje:finalizado`.
+- No valida proximidad: salir es irse.
+
+**Autenticación:** Requerida — rol `CONDUCTOR`, el chofer asignado.
+
+**Respuesta exitosa — 200** (real, quedan paradas):
+```json
+{
+  "mensaje": "Saliste de la parada",
+  "id_viaje": 883,
+  "id_parada": 1787,
+  "estado": "EN_RUTA",
+  "salida_real": "2026-10-09T21:36:19.192Z",
+  "viaje_finalizado": false
+}
+```
+**Respuesta exitosa — 200** (real, era la última):
+```json
+{
+  "mensaje": "Viaje finalizado",
+  "id_viaje": 883,
+  "id_parada": 1788,
+  "estado": "FINALIZADO",
+  "salida_real": "2026-10-09T21:36:23.652Z",
+  "viaje_finalizado": true,
+  "precio_real": 6.013888888888889,
+  "remito_url": "https://pub-259e35cb295345b4b029cc3b28a349e8.r2.dev/remitos/883.pdf",
+  "estimado": {
+    "manejo_horas": 0.2297222222222222,
+    "peon_horas": 1,
+    "total_horas": 1.2297222222222222,
+    "distancia_km": 4.322
+  },
+  "real": {
+    "manejo_horas": 0.0009533333333333334,
+    "peon_horas": 0.001258333333333333,
+    "total_horas": 0.0022116666666666665,
+    "distancia_km": 2.141186210529206
+  }
+}
+```
+
+**Errores posibles:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "No estas en ninguna parada: confirma la llegada a la siguiente antes de salir" }` | El viaje está `EN_RUTA` |
+| 400 | `{ "error": "No se puede salir de una parada en un viaje en estado CONFIRMADO" }` | No está en curso |
+| 404 | `{ "error": "Viaje no encontrado" }` | No es su viaje |
+| 409 | `{ "error": "El viaje cambio de estado mientras se procesaba tu pedido: volve a cargarlo" }` | Carrera (doble "salir", o lo cancelaron en ese instante) |
+
+Emite `viaje:estado_cambiado` (con `id_parada`) a la PyME.
 
 ---
 
@@ -4886,7 +5242,7 @@ personal. Todos los payloads traen `id_viaje` e `id_organizacion`.
 | `viaje:editado` | PyME + chofer | Al editar. `confirmacion_anulada: true` si estaba `CONFIRMADO` |
 | `viaje:confirmado` | PyME | El chofer confirma |
 | `viaje:rechazado` | PyME | El chofer rechaza |
-| `viaje:iniciado`, `viaje:estado_cambiado`, `viaje:finalizado` | PyME | Iniciar, avanzar, cierre |
+| `viaje:iniciado`, `viaje:estado_cambiado`, `viaje:finalizado` | PyME | Iniciar, salir, confirmar parada, cierre. `estado_cambiado` trae `id_parada`; `finalizado` trae `estimado`, `real` y `paradas` |
 | `viaje:cancelado` | PyME + chofer | Cualquier cancelación. `causa`: `CHOFER` / `ORGANIZACION` / `ADMIN` / `DESVINCULACION` |
 | `viaje:vencido` | PyME + chofer | Pasó a `VENCIDO`. Trae `estado_anterior` |
 | `mapa:actualizar`, `costo:actualizar`, `eta:actualizar`, `alerta:desvio`, `alerta:parada`, `ruta:recalculada` | PyME | Tracking en vivo de sus viajes en curso |
@@ -5025,27 +5381,67 @@ Payloads reales:
   "fecha_programada": "2026-10-04T00:23:56.985Z"
 }
 ```
-`viaje:finalizado`
+`viaje:finalizado` (real; el test recorre las paradas en segundos)
 ```json
 {
-  "id_viaje": 464,
-  "precio_real": 0,
+  "id_viaje": 883,
+  "precio_real": 6.013888888888889,
   "desglose": {
-    "precio_por_tiempo": 0,
+    "precio_por_tiempo": 6.013888888888889,
     "precio_por_distancia": null,
-    "tiempo_horas": 0,
-    "distancia_km": 0,
-    "tiempo_capital": 0,
+    "tiempo_horas": 0.0012027777777777779,
+    "distancia_km": 2.1411862105292063,
+    "tiempo_capital": 0.0012027777777777779,
     "distancia_provincia": null,
-    "tarifa_hora": 3500,
+    "tarifa_hora": 5000,
     "tarifa_km": null
   },
-  "remito_url": "https://pub-259e35cb295345b4b029cc3b28a349e8.r2.dev/remitos/464.pdf",
+  "remito_url": "https://pub-259e35cb295345b4b029cc3b28a349e8.r2.dev/remitos/883.pdf",
   "duracion_real": 0,
   "duracion_carga": 0,
   "duracion_descarga": 0,
   "duracion_aproximacion_origen": 0,
-  "puntualidad_inicio": "A_TIEMPO"
+  "puntualidad_inicio": "A_TIEMPO",
+  "estimado": {
+    "manejo_horas": 0.2297222222222222,
+    "peon_horas": 1,
+    "total_horas": 1.2297222222222222,
+    "distancia_km": 4.322
+  },
+  "real": {
+    "manejo_horas": 0.0009533333333333334,
+    "peon_horas": 0.001258333333333333,
+    "total_horas": 0.0022116666666666665,
+    "distancia_km": 2.141186210529206
+  },
+  "paradas": [
+    {
+      "id_parada": 1787,
+      "orden": 1,
+      "llegada_estimada": "2026-10-09T21:38:12.072Z",
+      "salida_estimada": "2026-10-09T22:08:12.072Z",
+      "llegada_real": "2026-10-09T21:36:15.690Z",
+      "salida_real": "2026-10-09T21:36:19.192Z",
+      "peon_estimado_min": 30,
+      "manejo_estimado_min": null,
+      "peon_real_min": 0,
+      "manejo_real_min": null,
+      "diferencia_min": -2
+    },
+    {
+      "id_parada": 1788,
+      "orden": 2,
+      "llegada_estimada": "2026-10-09T22:21:59.072Z",
+      "salida_estimada": "2026-10-09T22:51:59.072Z",
+      "llegada_real": "2026-10-09T21:36:22.624Z",
+      "salida_real": "2026-10-09T21:36:23.652Z",
+      "peon_estimado_min": 30,
+      "manejo_estimado_min": 14,
+      "peon_real_min": 0,
+      "manejo_real_min": 0,
+      "diferencia_min": -46
+    }
+  ]
 }
 ```
 `mapa:actualizar` (en la sala de la PyME)

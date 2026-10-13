@@ -76,12 +76,15 @@ const VENCE = { quien: ['SISTEMA'], accion: 'vencer' };
 // ASIGNADO -> ASIGNADO existe (reasignar / editar sin cambio de estado) y NO
 // genera fila de historial, igual que reasignarViaje en el ciclo legacy.
 //
-// CONFIRMADO -> CARGANDO es SOLO por "iniciar" (ventana + proximidad al origen):
-// el PATCH /estado no lo permite, ver ACCIONES_PATCH_ESTADO.
-//
-// EN_RUTA -> FINALIZADO esta porque es lo que ya hace confirmar-parada: si el
-// chofer confirma la ULTIMA parada en EN_RUTA, el cierre corre igual. La tabla
-// lo dice para no mentir sobre el comportamiento.
+// CICLO POR PARADA (Paso 3): en curso, el viaje alterna entre "en una parada"
+// (CARGANDO en la 1, DESCARGANDO en las demas) y EN_RUTA (manejando):
+//   - iniciar  (CONFIRMADO -> CARGANDO): llega a la parada 1.
+//   - salir    (CARGANDO / DESCARGANDO -> EN_RUTA): se va de la parada actual.
+//   - confirmar-parada (EN_RUTA -> DESCARGANDO): llega a la SIGUIENTE parada.
+//   - salir de la ULTIMA (DESCARGANDO -> FINALIZADO): cierra el viaje.
+// Cada parada queda con llegada_real y salida_real (ver medicion-real.service).
+// El PATCH /api/viajes/:id/estado NO aplica a viajes internos: todas las
+// transiciones van por estas tres acciones.
 export const TRANSICIONES_INTERNO = {
   ASIGNADO: {
     CONFIRMADO: { quien: ['CHOFER'], accion: 'confirmar' },
@@ -97,16 +100,16 @@ export const TRANSICIONES_INTERNO = {
     VENCIDO: VENCE,
   },
   CARGANDO: {
-    EN_RUTA: { quien: ['CHOFER'], accion: 'avanzar' },
+    EN_RUTA: { quien: ['CHOFER'], accion: 'salir' },
     CANCELADO: CANCELABLE_EN_CURSO,
   },
   EN_RUTA: {
-    DESCARGANDO: { quien: ['CHOFER'], accion: 'avanzar' },
-    FINALIZADO: { quien: ['CHOFER'], accion: 'confirmar-parada' },
+    DESCARGANDO: { quien: ['CHOFER'], accion: 'confirmar-parada' },
     CANCELADO: CANCELABLE_EN_CURSO,
   },
   DESCARGANDO: {
-    FINALIZADO: { quien: ['CHOFER'], accion: 'confirmar-parada' },
+    EN_RUTA: { quien: ['CHOFER'], accion: 'salir' },
+    FINALIZADO: { quien: ['CHOFER'], accion: 'salir' },
     CANCELADO: CANCELABLE_EN_CURSO,
   },
   FINALIZADO: {},
@@ -114,6 +117,11 @@ export const TRANSICIONES_INTERNO = {
   RECHAZADO: {},
   VENCIDO: {},
 };
+
+// Estados del ciclo interno en los que el chofer esta EN una parada (llego y
+// todavia no salio). En la 1 es CARGANDO; en las demas, DESCARGANDO (que desde
+// el Paso 3 significa "en una parada": carga o descarga).
+export const ESTADOS_EN_PARADA_INTERNO = ['CARGANDO', 'DESCARGANDO'];
 
 // Estados del ciclo interno en los que el viaje todavia no arranco y puede
 // vencer. Son tambien los unicos en los que la PyME puede reasignar o editar.

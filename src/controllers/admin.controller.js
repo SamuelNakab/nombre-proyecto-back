@@ -4,12 +4,17 @@ import { limpiarViajeActivo } from '../services/cancelacion.service.js';
 import { cancelarTimeoutReserva } from '../services/reserva.service.js';
 import { esViajeVencido, cancelarAvisoVencimiento } from '../services/vencimiento.service.js';
 import { calcularPuntualidadInicio } from '../services/puntualidad.service.js';
-import { calcularMetricasViaje } from '../services/duracion.service.js';
+import {
+  calcularMetricasViaje,
+  bloqueTiempos,
+  paradasConTiempos,
+} from '../services/duracion.service.js';
+import { guardarMedicionParcial } from '../services/medicion-real.service.js';
 import {
   registrarCambioEstado,
   INCLUDE_HISTORIAL,
 } from '../services/historial-estado.service.js';
-import { ESTADOS_TERMINALES } from '../services/estado-viaje.service.js';
+import { ESTADOS_TERMINALES, ESTADOS_EN_CURSO } from '../services/estado-viaje.service.js';
 import { emitirViajeInterno } from '../sockets/salas.js';
 import { io } from '../sockets/index.js';
 
@@ -97,6 +102,8 @@ const conVencido = (viajes) =>
     ...v,
     puntualidad_inicio: calcularPuntualidadInicio(v),
     vencido: esViajeVencido(v),
+    // Bloques estimado / real de manejo y peon (Paso 3).
+    ...bloqueTiempos(v),
   }));
 
 // ─── 1. GET /api/admin/usuarios ──────────────────────────────────────────────
@@ -307,9 +314,11 @@ export async function obtenerViaje(req, res) {
 
   return res.status(200).json({
     ...viaje,
+    paradas: paradasConTiempos(viaje.paradas),
     fee,
     remito_url,
     ...calcularMetricasViaje(viaje),
+    ...bloqueTiempos(viaje),
     vencido: esViajeVencido(viaje),
   });
 }
@@ -467,6 +476,7 @@ export async function cancelarViaje(req, res) {
   }
 
   const estadoAnterior = viaje.estado;
+  const ahora = new Date();
 
   // El viaje pasa a CANCELADO. Se guarda el motivo y quien lo cancelo. NO se
   // tocan id_conductor/id_vehiculo ni las paradas ya ENTREGADO (historial).
@@ -509,6 +519,11 @@ export async function cancelarViaje(req, res) {
   // el emisor de ETA y limpiar todas las keys gps:{id_viaje}:*. En
   // BUSCANDO_CONDUCTOR no hay nada que limpiar. limpiarViajeActivo es idempotente.
   if (estadoAnterior !== 'BUSCANDO_CONDUCTOR') {
+    // Cancelado EN CURSO: se guarda lo medido hasta ahora, ANTES de limpiar
+    // Redis (la distancia real sale del acumulado GPS). Nunca tira.
+    if (ESTADOS_EN_CURSO.includes(estadoAnterior)) {
+      await guardarMedicionParcial(id_viaje, ahora);
+    }
     await limpiarViajeActivo(id_viaje);
   }
 

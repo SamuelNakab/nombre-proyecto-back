@@ -510,6 +510,22 @@ model Viaje {
   fecha_rechazo      DateTime?
   causa_cancelacion  CausaCancelacion?
 
+  // ── Manejo / peon (Paso 3) ──
+  // Todas nullable (viajes anteriores no las tienen). Horas en la base, minutos
+  // en la API (ver duracion.service.js). duracion_estimada_horas sigue
+  // existiendo y es el TOTAL: manejo_estimado_horas + peon_estimado_horas.
+  // Lo estimado se escribe al crear y se reescribe al editar
+  // (estimacion.service.js). Lo real se escribe en cada salida de parada, al
+  // cerrar y, si se cancela en curso, con lo medido hasta ese momento
+  // (medicion-real.service.js).
+  manejo_estimado_horas Float?
+  peon_estimado_horas   Float?
+  distancia_estimada_km Float?
+  manejo_real_horas     Float?
+  peon_real_horas       Float?
+  // Del acumulado GPS de Redis, leido ANTES de limpiarlo.
+  distancia_real_km     Float?
+
   cliente             Cliente                @relation(fields: [id_cliente], references: [id_cliente])
   organizacion        Organizacion?          @relation(fields: [id_organizacion], references: [id_organizacion])
   creador             Usuario?               @relation("ViajesCreados", fields: [id_creador], references: [id_usuario])
@@ -571,6 +587,23 @@ model Parada {
   qr_token      String       @unique @default(cuid())
   estado        EstadoParada @default(PENDIENTE)
   fecha_entrega DateTime?
+
+  // ── Manejo / peon por parada (Paso 3) ──
+  // Estimado: la llegada y la salida que calculo el algoritmo de duracion, el
+  // peon en esta parada y el manejo / distancia del tramo que LLEGA a ella
+  // (null en la parada 1).
+  llegada_estimada      DateTime?
+  salida_estimada       DateTime?
+  peon_estimado_horas   Float?
+  manejo_estimado_horas Float?
+  distancia_estimada_km Float?
+  // Real (solo viajes internos): llegada = iniciar (parada 1) o
+  // confirmar-parada; salida = la accion "salir". peon = salida - llegada;
+  // manejo = llegada - salida de la parada anterior.
+  llegada_real          DateTime?
+  salida_real           DateTime?
+  peon_real_horas       Float?
+  manejo_real_horas     Float?
 
   viaje Viaje @relation(fields: [id_viaje], references: [id_viaje])
 

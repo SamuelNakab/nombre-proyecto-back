@@ -1,74 +1,45 @@
 import { obtenerTarifas } from './tarifa.service.js';
 import { clasificarZona, repartirPorZona } from './zona.service.js';
 import { obtenerAcumulado } from './gps.service.js';
+import { calcularTramo } from './maps/index.js';
+import { estimarRecorrido, tiempoPeonMinutos } from './estimacion.service.js';
+import { horasAMinutos } from './duracion.service.js';
 
-async function getDistanciaYTiempo(origenLat, origenLng, destinoLat, destinoLng) {
-  const apiKey = process.env.GOOGLE_MAPS_API_KEY;
-
-  if (!apiKey) {
-    console.warn('[costo.service] GOOGLE_MAPS_API_KEY no configurada — usando valores mock');
-    return { distancia_km: 10, tiempo_horas: 0.5 };
-  }
-
-  const url = new URL('https://maps.googleapis.com/maps/api/distancematrix/json');
-  url.searchParams.set('origins', `${origenLat},${origenLng}`);
-  url.searchParams.set('destinations', `${destinoLat},${destinoLng}`);
-  url.searchParams.set('mode', 'driving');
-  url.searchParams.set('language', 'es');
-  url.searchParams.set('units', 'metric');
-  url.searchParams.set('key', apiKey);
-
-  try {
-    const response = await fetch(url.toString());
-    const data = await response.json();
-
-    if (data.status !== 'OK') {
-      throw new Error(data.error_message || data.status);
-    }
-
-    const element = data.rows?.[0]?.elements?.[0];
-    if (!element || element.status !== 'OK') {
-      throw new Error(element?.status || 'ELEMENT_NOT_FOUND');
-    }
-
-    return {
-      distancia_km: element.distance.value / 1000,
-      tiempo_horas: element.duration.value / 3600,
-    };
-  } catch (err) {
-    console.warn('[costo.service] Error en Google Maps — usando mock:', err.message);
-    return { distancia_km: 10, tiempo_horas: 0.5 };
-  }
-}
-
-export async function calcularDistanciaYTiempo(origen, destino) {
-  return getDistanciaYTiempo(origen.lat, origen.lng, destino.lat, destino.lng);
-}
-
+// Estimacion de un viaje: recorrido (tramos secuenciales con trafico + peon en
+// cada parada, ver estimacion.service) y precio.
+//
+// EL PRECIO NO CAMBIO: tarifa.service recibe lo mismo que antes, el tiempo de
+// MANEJO (ahora con trafico, segun la hora de salida de cada tramo) y la
+// distancia. El peon NO se cobra todavia: solo suma a la duracion.
+//
+// Si Google falla, tira ErrorMaps (503, o 400 si no hay ruta posible): nunca
+// mas valores inventados. Va SIEMPRE antes de cualquier transaccion, asi un
+// fallo no crea ni modifica nada.
+//
 // La zona NO se recibe por parametro: se deduce de las coordenadas de las
 // paradas con clasificarZona. Lo que el cliente mande como `zona` en el body se
 // ignora a proposito. Se devuelve la zona calculada para que el caller la
 // persista.
 export async function estimarCosto({ paradas, fecha_programada }) {
   const zona = clasificarZona(paradas);
-  const { tarifa_hora, tarifa_km, es_hora_pico } = obtenerTarifas(zona, new Date(fecha_programada));
+  const fecha = new Date(fecha_programada);
+  const { tarifa_hora, tarifa_km, es_hora_pico } = obtenerTarifas(zona, fecha);
 
-  let distancia_total_km = 0;
-  let tiempo_total_horas = 0;
-
-  for (let i = 0; i < paradas.length - 1; i++) {
-    const tramo = await calcularDistanciaYTiempo(paradas[i], paradas[i + 1]);
-    distancia_total_km += tramo.distancia_km;
-    tiempo_total_horas += tramo.tiempo_horas;
-  }
+  const recorrido = await estimarRecorrido({
+    paradas,
+    inicio: fecha,
+    peonMinutos: tiempoPeonMinutos(),
+    calcularTramo,
+  });
+  const { manejo_horas, distancia_km } = recorrido.totales;
 
   // Magnitudes facturables. En MIXTO esto reparte proporcionalmente en vez de
   // cobrar el tiempo total Y la distancia total (ver repartirPorZona).
   const { tiempo_capital, distancia_provincia, fraccion_caba } = repartirPorZona({
     zona,
     paradas,
-    tiempo_horas: tiempo_total_horas,
-    distancia_km: distancia_total_km,
+    tiempo_horas: manejo_horas,
+    distancia_km,
   });
 
   const precio_por_tiempo = tiempo_capital === null ? null : tiempo_capital * tarifa_hora;
@@ -82,8 +53,10 @@ export async function estimarCosto({ paradas, fecha_programada }) {
     desglose: {
       precio_por_tiempo,
       precio_por_distancia,
-      tiempo_horas: tiempo_total_horas,
-      distancia_km: distancia_total_km,
+      // El MANEJO (input del precio). La duracion total (manejo + peon) va en
+      // `estimado.total_horas` y en Viaje.duracion_estimada_horas.
+      tiempo_horas: manejo_horas,
+      distancia_km,
       tiempo_capital,
       distancia_provincia,
       fraccion_caba,
@@ -91,6 +64,37 @@ export async function estimarCosto({ paradas, fecha_programada }) {
       tarifa_km,
       es_hora_pico,
     },
+    // Para persistir (columnas del viaje y de cada parada) y para la ruta
+    // planeada (la polilinea concatenada de los tramos).
+    recorrido,
+  };
+}
+
+// Lo que devuelve POST /api/viajes/estimar-costo: el resultado sin la
+// polilinea, con el estimado separado en manejo y peon y el detalle por tramo
+// (minutos enteros, como toda duracion de la API).
+export function serializarEstimacion({ zona, precio_estimado, desglose, recorrido }) {
+  const { totales } = recorrido;
+  return {
+    zona,
+    precio_estimado,
+    desglose,
+    estimado: {
+      manejo_horas: totales.manejo_horas,
+      peon_horas: totales.peon_horas,
+      total_horas: totales.total_horas,
+      distancia_km: totales.distancia_km,
+      inicio_estimado: totales.inicio_estimado,
+      fin_estimado: totales.fin_estimado,
+    },
+    tramos: recorrido.paradas.map((p) => ({
+      orden: p.orden,
+      llegada_estimada: p.llegada_estimada,
+      salida_estimada: p.salida_estimada,
+      peon_estimado_min: horasAMinutos(p.peon_estimado_horas),
+      manejo_estimado_min: horasAMinutos(p.manejo_estimado_horas),
+      distancia_estimada_km: p.distancia_estimada_km,
+    })),
   };
 }
 

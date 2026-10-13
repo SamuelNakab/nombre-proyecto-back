@@ -2,10 +2,11 @@ import { Prisma } from '@prisma/client';
 import prisma from '../config/prisma.js';
 import { ErrorNegocio } from './error-negocio.js';
 import { OPCIONES_TX } from './organizacion.service.js';
-import { ESTADOS_TERMINALES, ORIGEN_HISTORIAL } from './estado-viaje.service.js';
+import { ESTADOS_TERMINALES, ESTADOS_EN_CURSO, ORIGEN_HISTORIAL } from './estado-viaje.service.js';
 import { registrarCambioEstado } from './historial-estado.service.js';
 import { cancelarAvisoVencimiento } from './vencimiento.service.js';
 import { limpiarViajeActivo } from './cancelacion.service.js';
+import { guardarMedicionParcial } from './medicion-real.service.js';
 import { emitirViajeInterno } from '../sockets/salas.js';
 
 // ─── Lecturas ────────────────────────────────────────────────────────────────
@@ -91,6 +92,7 @@ const ESTADOS_FINALES_SQL = Prisma.join(ESTADOS_TERMINALES);
 // Fuera de la tx: historial, timers, limpieza de ETA/GPS/Redis y eventos.
 // Devuelve los ids de los viajes cancelados.
 export async function desvincularChofer({ id_organizacion, id_conductor, actor, io = null }) {
+  const ahora = new Date();
   const cancelados = await prisma.$transaction(async (tx) => {
     const r = await tx.vinculoChofer.updateMany({
       where: { id_organizacion, id_conductor, activo: true },
@@ -140,6 +142,11 @@ export async function desvincularChofer({ id_organizacion, id_conductor, actor, 
         origen,
       });
       cancelarAvisoVencimiento(id_viaje);
+      // Cancelado EN CURSO: se guarda lo medido hasta la desvinculacion, ANTES
+      // de limpiar Redis. Nunca tira.
+      if (ESTADOS_EN_CURSO.includes(estado)) {
+        await guardarMedicionParcial(id_viaje, ahora);
+      }
       // Idempotente: en los pre-inicio no hay nada, en los en curso corta el
       // emisor de ETA y borra todas las keys gps:{id}:*.
       await limpiarViajeActivo(id_viaje);

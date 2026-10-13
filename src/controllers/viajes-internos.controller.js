@@ -13,7 +13,7 @@ import { z } from 'zod';
 import { responderErrorNegocio } from '../services/error-negocio.js';
 import { calcularCostoAcumulado } from '../services/costo.service.js';
 import {
-  schemaParadas,
+  schemaParadasInternas,
   schemaCondiciones,
   schemaFechaProgramada,
 } from '../services/viaje-validacion.js';
@@ -48,7 +48,7 @@ const schemaCrear = z.object({
   id_conductor: idPositivo('id_conductor'),
   // `zona` se acepta y se ignora, igual que en la ruta legacy.
   zona: z.enum(['CABA', 'PROVINCIA', 'MIXTO']).optional(),
-  paradas: schemaParadas,
+  paradas: schemaParadasInternas,
   fecha_programada: schemaFechaProgramada,
   condiciones_requeridas: schemaCondiciones.optional().default([]),
   descripcion: z.string().max(500).optional(),
@@ -57,7 +57,7 @@ const schemaCrear = z.object({
 const schemaEditar = z
   .object({
     zona: z.enum(['CABA', 'PROVINCIA', 'MIXTO']).optional(),
-    paradas: schemaParadas.optional(),
+    paradas: schemaParadasInternas.optional(),
     fecha_programada: schemaFechaProgramada.optional(),
     condiciones_requeridas: schemaCondiciones.optional(),
     descripcion: z.string().max(500).nullable().optional(),

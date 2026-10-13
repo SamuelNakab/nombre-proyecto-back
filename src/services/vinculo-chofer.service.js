@@ -77,23 +77,29 @@ const ESTADOS_FINALES_SQL = Prisma.join(ESTADOS_TERMINALES);
 // Que sea una sola funcion es lo que garantiza que el enganche del Paso 2 corre
 // en los dos caminos: en la MISMA transaccion que corta el vinculo, se cancelan
 // TODOS los viajes no finales de este chofer con esta PyME, INCLUSO uno en
-// curso, con causa DESVINCULACION. Los viajes del chofer con OTRAS PyMEs no se
-// tocan.
+// curso, con causa DESVINCULACION. Desde el Paso 4, en esa misma transaccion las
+// series ACTIVAS de este chofer con esta PyME pasan a BORRADA (no generan nada
+// mas: la serie no se renueva sola, pero queda claro que murio con el vinculo).
+// Los viajes y series del chofer con OTRAS PyMEs no se tocan.
 //
-// Locks, en este orden (el mismo que crear / reasignar: vinculo -> viaje):
+// Locks, en este orden (el mismo que crear / reasignar / crear serie: vinculo ->
+// lo demas):
 //   1. updateMany del vinculo condicionado a activo: toma el lock de la fila.
 //      Dos desvinculaciones a la vez (el chofer y la PyME): gana una, la otra
-//      matchea 0 filas y recibe 404. Un crear / reasignar concurrente, que
-//      bloquea el mismo vinculo, espera y despues lo ve inactivo.
-//   2. SELECT ... FOR UPDATE de los viajes no finales: un iniciar / confirmar
+//      matchea 0 filas y recibe 404. Un crear / reasignar / crear serie
+//      concurrente, que bloquea el mismo vinculo, espera y despues lo ve
+//      inactivo (y no crea nada).
+//   2. UPDATE ... RETURNING de las series ACTIVAS -> BORRADA (toma el lock de
+//      esas filas: un cancelar serie concurrente gana antes o matchea 0 filas).
+//   3. SELECT ... FOR UPDATE de los viajes no finales: un iniciar / confirmar
 //      concurrente espera al commit y despues matchea 0 filas (409); si gano el
 //      iniciar, el viaje ya esta en CARGANDO y se cancela igual.
 //
 // Fuera de la tx: historial, timers, limpieza de ETA/GPS/Redis y eventos.
-// Devuelve los ids de los viajes cancelados.
+// Devuelve { viajes_cancelados, series_borradas } (ids).
 export async function desvincularChofer({ id_organizacion, id_conductor, actor, io = null }) {
   const ahora = new Date();
-  const cancelados = await prisma.$transaction(async (tx) => {
+  const resultado = await prisma.$transaction(async (tx) => {
     const r = await tx.vinculoChofer.updateMany({
       where: { id_organizacion, id_conductor, activo: true },
       data: {
@@ -107,6 +113,18 @@ export async function desvincularChofer({ id_organizacion, id_conductor, actor, 
       throw new ErrorNegocio(404, 'No hay un vinculo activo con ese chofer');
     }
 
+    // UN UPDATE ... RETURNING: devuelve exactamente las series que paso a
+    // BORRADA. Un cancelar serie concurrente que gano antes la deja CANCELADA y
+    // no aparece en la lista; si gana este, aquel matchea 0 filas (409).
+    const series = await tx.$queryRaw`
+      UPDATE series_viaje
+      SET estado = 'BORRADA'::"EstadoSerie", fecha_baja = ${ahora},
+          baja_por_id_usuario = ${actor.id_usuario}, actualizado_en = ${ahora}
+      WHERE id_organizacion = ${id_organizacion}
+        AND id_conductor = ${id_conductor}
+        AND estado = 'ACTIVA'::"EstadoSerie"
+      RETURNING id_serie`;
+
     const viajes = await tx.$queryRaw`
       SELECT id_viaje, estado::text AS estado
       FROM viajes
@@ -115,7 +133,7 @@ export async function desvincularChofer({ id_organizacion, id_conductor, actor, 
         AND estado::text NOT IN (${ESTADOS_FINALES_SQL})
       ORDER BY id_viaje
       FOR UPDATE`;
-    if (viajes.length === 0) return [];
+    if (viajes.length === 0) return { viajes: [], series };
 
     await tx.viaje.updateMany({
       where: {
@@ -124,8 +142,9 @@ export async function desvincularChofer({ id_organizacion, id_conductor, actor, 
       },
       data: { estado: 'CANCELADO', causa_cancelacion: 'DESVINCULACION' },
     });
-    return viajes;
+    return { viajes, series };
   }, OPCIONES_TX);
+  const cancelados = resultado.viajes;
 
   if (cancelados.length > 0) {
     const chofer = await prisma.conductor.findUnique({
@@ -166,5 +185,8 @@ export async function desvincularChofer({ id_organizacion, id_conductor, actor, 
     }
   }
 
-  return cancelados.map((v) => v.id_viaje);
+  return {
+    viajes_cancelados: cancelados.map((v) => v.id_viaje),
+    series_borradas: resultado.series.map((x) => x.id_serie),
+  };
 }

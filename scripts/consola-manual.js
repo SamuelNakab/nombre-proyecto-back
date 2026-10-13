@@ -18,6 +18,11 @@
 // (salir de la parada actual) y 6 (confirmar la llegada a la siguiente). Salir de
 // la ULTIMA finaliza el viaje. La opcion 5 (PATCH /estado) NO aplica a viajes de
 // PyME (da 400). Tambien cancelar como chofer o como PyME, reasignar y editar.
+//
+// Lugares y series (Paso 4), opciones de DOS letras: la (crear lugar), ll
+// (listar lugares), lv (crear un viaje con un lugar como origen), sa (crear
+// serie), sl (listar series), sv (ver serie con sus viajes) y sc (cancelar
+// serie). El evento serie:asignada se ve en vivo en los dos sockets.
 // Las opciones 1, 2, 7 y 8 son del marketplace: con MARKETPLACE_HABILITADO en
 // false, 1 y 2 dan 404 / error.
 //
@@ -85,6 +90,9 @@ const EVENTOS = [
   'viaje:rechazado',
   'viaje:cancelado',
   'viaje:vencido',
+  // Series (Paso 4).
+  'serie:asignada',
+  'serie:cancelada',
   'error',
 ];
 
@@ -97,6 +105,9 @@ const estado = {
   // (el backend lo muestra UNA sola vez, asi que lo guardamos para canjearlo).
   idOrganizacion: null,
   ultimoCodigo: null,
+  // Lugares y series (Paso 4): el ultimo lugar y la ultima serie creados.
+  idLugar: null,
+  idSerie: null,
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -546,6 +557,106 @@ async function accionEditar() {
   mostrar('PUT /api/organizaciones/:id/viajes/:idViaje', await api('PUT', rutaViajePyme(), body, estado.clienteToken));
 }
 
+// ── Lugares y series (Paso 4) ────────────────────────────────────────────────
+
+const rutaPyme = (sufijo) => `/api/organizaciones/${estado.idOrganizacion}${sufijo}`;
+
+async function accionCrearLugar() {
+  if (!(await requierePyme())) return;
+  const nombre = (await pregunta('  Nombre [Deposito Plaza de Mayo]: ')) || 'Deposito Plaza de Mayo';
+  const direccion = (await pregunta(`  Direccion [${PARADA_1.direccion}]: `)) || PARADA_1.direccion;
+  const r = await api('POST', rutaPyme('/lugares'), { nombre, direccion, lat: PARADA_1.lat, lng: PARADA_1.lng }, estado.clienteToken);
+  if (r.status === 201) estado.idLugar = r.data.id_lugar;
+  mostrar('POST /api/organizaciones/:id/lugares', r);
+}
+
+async function accionListarLugares() {
+  if (!(await requierePyme())) return;
+  const r = await api('GET', rutaPyme('/lugares'), null, estado.clienteToken);
+  if (r.status !== 200) return mostrar('GET /api/organizaciones/:id/lugares', r);
+  if (r.data.length === 0) console.log('    (sin lugares)');
+  for (const l of r.data) console.log(`    #${l.id_lugar} ${l.nombre} — ${l.direccion} (${l.lat}, ${l.lng})`);
+}
+
+// El ORIGEN sale de un lugar guardado (snapshot): el chofer ve la direccion,
+// nunca el nombre.
+async function accionCrearViajeConLugar() {
+  if (!(await requierePyme())) return;
+  const id_lugar = await preguntarNumero('  id_lugar del origen', estado.idLugar ?? 0);
+  const id_conductor = await elegirChofer();
+  if (id_conductor == null) return;
+  const minutos = await preguntarNumero('  Minutos desde ahora para fecha_programada', 70);
+  const r = await api('POST', rutaPyme('/viajes'), {
+    id_conductor,
+    fecha_programada: new Date(Date.now() + minutos * 60000).toISOString(),
+    paradas: [{ id_lugar }, PARADA_2],
+  }, estado.clienteToken);
+  if (r.status === 201) estado.idViaje = r.data.id_viaje;
+  mostrar('POST /api/organizaciones/:id/viajes (con lugar)', r);
+}
+
+// Fecha local de Buenos Aires (UTC-3) en YYYY-MM-DD.
+const fechaLocal = (dias = 0) => new Date(Date.now() - 3 * 3600000 + dias * 86400000).toISOString().slice(0, 10);
+
+async function accionCrearSerie() {
+  if (!(await requierePyme())) return;
+  const id_conductor = await elegirChofer();
+  if (id_conductor == null) return;
+  const frecuencia = ((await pregunta('  Frecuencia (DIARIA / DIAS_SEMANA / SEMANAL / MENSUAL) [DIARIA]: ')) || 'DIARIA').toUpperCase();
+  const body = { id_conductor, frecuencia };
+  if (frecuencia === 'DIAS_SEMANA') {
+    const raw = (await pregunta('  Dias (1 = lunes ... 7 = domingo, separados por coma) [1,3,5]: ')) || '1,3,5';
+    body.dias_semana = raw.split(',').map((d) => Number(d.trim()));
+  } else if (frecuencia === 'SEMANAL') {
+    body.dia_semana = await preguntarNumero('  Dia de la semana (1 = lunes ... 7 = domingo)', 1);
+  } else if (frecuencia === 'MENSUAL') {
+    body.dia_mes = await preguntarNumero('  Dia del mes (29-31 se ajusta a fin de mes)', 1);
+  }
+  body.hora = (await pregunta('  Hora local HH:MM [09:00]: ')) || '09:00';
+  body.fecha_desde = (await pregunta(`  fecha_desde YYYY-MM-DD [${fechaLocal(1)}]: `)) || fechaLocal(1);
+  const hasta = await pregunta('  fecha_hasta YYYY-MM-DD (vacio = desde + 30 dias): ');
+  if (hasta) body.fecha_hasta = hasta;
+  const usarLugar = estado.idLugar != null && (await siONo(`Usar el lugar #${estado.idLugar} como origen`));
+  body.paradas = [usarLugar ? { id_lugar: estado.idLugar } : PARADA_1, PARADA_2];
+  body.condiciones_requeridas = await preguntarCondiciones();
+  console.log('  Creando la serie (una estimacion de Google por viaje, puede tardar unos segundos)...');
+  const r = await api('POST', rutaPyme('/series'), body, estado.clienteToken);
+  if (r.status !== 201) return mostrar('POST /api/organizaciones/:id/series', r);
+  estado.idSerie = r.data.serie.id_serie;
+  console.log(`  ✅ serie #${estado.idSerie}: ${r.data.viajes.length} viajes`);
+  for (const v of r.data.viajes) console.log(`    #${v.id_viaje} ${v.fecha_programada} ${v.estado}`);
+  for (const o of r.data.salteadas) console.log(`    salteada ${o.fecha}: ${o.motivo}`);
+  for (const o of r.data.ajustadas) console.log(`    ajustada ${o.fecha}: ${o.motivo}`);
+}
+
+async function accionListarSeries() {
+  if (!(await requierePyme())) return;
+  const r = await api('GET', rutaPyme('/series'), null, estado.clienteToken);
+  if (r.status !== 200) return mostrar('GET /api/organizaciones/:id/series', r);
+  if (r.data.length === 0) console.log('    (sin series)');
+  for (const se of r.data) {
+    console.log(
+      `    #${se.id_serie} ${se.estado.padEnd(9)} ${se.frecuencia} ${se.hora} ${se.fecha_desde}..${se.fecha_hasta} ` +
+        `chofer=${se.conductor?.nombre ?? '—'} viajes=${JSON.stringify(se.resumen_viajes.por_estado)}`
+    );
+  }
+}
+
+async function accionVerSerie() {
+  if (!(await requierePyme())) return;
+  const id = await preguntarNumero('  id_serie', estado.idSerie ?? 0);
+  const r = await api('GET', rutaPyme(`/series/${id}`), null, estado.clienteToken);
+  if (r.status !== 200) return mostrar('GET /api/organizaciones/:id/series/:idSerie', r);
+  console.log(`  serie #${r.data.id_serie} ${r.data.estado} ${r.data.frecuencia} ${r.data.hora} (${r.data.zona_horaria})`);
+  for (const v of r.data.viajes) console.log(`    #${v.id_viaje} ${v.fecha_programada} ${v.estado} chofer=${v.conductor?.nombre ?? '—'}`);
+}
+
+async function accionCancelarSerie() {
+  if (!(await requierePyme())) return;
+  const id = await preguntarNumero('  id_serie a cancelar (sus viajes NO se tocan)', estado.idSerie ?? 0);
+  mostrar('POST /api/organizaciones/:id/series/:idSerie/cancelar', await api('POST', rutaPyme(`/series/${id}/cancelar`), null, estado.clienteToken));
+}
+
 // ── Menu ──────────────────────────────────────────────────────────────────────
 
 function imprimirMenu() {
@@ -589,6 +700,14 @@ function imprimirMenu() {
 ║  u) Reasignar a otro chofer    (cliente)       ║
 ║  v) Editar                     (cliente)       ║
 ║  w) Ver viaje de la PyME       (cliente)       ║
+╠═════════════ LUGARES Y SERIES (Paso 4) ════════╣
+║  la) Crear lugar               (cliente)       ║
+║  ll) Listar lugares            (cliente)       ║
+║  lv) Crear viaje con un lugar  (cliente)       ║
+║  sa) Crear serie               (cliente)       ║
+║  sl) Listar series             (cliente)       ║
+║  sv) Ver serie y sus viajes    (cliente)       ║
+║  sc) Cancelar serie            (cliente)       ║
 ║  0) Salir                                      ║
 ╚══════════════════════════════════════════════╝`);
 }
@@ -632,6 +751,13 @@ async function loopMenu(sCliente, sConductor) {
       case 'v': await accionEditar(); break;
       case 'w': await accionVerViajePyme(); break;
       case 'x': await accionSalirDeParada(); break;
+      case 'la': await accionCrearLugar(); break;
+      case 'll': await accionListarLugares(); break;
+      case 'lv': await accionCrearViajeConLugar(); break;
+      case 'sa': await accionCrearSerie(); break;
+      case 'sl': await accionListarSeries(); break;
+      case 'sv': await accionVerSerie(); break;
+      case 'sc': await accionCancelarSerie(); break;
       case '0':
         console.log('  Cerrando…');
         try { sCliente.disconnect(); } catch { /* noop */ }

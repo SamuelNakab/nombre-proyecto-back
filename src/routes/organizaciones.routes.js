@@ -29,6 +29,8 @@ import {
   costoAcumulado,
   remito,
 } from '../controllers/viajes-internos.controller.js';
+import * as lugares from '../controllers/lugares.controller.js';
+import * as series from '../controllers/series.controller.js';
 
 const router = Router();
 
@@ -65,5 +67,19 @@ router.post('/:id/viajes/:idViaje/reasignar', requireMiembro, reasignarViaje);
 router.post('/:id/viajes/:idViaje/cancelar', requireMiembro, cancelarViajePyme);
 router.get('/:id/viajes/:idViaje/costo-acumulado', requireMiembro, costoAcumulado);
 router.get('/:id/viajes/:idViaje/remito', requireMiembro, remito);
+
+// Lugares guardados (Paso 4). Cualquier miembro activo. Un lugar de otra PyME da
+// 404. Borrar es soft delete.
+router.get('/:id/lugares', requireMiembro, lugares.listar);
+router.post('/:id/lugares', requireMiembro, lugares.crear);
+router.put('/:id/lugares/:idLugar', requireMiembro, lugares.editar);
+router.delete('/:id/lugares/:idLugar', requireMiembro, lugares.borrar);
+
+// Series de viajes (Paso 4). Cualquier miembro activo. Crear genera TODOS los
+// viajes de la ventana (todo o nada); cancelar no toca los viajes creados.
+router.post('/:id/series', requireMiembro, series.crear);
+router.get('/:id/series', requireMiembro, series.listar);
+router.get('/:id/series/:idSerie', requireMiembro, series.obtener);
+router.post('/:id/series/:idSerie/cancelar', requireMiembro, series.cancelar);
 
 export default router;

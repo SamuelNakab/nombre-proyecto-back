@@ -522,7 +522,9 @@ Calcula el costo y la duración estimados de un viaje sin crearlo, con el
 - `zona`: **se acepta pero se IGNORA.** Se mantiene solo por compatibilidad con el front actual,
   que la sigue mandando. La zona real la calcula el servidor a partir de las coordenadas de las
   paradas — ver [Cómo se determina la zona](#cómo-se-determina-la-zona).
-- `paradas`: mínimo 2 elementos
+- `paradas`: mínimo 2 y máximo `MAX_PARADAS_POR_VIAJE` (default 10) elementos; con más → `400`
+  `{ "error": "Un viaje puede tener como máximo 10 paradas" }`. Acá solo coordenadas: `{ id_lugar }`
+  no se acepta (ver [Lugares guardados](#lugares-guardados-y-series-de-viajes-paso-4)).
 - `fecha_programada`: opcional. Si se omite se usa la fecha/hora actual para determinar si es hora pico.
   **No** tiene mínimo de anticipación: a diferencia de [`POST /api/viajes`](#post-apiviajes), acá
   no aplica `ANTICIPACION_MINIMA_MINUTOS` y se acepta cualquier fecha, incluso pasada.
@@ -649,6 +651,8 @@ instantáneamente a los conductores elegibles conectados via WebSocket.
   [`POST /api/viajes/estimar-costo`](#post-apiviajesestimar-costo) **no** tiene este mínimo:
   su `fecha_programada` es opcional y solo sirve para determinar si cae en hora pico, así que
   acepta cualquier fecha, incluso pasada.
+- `paradas`: mínimo 2 y máximo `MAX_PARADAS_POR_VIAJE` (default 10); con más → `400`
+  `{ "error": "Un viaje puede tener como máximo 10 paradas" }`.
 - `condiciones_requeridas`: opcional. Valores posibles: `FRAGIL`, `REFRIGERADO`,
   `CARGA_PESADA`, `PELIGROSO`, `VOLUMINOSO`
 - `descripcion`: opcional. Texto libre visible para el conductor antes de aceptar y en el
@@ -3726,8 +3730,11 @@ volver a vincularse más adelante con un código nuevo.
 
 **Respuesta exitosa — 200:**
 ```json
-{ "mensaje": "Chofer desvinculado", "id_conductor": 4, "viajes_cancelados": [101, 102, 103, 104] }
+{ "mensaje": "Chofer desvinculado", "id_conductor": 4, "viajes_cancelados": [101, 102, 103, 104], "series_borradas": [7] }
 ```
+- **Paso 4:** en la misma operación, las [series](#series-de-viajes) **ACTIVAS** de ese chofer con
+  esta PyME pasan a `BORRADA`; `series_borradas` trae sus ids (`[]` si no había). Las series ya
+  canceladas y las de otras PyMEs no se tocan.
 - **Paso 2:** en la misma operación se cancelan **todos** los viajes no finales de ese chofer con esta
   PyME, incluso uno en curso (`causa_cancelacion: "DESVINCULACION"`). `viajes_cancelados` trae sus ids
   (`[]` si no había). La PyME y el chofer reciben `viaje:cancelado` por cada uno. Los viajes del chofer
@@ -3771,10 +3778,10 @@ El chofer se desvincula de una PyME (`:id` = `id_organizacion`).
 
 **Respuesta exitosa — 200:**
 ```json
-{ "mensaje": "Te desvinculaste de la PyME", "id_organizacion": 2, "viajes_cancelados": [105] }
+{ "mensaje": "Te desvinculaste de la PyME", "id_organizacion": 2, "viajes_cancelados": [105], "series_borradas": [] }
 ```
 - Mismo efecto que desvincular desde la PyME: se cancelan tus viajes no finales **con esa PyME**,
-  incluso uno en curso.
+  incluso uno en curso, y sus series activas con esa PyME pasan a `BORRADA` (`series_borradas`).
 
 **Errores posibles:**
 | Status | Body | Causa |
@@ -3942,6 +3949,15 @@ iniciar (parada 1) → CARGANDO ─salir→ EN_RUTA ─confirmar parada 2→ DES
 
 Los viajes del marketplace (legacy) no cambian.
 
+**Paso 4 (lugares y series), también para mobile:**
+
+5. Las paradas que recibe el chofer (REST y sockets) **no** traen `id_lugar` ni `lugar`: solo
+   dirección y coordenadas. Nada cambia en cómo se muestran.
+6. Una [serie](#series-de-viajes) genera muchos viajes de una vez y el chofer recibe **un solo**
+   evento [`serie:asignada`](#websocket--serieasignada-y-seriecancelada) con todos (no un
+   `viaje:asignado` por cada uno). Los viajes de una serie se listan, confirman y rechazan **uno por
+   uno** como cualquier otro, y traen `id_serie` (null en un viaje suelto).
+
 ---
 
 ## Viaje interno — la PyME asigna, el chofer confirma (Paso 2)
@@ -4041,7 +4057,12 @@ lo elige el chofer al confirmar.
 ```
 - `id_conductor`: el `id_conductor` de [`GET /api/organizaciones/:id/choferes`](#get-apiorganizacionesidchoferes).
 - `paradas` y `condiciones_requeridas`: mismo formato que la ruta vieja. La primera parada es el **origen**
-  (ahí se inicia el viaje). `zona` se acepta y se ignora (la calcula el servidor).
+  (ahí se inicia el viaje). `zona` se acepta y se ignora (la calcula el servidor). Entre 2 y
+  `MAX_PARADAS_POR_VIAJE` (default 10) paradas.
+- **Paso 4:** cada parada puede ser `{ "id_lugar": 40 }` (un [lugar guardado](#lugares-guardados) de
+  la PyME) en vez de coordenadas: se **copian** su dirección y coordenadas a la parada y la parada
+  guarda `id_lugar`. La PyME ve `parada.lugar = { id_lugar, nombre, activo }` (`null` si la parada no
+  vino de un lugar); el chofer nunca. Lo mismo en el `PUT` de edición.
 - `fecha_programada`: futura, con al menos `ANTICIPACION_MINIMA_MINUTOS` de anticipación (mismo mensaje
   que la ruta vieja).
 - El precio sale del mismo cálculo de siempre; la duración, del [algoritmo nuevo](#algoritmo-de-duración-estimada).
@@ -4219,6 +4240,9 @@ lo elige el chofer al confirmar.
 | 400 | `{"error": "El chofer no tiene un vehiculo propio que cumpla las condiciones del viaje: REFRIGERADO"}` | Ningún vehículo **propio** del chofer cumple las condiciones (la flota de empresas no cuenta) |
 | 400 | `{ "error": "El chofer no tiene vehiculos propios registrados" }` | El chofer no tiene vehículos |
 | 400 | `{ "error": "id_conductor es requerido" }` / errores de `paradas` / `fecha_programada` | Body inválido |
+| 400 | `{ "error": "Un viaje puede tener como máximo 10 paradas" }` | Más de `MAX_PARADAS_POR_VIAJE` paradas |
+| 400 | `{ "error": "El lugar 42 no existe o no esta activo" }` | Un `id_lugar` borrado, inexistente o de otra PyME (mismo mensaje) |
+| 400 | `{ "error": "Cada parada lleva id_lugar o lat y lng, no las dos cosas" }` | Una parada con `id_lugar` y coordenadas |
 | 403 | `{"error": "La PyME esta suspendida: no puede crear ni modificar viajes"}` | La PyME está `SUSPENDIDA` |
 | 400 | `{ "error": "No hay una ruta en auto entre la parada 1 y la parada 2. Revisá las direcciones." }` | Google no encuentra una ruta en auto entre dos paradas consecutivas |
 | 503 | `{ "error": "No se pudo calcular la ruta. Probá de nuevo en unos minutos." }` | Google no respondió (caído, timeout, key inválida o sin cuota). No se creó ni modificó nada |
@@ -5246,6 +5270,8 @@ personal. Todos los payloads traen `id_viaje` e `id_organizacion`.
 | `viaje:cancelado` | PyME + chofer | Cualquier cancelación. `causa`: `CHOFER` / `ORGANIZACION` / `ADMIN` / `DESVINCULACION` |
 | `viaje:vencido` | PyME + chofer | Pasó a `VENCIDO`. Trae `estado_anterior` |
 | `mapa:actualizar`, `costo:actualizar`, `eta:actualizar`, `alerta:desvio`, `alerta:parada`, `ruta:recalculada` | PyME | Tracking en vivo de sus viajes en curso |
+| `serie:asignada` (Paso 4) | PyME + chofer | Al crear una serie: **un** evento con todos sus viajes. Ver [Series](#websocket--serieasignada-y-seriecancelada) |
+| `serie:cancelada` (Paso 4) | PyME | Al cancelar una serie (sus viajes no cambian) |
 
 `viaje:asignado` y `viaje:vencido` tienen el mismo nombre que eventos del marketplace pero otro payload:
 en un viaje de PyME siempre traen `id_organizacion`.
@@ -5500,6 +5526,341 @@ emite `viaje:cancelado` a la PyME y al chofer. Real (recortado):
   "causa_cancelacion": null
 }
 ```
+
+---
+
+## Lugares guardados y series de viajes (Paso 4)
+
+Dos herramientas de la PyME para no cargar lo mismo cada vez:
+
+- **Lugares guardados**: direcciones frecuentes con nombre ("Depósito Pilar"). Se usan como parada
+  al crear o editar un viaje y en las series.
+- **Series**: una recurrencia (todos los días, ciertos días de la semana, semanal o mensual, a una
+  hora) que genera **de una vez** todos los viajes de los próximos 30 días.
+
+Todas las rutas: **Autenticación** requerida, miembro activo de la PyME (`RESPONSABLE` o `MIEMBRO`). Un
+lugar o una serie de **otra** PyME responde `404` (por su ruta) o `403` (por la ruta de la otra PyME),
+igual que los viajes.
+
+### Lo que ve el chofer
+
+El chofer **nunca** ve el nombre de un lugar guardado. Las paradas que recibe (lista y detalle de
+[`/api/choferes/viajes`](#get-apichoferesviajes), `GET /api/viajes/:id`, todos los sockets y el remito
+PDF) traen solo dirección y coordenadas: ni `lugar` ni `id_lugar`. Ningún evento de socket lleva el
+nombre, tampoco los que recibe la PyME: el nombre se ve por REST.
+
+| Campo de la parada | PyME | Chofer |
+|---|---|---|
+| `direccion`, `latitud`, `longitud`, tiempos | ✔ | ✔ |
+| `id_lugar` | ✔ | — |
+| `lugar` `{ id_lugar, nombre, activo }` | ✔ | — |
+
+Parada de un viaje creado con `{ "id_lugar": 40 }` como origen. **PyME** (`GET
+/api/organizaciones/:id/viajes/:idViaje`, real, recortado):
+```json
+{
+  "id_parada": 2343,
+  "orden": 1,
+  "direccion": "Ruta 8 km 50, Pilar",
+  "latitud": -34.6037,
+  "longitud": -58.3816,
+  "estado": "PENDIENTE",
+  "llegada_estimada": "2026-10-10T04:15:44.206Z",
+  "peon_estimado_min": 30,
+  "id_lugar": 40,
+  "lugar": { "id_lugar": 40, "nombre": "Deposito Pilar", "activo": true }
+}
+```
+La misma parada para el **chofer** (`GET /api/choferes/viajes/:id`, real, recortado):
+```json
+{
+  "id_parada": 2343,
+  "orden": 1,
+  "direccion": "Ruta 8 km 50, Pilar",
+  "latitud": -34.6037,
+  "longitud": -58.3816,
+  "estado": "PENDIENTE",
+  "llegada_estimada": "2026-10-10T04:15:44.206Z",
+  "peon_estimado_min": 30
+}
+```
+
+**Snapshot.** La dirección y las coordenadas se **copian** a la parada al crear o editar el viaje (o la
+serie). Editar o borrar el lugar después **no** cambia viajes ni series existentes. Lo que sí sigue al
+lugar es el **nombre** que ve la PyME (`lugar.nombre` es el actual, y `lugar.activo` es `false` si se
+borró).
+
+### Lugares guardados
+
+#### POST /api/organizaciones/:id/lugares
+
+**Body:**
+```json
+{ "nombre": "Deposito Pilar", "direccion": "Ruta 8 km 50, Pilar", "lat": -34.6037, "lng": -58.3816 }
+```
+- `nombre`: 1 a 80 caracteres. Se guarda sin espacios de más. **Único entre los lugares activos de la
+  PyME, sin distinguir mayúsculas** ("deposito PILAR" choca con "Deposito Pilar"). Otra PyME puede
+  usar el mismo nombre.
+- `direccion`: 1 a 300 caracteres. Es lo que verá el chofer.
+- `lat` (-90 a 90) y `lng` (-180 a 180).
+
+**Respuesta — 201** (real):
+```json
+{
+  "id_lugar": 40,
+  "id_organizacion": 153,
+  "nombre": "Deposito Pilar",
+  "direccion": "Ruta 8 km 50, Pilar",
+  "lat": -34.6037,
+  "lng": -58.3816,
+  "activo": true,
+  "creado_en": "2026-10-10T03:05:40.021Z",
+  "actualizado_en": "2026-10-10T03:05:40.021Z"
+}
+```
+
+**Errores:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "Ya existe un lugar con ese nombre" }` | Otro lugar **activo** de la PyME con ese nombre |
+| 400 | `{ "error": "lat invalida" }` (y similares) | Body inválido |
+| 403 | `{ "error": "La PyME esta suspendida: no puede crear ni modificar lugares" }` | PyME `SUSPENDIDA` |
+| 403 | `{ "error": "No perteneces a esta PyME" }` | No sos miembro activo |
+
+#### GET /api/organizaciones/:id/lugares
+
+Los lugares **activos**, ordenados por nombre. **200** (real):
+```json
+[
+  { "id_lugar": 41, "id_organizacion": 153, "nombre": "Cliente Recoleta", "direccion": "Av. Alvear 1800, CABA", "lat": -34.5895, "lng": -58.3974, "activo": true, "creado_en": "2026-10-10T03:05:40.469Z", "actualizado_en": "2026-10-10T03:05:40.469Z" },
+  { "id_lugar": 40, "id_organizacion": 153, "nombre": "Deposito Pilar", "direccion": "Ruta 8 km 50, Pilar", "lat": -34.6037, "lng": -58.3816, "activo": true, "creado_en": "2026-10-10T03:05:40.021Z", "actualizado_en": "2026-10-10T03:05:40.021Z" }
+]
+```
+
+#### PUT /api/organizaciones/:id/lugares/:idLugar
+
+Edición parcial: `nombre`, `direccion`, `lat` y/o `lng` (al menos uno; si no → `400 { "error": "Mandá
+al menos un campo para editar (nombre, direccion, lat o lng)" }`). Responde **200** con el lugar, como
+el `POST`. Los viajes y series que ya lo usaron **no** cambian.
+
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "Ya existe un lugar con ese nombre" }` | El nombre nuevo choca con otro activo (renombrarlo a sí mismo con otras mayúsculas vale) |
+| 403 | `{ "error": "La PyME esta suspendida: no puede crear ni modificar lugares" }` | PyME `SUSPENDIDA` |
+| 404 | `{ "error": "Lugar no encontrado" }` | No existe, es de otra PyME o está borrado |
+| 409 | `{ "error": "El lugar cambio mientras se procesaba tu pedido: volve a cargarlo" }` | Otro pedido lo borró al mismo tiempo |
+
+#### DELETE /api/organizaciones/:id/lugares/:idLugar
+
+Borrado **lógico**: deja de aparecer en la lista y ya no se puede usar en viajes nuevos (`400 "El lugar
+N no existe o no esta activo"`). Su nombre queda libre. Permitido aunque la PyME esté `SUSPENDIDA`.
+**200** (real):
+```json
+{ "mensaje": "Lugar borrado", "id_lugar": 42 }
+```
+`404 { "error": "Lugar no encontrado" }` si no existe, es de otra PyME o ya estaba borrado.
+
+### Series de viajes
+
+#### POST /api/organizaciones/:id/series
+
+Crea la serie y **todos** sus viajes de una vez. Cada viaje es un viaje de PyME normal: queda
+`ASIGNADO` al chofer, con su propia estimación de Google (tráfico y hora pico según **su** fecha), su
+vencimiento y su historial. **Todo o nada:** primero se estiman todos los viajes; si Google falla en
+cualquiera → `503` y **no se crea nada** (ni la serie ni ningún viaje).
+
+**Body** (`DIARIA`):
+```json
+{
+  "id_conductor": 357,
+  "frecuencia": "DIARIA",
+  "hora": "09:00",
+  "fecha_desde": "2026-10-11",
+  "fecha_hasta": "2026-10-12",
+  "paradas": [{ "id_lugar": 40 }, { "lat": -34.5895, "lng": -58.3974, "direccion": "Recoleta, CABA" }],
+  "condiciones_requeridas": ["FRAGIL"],
+  "descripcion": "Reparto diario"
+}
+```
+
+| Campo | |
+|---|---|
+| `frecuencia` | `DIARIA` · `DIAS_SEMANA` (con `dias_semana`, p. ej. `[1, 3, 5]`) · `SEMANAL` (con `dia_semana`) · `MENSUAL` (con `dia_mes`, 1 a 31) |
+| `dias_semana` / `dia_semana` | **1 = lunes … 7 = domingo** |
+| `hora` | `"HH:MM"` (00:00 a 23:59), **hora de Argentina** (`America/Argentina/Buenos_Aires`). "Todos los días a las 9:00" son las 9:00 en Argentina (`12:00Z`) |
+| `fecha_desde` | `"YYYY-MM-DD"` (fecha de Argentina), de hoy a hoy + 90 días |
+| `fecha_hasta` | Opcional, por defecto `fecha_desde` + 30 días; como máximo eso. La ventana es **inclusiva**: una serie diaria genera hasta **31** viajes |
+| `paradas` | Igual que un viaje (coordenadas o `{ id_lugar }`), máximo `MAX_PARADAS_POR_VIAJE` |
+| `id_conductor`, `condiciones_requeridas`, `descripcion` | Igual que [crear un viaje](#post-apiorganizacionesidviajes): mismo chofer vinculado y vehículo compatible |
+
+- **Ocurrencias salteadas:** las que no cumplen `ANTICIPACION_MINIMA_MINUTOS` (la misma regla que
+  crear un viaje) no se crean y vuelven en `salteadas` con `motivo`: `PASADA` (ya pasó) o
+  `SIN_ANTICIPACION`.
+- **`MENSUAL` con día 29, 30 o 31** en un mes que no lo tiene: el viaje va el **último día de ese mes**
+  (el 31 de noviembre → el 30) y aparece en `ajustadas` con `motivo: "FIN_DE_MES"`.
+- La serie **no se renueva sola**.
+
+**Respuesta — 201** (real; `viajes` recortados: cada uno tiene **el mismo formato** que
+[`GET /api/organizaciones/:id/viajes/:idViaje`](#get-apiorganizacionesidviajesidviaje), con `id_serie`):
+```json
+{
+  "serie": {
+    "id_serie": 38,
+    "id_organizacion": 153,
+    "id_creador": 762,
+    "id_conductor": 357,
+    "conductor": { "id_conductor": 357, "id_usuario": 763, "nombre": "Chofer", "apellido": "Ejemplo" },
+    "frecuencia": "DIARIA",
+    "dias_semana": [],
+    "dia_semana": null,
+    "dia_mes": null,
+    "hora": "09:00",
+    "zona_horaria": "America/Argentina/Buenos_Aires",
+    "fecha_desde": "2026-10-11",
+    "fecha_hasta": "2026-10-12",
+    "paradas": [
+      { "lat": -34.6037, "lng": -58.3816, "orden": 1, "id_lugar": 40, "direccion": "Ruta 8 km 50, Pilar", "lugar": { "id_lugar": 40, "nombre": "Deposito Pilar", "activo": true } },
+      { "lat": -34.5895, "lng": -58.3974, "orden": 2, "id_lugar": null, "direccion": "Recoleta, CABA", "lugar": null }
+    ],
+    "condiciones_requeridas": ["FRAGIL"],
+    "descripcion": "Reparto diario",
+    "estado": "ACTIVA",
+    "fecha_baja": null,
+    "creado_en": "2026-10-10T03:05:48.681Z",
+    "actualizado_en": "2026-10-10T03:05:48.681Z"
+  },
+  "viajes": [
+    { "id_viaje": 1159, "id_serie": 38, "estado": "ASIGNADO", "fecha_programada": "2026-10-11T12:00:00.000Z", "precio_estimado": 1026.388888888889, "paradas": ["…"], "…": "…" },
+    { "id_viaje": 1160, "id_serie": 38, "estado": "ASIGNADO", "fecha_programada": "2026-10-12T12:00:00.000Z", "precio_estimado": 1223.611111111111, "paradas": ["…"], "…": "…" }
+  ],
+  "salteadas": [],
+  "ajustadas": []
+}
+```
+`MENSUAL` con `dia_mes: 31` desde el 10/11 (real, recortado):
+```json
+{ "viajes": [{ "fecha_programada": "2026-11-30T21:00:00.000Z", "…": "…" }], "salteadas": [], "ajustadas": [{ "fecha": "2026-11-30", "motivo": "FIN_DE_MES" }] }
+```
+
+**Errores:**
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "La serie no genera ningun viaje en esa ventana", "salteadas": [{ "fecha": "2026-10-10", "fecha_programada": "2026-10-10T03:01:00.000Z", "motivo": "PASADA" }] }` | Todas las ocurrencias quedaron salteadas (real) |
+| 400 | `{ "error": "fecha_hasta puede ser como maximo 30 dias despues de fecha_desde" }` | Ventana de más de 30 días |
+| 400 | `{ "error": "fecha_desde no puede ser anterior a hoy" }` / `"... mas de 90 dias despues de hoy"` | `fecha_desde` fuera de rango |
+| 400 | `{ "error": "dias_semana tiene dias repetidos" }`, `"dia_mes es requerido para MENSUAL"`, `"hora debe tener el formato HH:MM (00:00 a 23:59), hora de Argentina"`, `"frecuencia debe ser DIARIA, DIAS_SEMANA, SEMANAL o MENSUAL"` | Body inválido |
+| 400 | `{ "error": "Un viaje puede tener como máximo 10 paradas" }` | Más de `MAX_PARADAS_POR_VIAJE` paradas |
+| 400 | `{ "error": "El lugar 42 no existe o no esta activo" }` | Lugar borrado, inexistente o de otra PyME |
+| 400 | `{ "error": "El chofer no esta vinculado a esta PyME" }` / sin vehículo compatible | Igual que crear un viaje (también si se desvinculó mientras se creaba la serie) |
+| 400 | `{ "error": "No hay una ruta en auto entre la parada 1 y la parada 2. Revisá las direcciones." }` | Google no encuentra ruta. No se creó nada |
+| 403 | `{ "error": "La PyME esta suspendida: no puede crear ni modificar viajes" }` | PyME `SUSPENDIDA` |
+| 503 | `{ "error": "No se pudo calcular la ruta. Probá de nuevo en unos minutos." }` | Google no respondió (o se superó `SERIE_TIMEOUT_MS` en total). **No se creó nada** |
+
+**Tiempo de respuesta:** una serie diaria de 30 viajes de 2 paradas tarda unos **3 a 4 segundos**
+(medido: estimaciones ~0.8 s con 4 en paralelo, transacción ~0.6 s). Conviene mostrar un "Creando…".
+
+Emite **un solo** [`serie:asignada`](#websocket--serieasignada-y-seriecancelada) al chofer y a la PyME
+(no un `viaje:asignado` por viaje).
+
+#### GET /api/organizaciones/:id/series
+
+Las series de la PyME, las más nuevas primero, cada una con `resumen_viajes` (cuántos viajes hay en cada
+estado). Filtro opcional `?estado=ACTIVA|CANCELADA|BORRADA`. **200** (real):
+```json
+[
+  {
+    "id_serie": 38,
+    "id_organizacion": 153,
+    "id_conductor": 357,
+    "conductor": { "id_conductor": 357, "id_usuario": 763, "nombre": "Chofer", "apellido": "Ejemplo" },
+    "frecuencia": "DIARIA",
+    "hora": "09:00",
+    "zona_horaria": "America/Argentina/Buenos_Aires",
+    "fecha_desde": "2026-10-11",
+    "fecha_hasta": "2026-10-12",
+    "estado": "ACTIVA",
+    "…": "…",
+    "resumen_viajes": { "total": 2, "por_estado": { "ASIGNADO": 2 } }
+  }
+]
+```
+
+#### GET /api/organizaciones/:id/series/:idSerie
+
+La serie (mismo formato que en la respuesta de crear) con sus `viajes`: todos los que generó, con el
+estado **actual** de cada uno (incluidos los que se editaron, reasignaron o cancelaron por separado).
+`404 { "error": "Serie no encontrada" }` si no existe o es de otra PyME.
+
+#### POST /api/organizaciones/:id/series/:idSerie/cancelar
+
+La serie pasa a `CANCELADA`. **Los viajes ya creados no se tocan**: cada uno se cancela (o no) por su
+ruta. Permitido aunque la PyME esté `SUSPENDIDA`. Sin body. **200** (real):
+```json
+{
+  "mensaje": "Serie cancelada. Sus viajes no se modificaron",
+  "id_serie": 38,
+  "estado": "CANCELADA",
+  "fecha_baja": "2026-10-10T03:05:53.654Z"
+}
+```
+| Status | Body | Causa |
+|--------|------|-------|
+| 400 | `{ "error": "No se puede cancelar una serie en estado CANCELADA" }` | Ya estaba cancelada (o `BORRADA`) |
+| 404 | `{ "error": "Serie no encontrada" }` | No existe o es de otra PyME |
+| 409 | `{ "error": "La serie cambio de estado mientras se procesaba tu pedido: volve a cargarla" }` | Otro pedido la canceló (o se desvinculó el chofer) al mismo tiempo |
+
+#### Viajes de una serie
+
+- Se editan, reasignan y cancelan **uno por uno** con las rutas de siempre
+  ([`PUT`](#put-apiorganizacionesidviajesidviaje),
+  [`reasignar`](#post-apiorganizacionesidviajesidviajereasignar),
+  [`cancelar`](#post-apiorganizacionesidviajesidviajecancelar)). El cambio **no** se propaga a la
+  serie ni a los otros viajes; el viaje conserva su `id_serie`.
+- El chofer los confirma o rechaza **uno por uno** (no hay confirmación masiva) y los ve como viajes
+  normales en [`GET /api/choferes/viajes`](#get-apichoferesviajes), con `id_serie`. No tiene rutas de
+  series.
+- **Desvincular al chofer** cancela sus viajes con la PyME (como siempre) y pasa sus series activas
+  con esa PyME a `BORRADA` (`series_borradas` en la respuesta).
+
+#### WebSocket — serie:asignada y serie:cancelada
+
+`serie:asignada` — al chofer y a la sala de la PyME, **una vez** por serie. Cada viaje con el mismo
+formato que [`viaje:asignado`](#websocket--eventos-del-viaje-interno) (sin nombres de lugar). Real:
+```json
+{
+  "id_serie": 38,
+  "id_organizacion": 153,
+  "organizacion": { "id_organizacion": 153, "nombre": "Distribuidora Ejemplo" },
+  "frecuencia": "DIARIA",
+  "hora": "09:00",
+  "zona_horaria": "America/Argentina/Buenos_Aires",
+  "fecha_desde": "2026-10-11",
+  "fecha_hasta": "2026-10-12",
+  "cantidad_viajes": 2,
+  "viajes": [
+    {
+      "id_viaje": 1159,
+      "id_organizacion": 153,
+      "organizacion": { "id_organizacion": 153, "nombre": "Distribuidora Ejemplo" },
+      "estado": "ASIGNADO",
+      "fecha_programada": "2026-10-11T12:00:00.000Z",
+      "precio_estimado": 1026.388888888889,
+      "descripcion": "Reparto diario",
+      "id_serie": 38,
+      "paradas": [
+        { "id_parada": 2349, "orden": 1, "direccion": "Ruta 8 km 50, Pilar", "latitud": -34.6037, "longitud": -58.3816 },
+        { "id_parada": 2350, "orden": 2, "direccion": "Recoleta, CABA", "latitud": -34.5895, "longitud": -58.3974 }
+      ],
+      "condiciones_requeridas": ["FRAGIL"]
+    },
+    { "id_viaje": 1160, "…": "…" }
+  ]
+}
+```
+`serie:cancelada` — solo a la PyME. Real: `{ "id_serie": 38, "id_organizacion": 153, "estado": "CANCELADA" }`
+
+`viaje:asignado`, `viaje:editado` y los demás eventos del viaje traen ahora `id_serie` (`null` si el
+viaje no es de una serie).
 
 ---
 

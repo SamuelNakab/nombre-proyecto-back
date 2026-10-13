@@ -41,6 +41,10 @@ elegibles) queda DORMIDO detras de MARKETPLACE_HABILITADO. MVP: CABA + GBA.
   y real, y CICLO POR PARADA del viaje interno (iniciar / confirmar llegada /
   salir) COMPLETO. El precio NO cambio. Ver "Google Maps, duracion y manejo /
   peon (Paso 3)".
+- PASO 4 — LUGARES GUARDADOS de la PyME (snapshot en la parada, el chofer
+  nunca ve el nombre), SERIES de viajes (todo o nada, hora argentina, un
+  serie:asignada) y tope GLOBAL de paradas por viaje (MAX_PARADAS_POR_VIAJE)
+  COMPLETO. Ver "Lugares guardados y series (Paso 4)".
 
 ## Stack
 - Node.js 22, ES Modules (NUNCA require()). Async/await siempre.
@@ -83,6 +87,13 @@ elegibles) queda DORMIDO detras de MARKETPLACE_HABILITADO. MVP: CABA + GBA.
   distancia_estimada_km, llegada_real, salida_real, peon_real_horas,
   manejo_real_horas). Sin enums, indices ni FKs. Revisado con el mismo migrate
   diff: solo ADD COLUMN.
+- Paso 4 (lugares / series): 2 enums NUEVOS (FrecuenciaSerie, EstadoSerie; no se
+  toco ningun enum existente), 2 tablas nuevas (lugares, series_viaje) con sus
+  indices y FKs RESTRICT, 1 columna NULLABLE en paradas (id_lugar) y 1 en viajes
+  (id_serie), cada una con su FK ON DELETE SET NULL, y el indice
+  viajes(id_serie). Revisado con el mismo migrate diff: sin DROP, sin ALTER
+  COLUMN, sin ALTER TYPE. Las FKs nuevas sobre viajes / paradas se agregaron con
+  todas las filas en NULL (validacion instantanea).
 - OJO con agregar valores a un enum mientras la DB esta compartida: el Prisma
   de un deploy VIEJO no conoce los valores nuevos y TIRA al leer una fila que
   los tenga (p. ej. el panel admin de produccion antes de que main tenga el
@@ -381,7 +392,11 @@ desvincularChofer, en UNA transaccion: corta el vinculo (lock) -> SELECT ...
 FOR UPDATE de los viajes no finales de ese chofer con ESA PyME -> CANCELADO con
 causa DESVINCULACION, incluso uno en curso. Fuera de la tx: historial (origen
 del actor), timers, limpiarViajeActivo y viaje:cancelado a la PyME y al chofer.
-Los viajes del chofer con OTRAS PyMEs no se tocan.
+Los viajes del chofer con OTRAS PyMEs no se tocan. Desde el Paso 4, en la MISMA
+tx (despues del vinculo, antes de los viajes) las series ACTIVAS de ese chofer
+con ESA PyME pasan a BORRADA con UN UPDATE ... RETURNING (series_borradas son
+exactamente las que cambio, aunque un cancelar serie se cruce); devuelve
+{ viajes_cancelados, series_borradas }.
 
 ### Salas de socket
 organizacion:{id} = miembros ACTIVOS. Al conectarse, un CLIENTE entra a las de
@@ -602,6 +617,165 @@ Cada parada tiene LLEGADA y SALIDA reales:
 - Tarifario con peon y manejo por separado (las columnas ya estan).
 - Front mobile: boton Salir en cada parada (ver API.md "Cambio de contrato para
   mobile").
+
+## Lugares guardados y series (Paso 4)
+
+Archivos: src/services/lugar.service.js + controllers/lugares.controller.js;
+src/services/serie.service.js + controllers/series.controller.js;
+src/services/serie-fechas.js (PURO: fechas y zona horaria);
+src/services/limite-concurrencia.js (PURO: ejecutarConLimite);
+src/services/vista-parada.js (PURO: que ve cada uno de una parada). Rutas bajo
+/api/organizaciones/:id/{lugares,series}, cualquier miembro activo
+(requireMiembro). Recurso de otra PyME -> 404.
+
+### Tope GLOBAL de paradas — MAX_PARADAS_POR_VIAJE (default 10)
+Vive en schemaParadas (viaje-validacion.js), asi vale para TODO lo que lo usa:
+crear y editar interno, estimar-costo, POST /api/viajes legacy y la plantilla de
+las series. 400 "Un viaje puede tener como máximo N paradas". En EDITAR el schema
+es .optional(): el tope solo aplica si llegan paradas (un viaje viejo que ya lo
+supere no se rompe al cambiarle la fecha). Basura o < 2 -> 10. Peor caso de una
+serie: 31 viajes x 9 tramos = 279 llamadas Pro.
+
+### Lugares guardados
+- Lugar: nombre, direccion, latitud, longitud (la API usa lat / lng), activo,
+  id_creador, fecha_baja / baja_por_id_usuario. Crear, listar (solo activos),
+  editar (parcial), borrar = SOFT (activo false). Un lugar borrado no se
+  reactiva: se crea otro.
+- NOMBRE UNICO entre los ACTIVOS de la PyME sin distinguir mayusculas (y con los
+  espacios normalizados). NO es constraint: pg_advisory_xact_lock(hashtext(
+  'lugar-nombre:' || org || ':' || lower(nombre))) + SELECT, en la tx, igual que
+  el CUIT. La clave del lock usa lower() de POSTGRES (el mismo que compara), no
+  toLowerCase de JS. Editar toma el lock por el nombre NUEVO. Editar / borrar:
+  updateMany condicionado a activo (lectura previa 404; carrera 409).
+- SUSPENDIDA -> 403 en crear y editar; borrar sigue permitido (es sacar algo).
+- USO: en crear / editar viaje y en la plantilla de una serie, cada parada es
+  { id_lugar } O { lat, lng, direccion? } (schemaParadasInternas; las dos cosas
+  juntas -> 400). La ruta LEGACY y estimar-costo NO aceptan id_lugar.
+  resolverParadas(id_organizacion, paradas): UNA query por los ids con
+  { id_organizacion, activo: true }; si falta alguno -> 400 "El lugar N no existe
+  o no esta activo", el MISMO para uno de otra PyME (no se filtran ids). Fuera de
+  toda tx y sin lock: es una copia.
+
+### REGLA DE SNAPSHOT
+- La parada guarda una COPIA de direccion, latitud y longitud del lugar, mas
+  Parada.id_lugar (FK SET NULL). Editar o borrar el lugar despues NO cambia
+  viajes ni series existentes (snapshotParadas, pura, en viaje-validacion.js).
+- El NOMBRE NO se copia a la parada (decision): la PyME ve el nombre ACTUAL por
+  join (parada.lugar = { id_lugar, nombre, activo }, tambien de un lugar
+  borrado); si el nombre no esta en la fila, ningun spread de la fila cruda se lo
+  puede mostrar al chofer.
+- EL CHOFER NUNCA VE EL NOMBRE NI id_lugar. Canales, uno por uno:
+  * PyME (lista, detalle, crear, editar, reasignar): serializarViajePyme ->
+    paradaVistaPyme. INCLUDE_VIAJE_INTERNO trae paradas.lugar.
+  * Chofer (GET /api/choferes/viajes y /:id): serializarViajeChofer ->
+    paradaVistaChofer (saca lugar e id_lugar). Si trae id_serie.
+  * GET /api/viajes/:id (en un interno solo llega el chofer): paradaVistaChofer
+    sobre el spread.
+  * Sockets que van a la PyME Y al chofer en el MISMO emit (viaje:asignado,
+    viaje:editado, serie:asignada): resumenViaje arma las paradas con campos
+    EXPLICITOS y nunca el lugar. NINGUN socket lleva el nombre: la PyME lo ve por
+    REST.
+  * viaje:finalizado, tracking (mapa / eta / costo / alertas / ruta) y las
+    respuestas de iniciar / salir / confirmar-parada: no llevan filas de parada
+    con lugar. Remito PDF: solo p.direccion. Admin: fila cruda con id_lugar, sin
+    nombre (el admin no es el chofer).
+  * paradaVistaPyme TIRA si la parada viene de un lugar y el include no trajo la
+    relacion (mismo idiom que esViajeVencido).
+- test-lugares-series.js lo verifica por TODAS las vias (REST, sockets y el texto
+  del remito descomprimido) y ademas con un chequeo global: ningun cuerpo REST ni
+  evento que recibio el chofer contiene la marca de los nombres.
+
+### Series de viajes — SerieViaje
+- frecuencia DIARIA | DIAS_SEMANA (dias_semana, ISO 1 = lunes ... 7 = domingo) |
+  SEMANAL (dia_semana) | MENSUAL (dia_mes 1..31); hora "HH:MM" LOCAL;
+  fecha_desde / fecha_hasta @db.Date LOCALES; paradas = plantilla YA RESUELTA
+  (snapshot, con id_lugar); condiciones; descripcion; estado ACTIVA |
+  CANCELADA | BORRADA (+ fecha_baja, baja_por_id_usuario). Viaje.id_serie.
+- ZONA HORARIA: America/Argentina/Buenos_Aires. "Todos los dias a las 9:00" =
+  9:00 de Buenos Aires = 12:00Z. localAUtc calcula el offset con Intl en el
+  instante (dos pasadas), sin dependencias: no asume que Argentina siga sin
+  horario de verano (el unit test lo prueba con New York).
+- VENTANA: [fecha_desde, fecha_hasta] INCLUSIVA, fecha_hasta por defecto
+  desde + 30 y como maximo eso -> DIARIA da hasta 31 viajes
+  (MAX_VIAJES_POR_SERIE = 31). fecha_desde entre hoy (local) y hoy + 90.
+- Ocurrencias que no cumplen ANTICIPACION_MINIMA_MINUTOS (la MISMA comparacion
+  que crear: fecha <= ahora + anticipacion) se SALTEAN con motivo PASADA o
+  SIN_ANTICIPACION y vuelven en la respuesta (salteadas). Si no queda ninguna ->
+  400 "La serie no genera ningun viaje en esa ventana" con salteadas en el
+  cuerpo (ErrorNegocio acepta un extra que se suma al { error }).
+- MENSUAL con dia 29-31 en un mes que no lo tiene -> se AJUSTA al ULTIMO dia
+  del mes (31 de noviembre -> 30) y sale en "ajustadas" con FIN_DE_MES. "El 31
+  de cada mes" en logistica es "a fin de mes"; saltear dejaria un hueco callado.
+
+### TODO O NADA al crear una serie (crearSerie)
+1. PyME operativa (SUSPENDIDA -> 403), Cliente del creador (ancla de
+   id_cliente), ventana, validarChoferAsignable UNA vez, resolverParadas,
+   generarOcurrencias.
+2. TODAS las estimaciones (estimarCosto, cada una con SU fecha: trafico y hora
+   pico propios) con ejecutarConLimite: SERIE_CONCURRENCIA_MAPS (4) a la vez y
+   SERIE_TIMEOUT_MS (60000) en total. Ante el primer error no lanza mas, espera a
+   las que estan en vuelo y tira: Google caido o timeout total -> 503,
+   SIN_RUTA -> 400 (igual que crear). NO se escribio nada.
+3. UNA transaccion: bloquearVinculoActivo (el MISMO lock que crear: serializa
+   contra desvincular; vinculo cortado -> 400 y rollback) -> serieViaje.create ->
+   viaje.createManyAndReturn (todos ASIGNADO, con precio, zona, tarifas,
+   estimado e id_serie) -> parada.createMany -> condicionRequerida.createMany.
+   ~5 queries, no un round-trip por viaje. Los ids se emparejan por
+   fecha_programada (unica en la serie), NO por el orden del RETURNING.
+4. Fuera de la tx: historial ASIGNADO en LOTE (registrarCambiosEstado, nunca
+   tira), programarVencimientoInterno por viaje, ruta planeada en Redis SOLO de
+   los que salen dentro de 24 h (la key tiene TTL de 24 h; el resto la recalcula
+   el fallback de gps.socket en el primer ping) y UN serie:asignada al chofer y a
+   la sala de la PyME (no N viaje:asignado). Log:
+   "[series] serie X: N viajes, M llamadas Pro, estimacion Xms, tx Yms, total Zms".
+- Medido (test-lugares-series, Neon desde Argentina): DIARIA de 30 viajes de 2
+  paradas = 30 llamadas Pro, estimacion ~0.75-0.8 s (4 en paralelo), tx ~0.6 s,
+  total ~3.1-3.6 s en el server.
+- Cada viaje generado es un viaje interno normal: el chofer confirma / rechaza
+  cada uno, y la PyME los edita / reasigna / cancela con las rutas del Paso 2.
+  NADA se propaga a la serie ni a los otros viajes; id_serie queda aunque se
+  reasigne.
+- Cancelar serie: lectura previa (404 / 400 si no esta ACTIVA) + updateMany
+  { estado: 'ACTIVA' } -> 409 si pierde la carrera. Los viajes NO se tocan.
+  serie:cancelada solo a la PyME. Permitido con la PyME SUSPENDIDA.
+- Desvincular: series ACTIVAS del chofer con ESA PyME -> BORRADA en la misma tx
+  (ver "Desvinculacion"). Las CANCELADAS y las de otras PyMEs no se tocan.
+- Detalle y lista corren el chequeo PEREZOSO de vencimiento antes de leer; la
+  lista trae resumen_viajes { total, por_estado }.
+- La serie NO se renueva sola. Propuesta (NO implementada, pendiente de
+  aprobacion): POST /:id/series/:idSerie/repetir que EXTIENDE la misma serie
+  (ventana nueva desde la ultima ocurrencia + 1 dia, fecha_hasta se actualiza,
+  sin cambio de schema), misma plantilla snapshot, mismo todo o nada, solo si a
+  la serie le quedan <= 7 dias.
+
+GUARDS VERIFICADOS REVIRTIENDOLOS (test-lugares-series.js):
+| Guard | Caso que se pone en rojo sin el |
+|-------|---------------------------------|
+| advisory lock del nombre del lugar | 21c (201,201,201 y 3 activos con el mismo nombre) |
+| cancelar serie: estado 'ACTIVA' en el WHERE | 21b (200,200 en las 5 rondas) |
+| crear serie: lock + re-chequeo del vinculo en la tx | 21a (serie ACTIVA y viajes vivos con el vinculo cortado) |
+| desvincular: UPDATE ... RETURNING de las series ACTIVAS en la tx | 19c / 19f (la serie queda ACTIVA) |
+| resolverParadas: activo: true en el WHERE | 7a / 7d / 7e (viaje, serie y edicion con un lugar borrado) |
+
+### Decisiones de interpretacion (Paso 4)
+D1 tope de paradas global por env (editar: solo si cambian las paradas). D2
+columnas latitud / longitud, API lat / lng. D3 el nombre del lugar no se copia
+(la PyME ve el actual por join). D4 el chofer tampoco ve id_lugar. D5 ningun
+socket lleva el nombre. D6 borrar lugar permitido con SUSPENDIDA; borrado no se
+reactiva. D7 dias ISO, ventana inclusiva (max 31), desde hasta hoy + 90. D8
+MENSUAL 29-31 -> fin de mes. D9 SIN_RUTA 400, Google caido / timeout 503. D10
+plantilla snapshot. D11 fecha_baja / baja_por en Lugar y SerieViaje. D12
+serie:cancelada solo a la PyME; desvincular no emite evento de serie. D13
+historial en lote. D14 ruta en Redis solo < 24 h. D15 estimar-costo sin
+id_lugar.
+
+### PENDIENTES (Paso 5 o despues)
+- "Repetir serie" (propuesta arriba), si se aprueba.
+- Rate limit / cupo de creacion de series por PyME: hoy un miembro puede crear
+  series sin limite y cada una cuesta hasta 279 llamadas Pro.
+- estimar-costo con { id_lugar } (hoy el front manda las coordenadas del lugar).
+- Los 31 timers por serie suman al Map en memoria: misma limitacion de un solo
+  proceso que el resto (cola persistente el dia que haya mas de una instancia).
 
 ## Maquina de estados — src/services/estado-viaje.service.js
 Hay DOS ciclos con su tabla cada uno: TRANSICIONES (este, el LEGACY del
@@ -1023,6 +1197,7 @@ PyME es CLIENTE.
 | 20 | desvincularChofer          | vinculo-chofer.service.js | no final -> CANCELADO (uno por viaje)         | CLIENTE o CONDUCTOR |
 | 21 | salirDeParada              | viaje-interno.service.js  | CARGANDO / DESCARGANDO -> EN_RUTA (la ultima: cerrarViaje -> FINALIZADO) | CONDUCTOR |
 | 22 | confirmarParadaInterna     | viaje-interno.service.js  | EN_RUTA -> DESCARGANDO                        | CONDUCTOR         |
+| 23 | crearSerie                 | serie.service.js          | — -> ASIGNADO (uno por viaje, EN LOTE con registrarCambiosEstado) | CLIENTE |
 | —  | cerrarViaje (11), cancelarViaje admin (7) | | los mismos sitios de arriba, ahora tambien para viajes internos | |
 cambiarEstado (3) ya NO aplica a viajes internos desde el Paso 3 (400). Los
 sitios 16, 21, 22 y el cierre pasan `fecha` al historial: el mismo instante que
@@ -1388,6 +1563,8 @@ id_organizacion):
 | viaje:cancelado      | PyME + chofer                        | cualquier cancelacion: `causa` CHOFER / ORGANIZACION / ADMIN / DESVINCULACION |
 | viaje:vencido        | PyME + chofer                        | VENCIDO (estado real; `estado_anterior`) |
 | mapa:actualizar, costo:actualizar, eta:actualizar, alerta:desvio, alerta:parada, ruta:recalculada | viaje:{id} + PyME | tracking; mapa y costo sumaron `id_viaje` al payload |
+| serie:asignada (Paso 4) | PyME + chofer | crear serie: UN evento con todos sus viajes (resumenViaje, sin nombres de lugar) en vez de N viaje:asignado |
+| serie:cancelada (Paso 4) | PyME | cancelar serie (los viajes no cambian) |
 
 El tracking llega a la sala de la PyME porque los emisores reciben las salas de
 salasDeViaje(viaje) (sockets/salas.js) en vez de armar `viaje:${id}` a mano.
@@ -1480,6 +1657,13 @@ INVITACION_INTENTOS_MAX=5         (rate limit del canje, por usuario Y por IP,
 INVITACION_VENTANA_MINUTOS=15      en Redis. Los tests suben el max: todo sale
                                    de localhost y comparte la key por IP)
 MAX_ORGANIZACIONES_POR_USUARIO=1  (PyMEs activas por cuenta CLIENTE)
+MAX_PARADAS_POR_VIAJE=10          (Paso 4: tope GLOBAL de paradas por viaje,
+                                   en todo lo que usa schemaParadas. Basura o
+                                   < 2 -> 10)
+SERIE_CONCURRENCIA_MAPS=4         (estimaciones a Google en vuelo a la vez al
+                                   crear una serie. Basura o < 1 -> 4)
+SERIE_TIMEOUT_MS=60000            (tope TOTAL de las estimaciones de una serie;
+                                   si se pasa -> 503 y no se crea nada)
 Todas se leen en CADA request (no se cachean), con guarda: un
 valor basura o <= 0 cae al default.
 
@@ -1501,6 +1685,8 @@ MATCHING_TIMEOUT eliminado POR COMPLETO — no queda ningun rastro:
 - Variables que tienen que valer LO MISMO en los dos environments mientras la
   DB sea compartida: INVITACION_SECRETO, VENTANA_INICIO_ANTES_MINUTOS y
   VENTANA_INICIO_DESPUES_MINUTOS (los dos procesos vencen viajes de la misma DB).
+  Conviene que MAX_PARADAS_POR_VIAJE tambien valga lo mismo (un viaje creado en
+  un environment se edita desde el otro).
 
 ## CI — .github/workflows/ci.yml
 - `quality` (PR y push a main / develop): lint + tests unitarios. NO pega
@@ -1650,11 +1836,30 @@ node scripts/test-viaje-interno.js         (Paso 2: crear, confirmar, rechazar,
                                             punta a punta, CASO 20 = cancelar en
                                             curso, 17h-j = carreras del ciclo
                                             por parada)
+node scripts/test-lugares-series.js        (Paso 4: lugares (CRUD, nombre unico,
+                                            soft delete, snapshot, aislamiento,
+                                            SUSPENDIDA), el chofer sin el nombre
+                                            por REST / sockets / remito, tope de
+                                            paradas, series de las 4
+                                            frecuencias con fechas exactas en
+                                            hora AR, salteadas, todo o nada con
+                                            Google caido (3802), editar /
+                                            reasignar / confirmar / rechazar uno,
+                                            cancelar, desvincular -> BORRADA, y 3
+                                            carreras x 5 rondas (21a-c,
+                                            SUBCASOS=21a). NO usa :3000 —
+                                            levanta 3801 (y 3802 con key
+                                            invalida). Acepta numeros de caso y
+                                            --restos. Borra TODO lo suyo y lo
+                                            verifica. Google REAL: ~60 llamadas
+                                            Pro por corrida, las imprime al
+                                            final junto con la tabla de series
+                                            (viajes, llamadas y tiempos))
 
 scripts/_server-efimero.js es el helper compartido que levanta src/app.js en un
 puerto propio con el env que se le pida. Lo usan el CASO 8 de test-jerarquia
-(puerto 3210), test-timeout-reserva, test-viajes-vencidos, test-identidad y
-test-viaje-interno. test-anticipacion tiene su propia copia
+(puerto 3210), test-timeout-reserva, test-viajes-vencidos, test-identidad,
+test-viaje-interno y test-lugares-series. test-anticipacion tiene su propia copia
 inline, anterior a la extraccion. OJO: no hay adapter de Redis en socket.io, o
 sea que un socket conectado a :3000 NO recibe los eventos que emite un server
 efimero — los tests que verifican eventos conectan sus sockets al puerto efimero.
@@ -1662,3 +1867,24 @@ efimero — los tests que verifican eventos conectan sus sockets al puerto efime
 Nota de entorno: si el repo esta en una carpeta sincronizada por OneDrive,
 node --watch (npm run dev) se reinicia solo cuando OneDrive toca node_modules y
 corta requests en vuelo. Sintoma tipico: "fetch failed" a mitad de un script.
+
+### PENDIENTE — mantenimiento de tests
+Va todo junto, en una tarea aparte:
+- LAS SUITES LEGACY NO LIMPIAN LO QUE CREAN: test-jerarquia (-jer-),
+  test-visibilidad-gerente (-vis-), test-acceso-gerente (-acc-),
+  test-campos-duracion (-dur-), test-concurrencia-jerarquia (-conc-),
+  test-confirmar-parada (-conf-), test-viajes-vencidos (-vnc-),
+  test-historial-estados (-hst-), test-timeout-reserva (-tmo-) y
+  test-mis-viajes-conductor (cond-mvc-*). Cada corrida deja usuarios (DB y
+  Firebase), viajes (algunos VIVOS), empresas y vehiculos en la DB COMPARTIDA
+  con produccion. El 2026-10-10 se borraron a mano 177 usuarios, 213 viajes, 88
+  empresas y 94 vehiculos acumulados desde el 3/10 (sin tocar el seed ni la
+  cuenta E2E). Hay que darles la limpieza + verificacion de 0 restos + --restos
+  que ya tienen test-identidad, test-viaje-interno y test-lugares-series.
+- test-vehiculos.
+- Flakies: test-viajes-vencidos CASO 5b busca su linea con
+  includes('[viaje-vencido] barrido de arranque'), y desde el Paso 2 hay DOS
+  lineas con ese prefijo (la legacy y la "(ciclo interno)") que salen de queries
+  async en carrera: agarra la que loguee primero. Tiene que buscar "con aviso
+  programado" (mismo problema que ya resolvio test-timeout-reserva con el prefijo
+  completo).

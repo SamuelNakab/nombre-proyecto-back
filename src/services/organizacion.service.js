@@ -55,6 +55,20 @@ async function bloquearCuit(tx, cuit) {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+export const MENSAJE_SUSPENDIDA_VIAJES = 'La PyME esta suspendida: no puede crear ni modificar viajes';
+
+// 403 si la PyME esta SUSPENDIDA: no puede generar trabajo nuevo (crear, editar
+// y reasignar viajes; crear series; crear y editar lugares). Cancelar sigue
+// permitido. El mensaje lo elige el caller.
+export async function exigirPymeOperativa(id_organizacion, mensaje = MENSAJE_SUSPENDIDA_VIAJES) {
+  const org = await prisma.organizacion.findUnique({
+    where: { id_organizacion },
+    select: { estado: true },
+  });
+  if (!org) throw new ErrorNegocio(404, 'PyME no encontrada');
+  if (org.estado === 'SUSPENDIDA') throw new ErrorNegocio(403, mensaje);
+}
+
 // Tira 409 si el usuario ya llego al tope de PyMEs activas. Con `db` = tx se
 // usa DESPUES de bloquearUsuario; con `db` = prisma es el chequeo previo que da
 // el error explicito antes de tocar nada.

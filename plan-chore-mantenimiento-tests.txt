@@ -1,0 +1,99 @@
+# Mantenimiento de tests y configuración (antes de separar las DBs)
+
+## Context
+Antes de separar las bases de staging y producción, hay que dejar los tests y la configuración sanos: una Web API key de Firebase hardcodeada en 28 archivos (y test-vehiculos usando la key de Maps para loguearse), ~13 suites legacy que dejan usuarios/viajes/empresas en la DB compartida con producción, 3 tests intermitentes, un seed roto, ningún runner único de regresión, un .env.example incompleto y un log de desconexión de socket sin motivo ni duración. No se cambia comportamiento de la app (solo el log del punto 6), ni schema, ni git.
+
+**Requisito antes de correr nada:** agregar `FIREBASE_WEB_API_KEY` al `.env` local (hoy no está; las suites la tenían hardcodeada). Es el mismo valor que el secret de GitHub.
+
+---
+
+## 1. Helper de Firebase — `scripts/_firebase-auth.js` (nuevo)
+- `firebaseWebApiKey()`: lee `FIREBASE_WEB_API_KEY` (con `dotenv/config`); si falta tira `"Falta FIREBASE_WEB_API_KEY en el .env (es la Web API key de Firebase, NO la GOOGLE_MAPS_API_KEY)"`.
+- `getToken(email, password)` (signInWithPassword, mismo mensaje de error que hoy) y `signUp(email, password)` (lo usa test-vehiculos).
+- Migrar los 28 archivos: borrar `const FIREBASE_KEY = '…'` y la copia local de `getToken`, importar del helper. Los que tienen default de password (`password = PASS`) lo pasan explícito o con wrapper de 1 línea.
+  - Con key: test-acceso-gerente, admin, anticipacion, bugs2, campos-duracion, cancelacion-cliente, cancelacion-conductor, concurrencia-jerarquia, confirmar-parada, eta-recalculo, fase4, fase5, historial-estados, identidad, iniciar-viaje, jerarquia, lugares-series, maps, matching-fix, mis-viajes-conductor, ruta-front, timeout-reserva, vehiculos (bug: usaba GOOGLE_MAPS_API_KEY), viaje-interno, viajes-vencidos, visibilidad-gerente, zona, stress/_helpers.js (re-exporta del helper).
+  - `consola-manual.js` y el e2e ya leen `FIREBASE_WEB_API_KEY`: consola-manual pasa a usar el helper; el e2e (vitest, corre en CI) queda como está.
+  - `test-bugs.js` tiene un **ID token JWT hardcodeado** (vencido). Lo saco y lo reemplazo por `getToken` del helper (es la única forma de "migrarlo"); no arreglo nada más de ese script.
+- Verificación: `grep -r "AIza" scripts e2e src` → 0. **Nota:** la key sigue en el historial de git; es una Web API key (pública por diseño), pero conviene restringirla en GCP Console (por referrer/API) — no lo hago yo.
+
+## 2. Limpieza compartida — `scripts/_limpieza.js` (nuevo)
+Extraída y generalizada de `limpiar()` de test-viaje-interno.js (la más completa), sumando las entidades legacy.
+
+- `PROTEGIDOS`: las 6 cuentas de seed-cuentas-test.js, `TEST_USER_EMAIL`, `chofer-e2e@test.com`, la PyME de CUIT `30999999995` y la patente `E2E000`. La función **tira** si le piden borrar un usuario/PyME/vehículo protegido (guard duro, no un filtro silencioso).
+- `crearRegistro(patron)` → `{ email(e), viaje(id), vehiculo(id), empresa(id), org(id), limpiar(), verificar() }`. Cada suite registra lo que crea; además, a partir de los emails se derivan los viajes (id_cliente / id_conductor), empresas (id_gerente), vehículos propios y de empresa, membresías y PyMEs.
+- `limpiar()` borra en orden de FKs: R2 `remitos/{id}.pdf` de los FINALIZADO → Redis `gps:{id}:*` y keys `invitacion:canje:*` de los usuarios y de loopback → calificaciones, transacciones, historial, paradas, condiciones_req, viajes → series, lugares → conductor_vehiculo, condicion_vehiculo, vehículos (propios y de empresa) → conductor_empresa, empresas → vínculos, invitaciones, membresías, PyMEs → metodos_pago, conductor, cliente, usuario → Firebase (`admin.auth().deleteUser`).
+- `verificar()` cuenta lo que queda (usuarios con el patrón, viajes, historial, PyMEs, empresas, vehículos, keys gps) y devuelve `{ ok, conteos }`; la suite lo reporta como `paso('LIMPIEZA: no quedo nada…')`.
+- **Suites con cuentas fijas del seed** (cancelacion-*, admin, fase5, iniciar-viaje, zona, anticipacion, eta-recalculo, ruta-front, stress/cierre-exhaustivo): solo se borra lo **registrado por ID** en esa corrida (viajes creados, vehículos creados con 201); jamás la cuenta ni un vehículo preexistente.
+- Patrón en cada suite: el cuerpo de `main()` en `try { … } finally { limpio = await reg.limpiar() … }`, y el `.catch` final también intenta limpiar (mismo esquema que test-viaje-interno). Donde hoy hay `process.exit` en el medio (fase5, fase4…), pasan a `throw` para que el finally corra.
+- Suites a limpiar: jerarquia (-jer-), visibilidad-gerente (-vis-), acceso-gerente (-acc-), campos-duracion (-dur-), concurrencia-jerarquia (-conc-), confirmar-parada (-conf-), viajes-vencidos (-vnc-), historial-estados (-hst-), timeout-reserva (-tmo-), mis-viajes-conductor (cond-mvc-), vehiculos (_veh_), maps (maps-…), más las de cuentas fijas de arriba. test-viaje-interno, test-identidad y test-lugares-series pasan a usar el helper (su `limpiar()` queda como wrapper fino) para no tener 4 copias.
+- **Restos — `scripts/restos.js` (nuevo)**: recorre TODOS los patrones (-jer-, -vis-, -acc-, -dur-, -conc-, -conf-, -vnc-, -hst-, -tmo-, cond-mvc-, _veh_, -vin-, -idn-, -lys-, maps-) + viajes que cuelgan de cuentas fijas + la "Empresa Test" (CUIT 20-99999999-9) y TEST001 del seed-test + lo que dejen las exploratorias. **Por defecto solo cuenta** (tabla patrón / usuarios / viajes / empresas / vehículos / PyMEs / Firebase); `--borrar` borra. El `--restos` de cada suite delega acá con su patrón y **también pasa a ser solo conteo** salvo `--borrar` (cambio respecto de hoy en viaje-interno / identidad / lugares-series, documentado en CLAUDE.md).
+
+## 3. Intermitentes (sin tocar logs de producción)
+- **test-timeout-reserva CASO 4d**: reemplazar `esperar(2500)` por `esperarLinea(leerLog, regex, 15000)` (poll cada 200 ms) con `/\[reserva-timeout\] barrido de arranque: (\d+) reservas activas, (\d+) liberadas…/`; 4b/4c se evalúan después de que aparece la línea (el barrido ya terminó).
+- **test-viajes-vencidos CASO 5b**: las dos líneas son `"[viaje-vencido] barrido de arranque: N viajes pre-inicio con aviso programado"` (legacy) y `"[viaje-vencido] barrido de arranque (ciclo interno): …"` / `"… del ciclo interno DESACTIVADO"`. Se busca con la regex anclada `/\[viaje-vencido\] barrido de arranque: (\d+) viajes pre-inicio con aviso programado/` (el `:` justo después de "arranque" las distingue) y con el mismo poll (el barrido es async y puede loguear después de /health). No hace falta renombrar logs.
+- **test-identidad CASO 12a**: antes de los 4 intentos, "sonda": canjear un código basura en loop (máx 15 s) hasta que aparezca `invitacion:canje:usuario:{R1}` en Redis (prueba que el Redis del server efímero está `ready` y contando), y después `borrarKeysRateLimit([R1, R2])` + IPs de loopback. Ahí arrancan los 4 intentos reales.
+- `esperarLinea` va en `_server-efimero.js` (lo usan los dos primeros).
+- Cada suite: 3 corridas seguidas, verdes las 3.
+
+## 4. seed-test.js
+Nada lo referencia (scripts, docs, package.json, CI: grep vacío) → **se borra**. Lo que dejó en la DB (Empresa Test CUIT 20-99999999-9, vehículo TEST001 asignado a conductor@ y conductor2@ por conductor_vehiculo) aparece en el conteo de restos para tu OK. Ojo: test-matching-fix crea su propio TEST001 si no existe; se ve en el triage.
+
+## 5. Runner — `scripts/test-regresion.js` + `"test:regresion"` en package.json
+- `SUITES` = array único al principio: `{ archivo, timeoutMin, args? }`. Lista (según tu respuesta): identidad, viaje-interno, maps, lugares-series, fase5, cancelacion-conductor, cancelacion-cliente, admin, iniciar-viaje, jerarquia, visibilidad-gerente, zona, acceso-gerente, campos-duracion, concurrencia-jerarquia, confirmar-parada, anticipacion, historial-estados, timeout-reserva, viajes-vencidos, mis-viajes-conductor, stress/test-cierre-exhaustivo, eta-recalculo, ruta-front, vehiculos (+ las exploratorias que el triage clasifique como (a)).
+- El runner levanta **su propio server** con `conServer` en `:3900` y env `MARKETPLACE_HABILITADO=true CALIFICACIONES_HABILITADAS=true RESERVA_BARRIDO_ARRANQUE=0 VENCIMIENTO_BARRIDO_ARRANQUE=0` (para no barrer datos reales ni chocar con un `npm run dev` en :3000). Las suites que hoy pegan a `http://localhost:3000` pasan a `const BASE = process.env.TEST_BASE_URL ?? 'http://localhost:3000'` (siguen andando sueltas contra tu :3000). Los flags van solo al server del runner, no al env de las suites: las que levantan servers efímeros siguen fijando sus propios flags (viaje-interno los pone en false a propósito).
+- Corre en serie con `spawn`, timeout por suite (kill + FALLA "timeout"), log de cada suite a `scripts/.regresion/<suite>.log` (gitignored) y en vivo con prefijo. Al final: tabla `suite | resultado | duración`, total, y `process.exit(1)` si alguna falló. `--solo a,b` para correr un subconjunto; `--desde x` para retomar.
+- test-iniciar-viaje: hoy calcula la ventana con `VENTANA_INICIO_MINUTOS ?? 30` (no coincide con el server si ANTES está seteada). Pasa a importar `ventanaInicioAntesMinutosLegacy` de `src/services/ventana-inicio.js` → mismo cálculo que el server.
+- Documentado en CLAUDE.md (Comandos + nueva sección "Regresión").
+
+### Triage de exploratorias (primer paso de la ejecución)
+Correr cada una una vez contra el server del runner (flags en true), anotar resultado + qué prueba + restos, y clasificar a/b/c/d. Pre-clasificación leyendo el código (a confirmar corriéndolas):
+| Script | Qué prueba | Probable |
+|---|---|---|
+| test-bugs | condiciones_req en respuestas; usa JWT hardcodeado vencido | c/d (no anda sin el token) |
+| test-bugs2 | regresiones del matching viejo con cuentas fijas | b o c |
+| test-fase4 | fase 4 (GPS/tracking) del ciclo viejo | b (cubierto por fase5/eta) o c |
+| test-matching-fix | aceptar del marketplace, TEST001 | b o c |
+| stress/test-concurrencia | doble aceptar, mapa:actualizar con id_viaje, reconexión, carga de pings | a? (carga/reconexión no la cubre nadie) |
+| stress/test-gps-exhaustivo | validación de coordenadas y acumulado GPS | a? (validación de lat/lng no cubierta) |
+| stress/test-vehiculos-exhaustivo | CRUD de vehículos y validaciones | b (test-vehiculos) |
+Las b/c van a `scripts/legacy/` (sin borrar; ajustar imports `../src` → `../../src`), con una línea en CLAUDE.md para las c. Las d te las listo. Te muestro la tabla del triage antes de seguir con el runner.
+
+## 6. Log de desconexión — `src/sockets/index.js`
+Ya existe `console.log('[Socket] desconectado: …')` sin motivo. Se reemplaza por:
+`const conectadoEn = Date.now()` al conectar y `socket.on('disconnect', (reason) => console.log(\`[Socket] desconectado: ${rol} uid:${id_usuario} id:${socket.id} motivo:${reason} duracion:${seg}s\`))`. Sin email, token ni IP. Nada más cambia.
+
+## 7. Auditoría de variables
+Fuentes: `process.env.X` y `env.X` (funciones que reciben `env = process.env`) en src/, scripts/, e2e/ y ci.yml. Reescribir `.env.example` agrupado (Base de datos / Servidor, Firebase, Google Maps, Redis, R2, Tarifas y reglas del viaje, GPS/ETA/desvío, Invitaciones, Lugares y series, Flags, Solo tests, Scripts manuales) con comentario + default de código de cada una, sin valores secretos, y marcas `[SOLO TESTS]`, `[LEGACY]`, `[NO LA LEE NADIE]`.
+- Agregadas (las lee el código y no estaban): `ETA_EMISION_SEGUNDOS` (30), `ETA_RECALCULO_SEGUNDOS` (360), `RUTA_RECALCULO_COOLDOWN_SEGUNDOS` (120), `FEE_PORCENTAJE` (10), `FIREBASE_WEB_API_KEY`, `TEST_BASE_URL`, `TEST_API_URL`, `SUBCASOS`, `EJEMPLOS_JSON`, `API_URL`/`CLIENTE_*`/`CONDUCTOR_*`/`ADMIN_*` (consola-manual / crear-admin).
+- `[NO LA LEE NADIE]`: `MERCADOPAGO_ACCESS_TOKEN` (se saca). `TEST_CONDUCTOR_TOKEN` solo lo lee scripts/simular-gps.js (queda en "scripts manuales"). Corrección: `ETA_EMISOR_IDLE_SEGUNDOS` tiene default 300 en código (el example dice 600).
+
+**Comparación con Railway staging (preliminar, se confirma con la auditoría final):**
+- En Railway y el código no la usa: ninguna estrictamente. `VENTANA_INICIO_MINUTOS` es **muerta en Railway** porque `VENTANA_INICIO_ANTES_MINUTOS` está cargada (el fallback solo se usa si ANTES falta o está vacía) → candidata a borrar.
+- Usa el código y falta en Railway: `ETA_EMISION_SEGUNDOS` (30), `ETA_RECALCULO_SEGUNDOS` (360), `RUTA_RECALCULO_COOLDOWN_SEGUNDOS` (120), `FEE_PORCENTAJE` (10), `TARIFA_BASE_HORA_CABA` / `TARIFA_PICO_HORA_CABA` / `TARIFA_BASE_KM_PROVINCIA` / `TARIFA_PICO_KM_PROVINCIA` (defaults de tarifa.service; si producción cobra con los defaults, no hace falta cargarlas). `PORT` lo inyecta Railway. `RESERVA_BARRIDO_ARRANQUE` / `VENCIMIENTO_BARRIDO_ARRANQUE` son [SOLO TESTS]: NO cargarlas.
+- **VENTANA_INICIO_MINUTOS**: la leen `ventanaInicioAntesMinutosLegacy` (src/services/ventana-inicio.js, solo el iniciar legacy, como fallback), su unit test, y test-iniciar-viaje (que dejará de leerla, ver punto 5). Propuesta (NO la hago, es cambio de src): sacar el fallback de `ventanaInicioAntesMinutosLegacy` y que el legacy use `ventanaInicioAntesMinutos`; con ANTES cargada en Railway el comportamiento no cambia. Después borrarla de Railway.
+
+## 8. Restos
+Al final: `node scripts/restos.js` (solo conteo) → te muestro la tabla y espero tu OK para `--borrar`. Después, conteo = 0 en todos los patrones.
+
+---
+
+## Decisiones que interpreté
+1. El runner tiene server propio en :3900 y las suites leen `TEST_BASE_URL` (default :3000), en vez de exigir que tu `npm run dev` esté con los flags en true.
+2. `--restos` en todas las suites pasa a ser solo conteo; borrar requiere `--borrar` (también en las 3 suites nuevas, que hoy borran directo).
+3. En suites con cuentas fijas solo se borra lo creado por ID en la corrida; los viajes viejos colgados de cuentas fijas salen en el conteo de restos como categoría aparte, para tu OK.
+4. El guard de protegidos tira (no filtra en silencio).
+5. test-bugs.js: se le saca el JWT hardcodeado (por el criterio de secretos) aunque no se arregla el resto.
+6. test-iniciar-viaje usa la misma función de ventana que el server (cambio de test, no de src).
+7. El e2e no usa el helper (corre en CI con vitest y ya lee la variable).
+8. Las exploratorias movidas a `scripts/legacy/` reciben solo el ajuste de imports para que sigan siendo ejecutables.
+
+## Archivos
+Nuevos: `scripts/_firebase-auth.js`, `scripts/_limpieza.js`, `scripts/restos.js`, `scripts/test-regresion.js`. Modificados: los 28 scripts del punto 1, `scripts/_server-efimero.js` (esperarLinea), `src/sockets/index.js`, `.env.example`, `package.json`, `CLAUDE.md`, `.gitignore` (`scripts/.regresion/`). Borrado: `scripts/seed-test.js`. Movidos: exploratorias b/c a `scripts/legacy/`.
+
+## Verificación
+1. `node --check` en cada archivo tocado; `npm run lint`; `npm run test`.
+2. `grep -r AIza scripts e2e src` → vacío.
+3. timeout-reserva, identidad (CASO 12) y viajes-vencidos (CASO 5): 3 corridas seguidas cada una, todas verdes.
+4. `npm run test:regresion` completo en verde, con la tabla.
+5. `node scripts/restos.js` → conteo; con tu OK `--borrar`; recuento final = 0 en todos los patrones.
+6. Reporte final: archivos, decisiones, tabla del runner, las 3×3 corridas, el .env.example nuevo, Railway (borrar / cargar) y restos.

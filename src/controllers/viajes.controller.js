@@ -28,6 +28,7 @@ import {
 } from '../services/historial-estado.service.js';
 import { distanciaMetros } from '../services/parada.service.js';
 import { confirmarParadaInterna } from '../services/viaje-interno.service.js';
+import { paradaVistaChofer } from '../services/vista-parada.js';
 import {
   esViajeVencido,
   programarAvisoVencimiento,
@@ -289,6 +290,10 @@ export async function obtenerViaje(req, res) {
   // de que existiera la columna, o si Google no respondio al crear.
   return res.status(200).json({
     ...viaje,
+    // En un viaje INTERNO el unico que llega hasta aca es el chofer asignado: la
+    // parada sale sin id_lugar (el chofer no ve los lugares guardados de la
+    // PyME, ver vista-parada.js). En un legacy id_lugar es siempre null.
+    paradas: viaje.paradas.map(paradaVistaChofer),
     duracion_estimada: horasAMinutos(viaje.duracion_estimada_horas),
     // Las cinco metricas del historial. puntualidad_inicio va aca adentro y
     // pisa a la columna MUERTA del mismo nombre que trae el spread.

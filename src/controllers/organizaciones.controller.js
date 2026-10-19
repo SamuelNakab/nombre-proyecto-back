@@ -205,14 +205,17 @@ export async function desvincularChofer(req, res) {
   if (!id_conductor) return res.status(400).json({ error: 'id de conductor invalido' });
   try {
     // Cancela en la misma transaccion TODOS los viajes no finales de ese chofer
-    // con esta PyME, incluido uno en curso (causa DESVINCULACION).
-    const viajes_cancelados = await desvincularChoferSrv({
+    // con esta PyME, incluido uno en curso (causa DESVINCULACION), y pasa a
+    // BORRADA sus series activas con esta PyME.
+    const { viajes_cancelados, series_borradas } = await desvincularChoferSrv({
       id_organizacion: req.id_organizacion,
       id_conductor,
       actor: { id_usuario: req.usuario.id_usuario, origen: 'ORGANIZACION' },
       io,
     });
-    return res.status(200).json({ mensaje: 'Chofer desvinculado', id_conductor, viajes_cancelados });
+    return res
+      .status(200)
+      .json({ mensaje: 'Chofer desvinculado', id_conductor, viajes_cancelados, series_borradas });
   } catch (err) {
     return responderErrorNegocio(res, err);
   }

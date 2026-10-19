@@ -77,6 +77,30 @@ export async function registrarCambioEstado({ id_viaje, estado, id_usuario, orig
   }
 }
 
+// Lo mismo para MUCHOS cambios de una vez (las series del Paso 4 crean hasta 31
+// viajes en ASIGNADO): UN insert en vez de 31 round-trips contra Neon. Mismas
+// reglas de llamada y la misma garantia: NUNCA TIRA. Si el insert falla se
+// pierden esas filas de auditoria, no los viajes. Devuelve cuantas registro.
+export async function registrarCambiosEstado(filas) {
+  if (filas.length === 0) return 0;
+  try {
+    const r = await prisma.historialEstadoViaje.createMany({
+      data: filas.map(({ id_viaje, estado, id_usuario, origen, fecha }) => ({
+        id_viaje,
+        estado,
+        id_usuario: id_usuario ?? null,
+        origen: origen ?? null,
+        ...(fecha ? { fecha } : {}),
+      })),
+    });
+    return r.count;
+  } catch (err) {
+    const ids = filas.map((f) => f.id_viaje).join(', ');
+    console.error(`[historial-estado] no se pudo registrar el lote de los viajes ${ids}: ${err.message}`);
+    return 0;
+  }
+}
+
 // Momento en que el viaje entro por PRIMERA vez a `estado`, o null si nunca
 // entro (viaje viejo sin historial, o transicion que todavia no ocurrio).
 //

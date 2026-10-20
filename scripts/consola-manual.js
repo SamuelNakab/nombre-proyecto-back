@@ -47,6 +47,8 @@
 import 'dotenv/config';
 import readline from 'node:readline';
 import { io } from 'socket.io-client';
+// Login contra Firebase Identity Toolkit → devuelve el idToken (Bearer).
+import { getToken as getFirebaseToken } from './_firebase-auth.js';
 
 // ── Configuracion ─────────────────────────────────────────────────────────────
 
@@ -116,23 +118,6 @@ const rl = readline.createInterface({ input: process.stdin, output: process.stdo
 
 function pregunta(texto) {
   return new Promise((resolve) => rl.question(texto, (r) => resolve(r.trim())));
-}
-
-// Login contra Firebase Identity Toolkit → devuelve el idToken (Bearer).
-async function getFirebaseToken(email, password) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_WEB_API_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    }
-  );
-  const data = await res.json();
-  if (!data.idToken) {
-    throw new Error(`Login Firebase fallido para ${email}: ${data.error?.message || JSON.stringify(data)}`);
-  }
-  return data.idToken;
 }
 
 // Llamada REST generica. Devuelve { status, data }.

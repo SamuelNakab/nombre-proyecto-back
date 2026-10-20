@@ -1,9 +1,13 @@
 import { io } from 'socket.io-client';
 import redis from '../src/config/redis.js';
 import prisma from '../src/config/prisma.js';
+import { getToken } from './_firebase-auth.js';
+import { crearRegistro, terminar } from './_limpieza.js';
 
-const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
-const BASE = 'http://localhost:3000';
+// Cuentas FIJAS del seed: al final se borra SOLO lo que esta corrida creo,
+// por ID (viajes y vehiculos nuevos). Las cuentas no se tocan. Ver _limpieza.js.
+const reg = crearRegistro();
+const BASE = process.env.TEST_BASE_URL ?? 'http://localhost:3000';
 
 // Coordenadas reales de CABA (dentro de 200m entre si para el test)
 const PARADA_1 = { lat: -34.6037, lng: -58.3816, direccion: 'Plaza de Mayo, CABA' };
@@ -20,20 +24,6 @@ function paso(nombre, ok, detalle = '') {
 
 function esperar(ms) {
   return new Promise(r => setTimeout(r, ms));
-}
-
-async function getToken(email, password) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    }
-  );
-  const data = await res.json();
-  if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
-  return data.idToken;
 }
 
 async function api(method, path, body, token) {
@@ -72,7 +62,7 @@ async function registrarSiNoExiste(datos, tipo) {
 }
 
 async function crearVehiculoSiNoExiste(token, patente) {
-  await api('POST', '/api/conductores/mis-vehiculos', {
+  const r = await api('POST', '/api/conductores/mis-vehiculos', {
     patente,
     marca: 'Ford',
     modelo: 'Transit',
@@ -80,14 +70,13 @@ async function crearVehiculoSiNoExiste(token, patente) {
     color: 'Blanco',
     tipo_vehiculo: 'furgon',
   }, token);
+  if (r.status === 201) reg.vehiculo(r.data.id_vehiculo); // 409 = ya existia: no es nuestro
   // 409 = ya existe, ambos casos son OK para el test
 }
 
 async function cleanup(sConductor, sCliente) {
   try { sConductor?.disconnect(); } catch {}
   try { sCliente?.disconnect(); } catch {}
-  try { await prisma.$disconnect(); } catch {}
-  try { await redis.quit(); } catch {}
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -140,9 +129,9 @@ async function main() {
   }, clienteToken);
 
   paso('POST /api/viajes → 201', sv === 201, sv !== 201 ? JSON.stringify(viajeData) : '');
-  if (sv !== 201) { await cleanup(sConductor, sCliente); process.exit(1); }
+  if (sv !== 201) throw new Error('Abortado: fallo un paso previo (ver arriba)');
 
-  id_viaje = viajeData.id_viaje;
+  id_viaje = reg.viaje(viajeData.id_viaje);
   const paradas = viajeData.paradas ?? [];
 
   paso(`Viaje creado con id ${id_viaje}`, !!id_viaje, '');
@@ -175,9 +164,7 @@ async function main() {
   paso('Conductor asignado tiene id_conductor en DB',
     !!viajeAsig.conductor?.id_conductor, JSON.stringify(viajeAsig.conductor?.id_conductor));
 
-  if (viajeAsig.estado !== 'CONDUCTOR_ASIGNADO') {
-    await cleanup(sConductor, sCliente); process.exit(1);
-  }
+  if (viajeAsig.estado !== 'CONDUCTOR_ASIGNADO') throw new Error('Abortado: fallo un paso previo (ver arriba)');
 
   // Inicio MANUAL del viaje (boton). Reemplaza al viejo inicio automatico por
   // primer ping GPS: ahora los pings solo se procesan con el viaje ya iniciado.
@@ -185,7 +172,7 @@ async function main() {
   await prisma.viaje.update({ where: { id_viaje }, data: { fecha_programada: new Date() } });
   const { status: siniciar } = await api('POST', `/api/viajes/${id_viaje}/iniciar`, null, conductorToken);
   paso('POST /api/viajes/:id/iniciar → 200 (EN_CAMINO_A_ORIGEN)', siniciar === 200, `status ${siniciar}`);
-  if (siniciar !== 200) { await cleanup(sConductor, sCliente); process.exit(1); }
+  if (siniciar !== 200) throw new Error('Abortado: fallo un paso previo (ver arriba)');
 
   // ──────────────────────────────────────────────────────────────────────────
   // PASO 4: GPS pings (5 pings)
@@ -242,9 +229,7 @@ async function main() {
     spEnRuta === 200 && enRutaData.estado_nuevo === 'EN_RUTA',
     spEnRuta !== 200 ? JSON.stringify(enRutaData) : enRutaData.estado_nuevo);
 
-  if (enRutaData.estado_nuevo !== 'EN_RUTA') {
-    await cleanup(sConductor, sCliente); process.exit(1);
-  }
+  if (enRutaData.estado_nuevo !== 'EN_RUTA') throw new Error('Abortado: fallo un paso previo (ver arriba)');
 
   // ──────────────────────────────────────────────────────────────────────────
   // PASO 6: Paradas del viaje (el conductor las lee del detalle)
@@ -255,7 +240,7 @@ async function main() {
     'GET', `/api/viajes/${id_viaje}`, null, conductorToken
   );
   paso('GET /api/viajes/:id → 200 (conductor asignado)', sdet === 200, sdet !== 200 ? JSON.stringify(detData) : '');
-  if (sdet !== 200) { await cleanup(sConductor, sCliente); process.exit(1); }
+  if (sdet !== 200) throw new Error('Abortado: fallo un paso previo (ver arriba)');
 
   paso('El detalle trae las 2 paradas', Array.isArray(detData.paradas) && detData.paradas.length === 2,
     `${detData.paradas?.length ?? 0} paradas`);
@@ -287,7 +272,7 @@ async function main() {
     conductorToken
   );
   paso('POST confirmar-parada 1 → 200', sc1 === 200, sc1 !== 200 ? JSON.stringify(conf1) : '');
-  if (sc1 !== 200) { await cleanup(sConductor, sCliente); process.exit(1); }
+  if (sc1 !== 200) throw new Error('Abortado: fallo un paso previo (ver arriba)');
 
   paso('confirmada=true, viaje_finalizado=false',
     conf1.confirmada === true && conf1.viaje_finalizado === false,
@@ -325,7 +310,7 @@ async function main() {
   );
   conf2 = conf2Data;
   paso('POST confirmar-parada 2 → 200', sc2 === 200, sc2 !== 200 ? JSON.stringify(conf2) : '');
-  if (sc2 !== 200) { await cleanup(sConductor, sCliente); process.exit(1); }
+  if (sc2 !== 200) throw new Error('Abortado: fallo un paso previo (ver arriba)');
 
   paso('confirmada=true, viaje_finalizado=true',
     conf2.confirmada === true && conf2.viaje_finalizado === true,
@@ -460,11 +445,12 @@ async function main() {
     fallaron.forEach(p => console.log(`    ❌ ${p.nombre}${p.detalle ? ': ' + p.detalle : ''}`));
   }
 
-  process.exit(fallaron.length === 0 ? 0 : 1);
+  return fallaron.length === 0;
 }
 
-main().catch(async e => {
-  console.error('\n💥 Error inesperado:', e.message);
-  try { await redis.quit(); } catch {}
-  process.exit(1);
-});
+main()
+  .then((ok) => terminar(reg, ok))
+  .catch((e) => {
+    console.error('\n💥 Error inesperado:', e.message, e.stack);
+    return terminar(reg, false);
+  });

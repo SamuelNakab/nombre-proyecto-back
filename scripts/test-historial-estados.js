@@ -30,19 +30,30 @@
 import { io as ioClient } from 'socket.io-client';
 import * as turf from '@turf/turf';
 import prisma from '../src/config/prisma.js';
-import redis from '../src/config/redis.js';
 import { registrarCambioEstado } from '../src/services/historial-estado.service.js';
 import { conServer } from './_server-efimero.js';
+import { getToken } from './_firebase-auth.js';
+import { crearRegistro, terminar } from './_limpieza.js';
 
-const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
-const SETUP_BASE = 'http://localhost:3000'; // solo para el alta de fixtures
+// Todo lo que crea la corrida se borra al final (ver _limpieza.js): los
+// usuarios con el patron de esta corrida y lo que cuelga de ellos.
+const reg = crearRegistro();
+const SETUP_BASE = process.env.TEST_BASE_URL ?? 'http://localhost:3000'; // solo para el alta de fixtures
 
 const ADMIN = { email: 'admin-test@fleter.com', password: 'admintest123' };
 
 const PARADA_1 = { lat: -34.6037, lng: -58.3816, direccion: 'Plaza de Mayo, CABA' };
 const PARADA_2 = { lat: -34.5895, lng: -58.3974, direccion: 'Recoleta, CABA' };
 
-const ENV = { ANTICIPACION_MINIMA_MINUTOS: '0' };
+// El marketplace esta dormido por defecto (MARKETPLACE_HABILITADO=false en el
+// .env): esta suite prueba el ciclo LEGACY, asi que su server lo prende. Los
+// barridos de arranque apagados: la DB esta compartida con produccion.
+const ENV = {
+  ANTICIPACION_MINIMA_MINUTOS: '0',
+  MARKETPLACE_HABILITADO: 'true',
+  RESERVA_BARRIDO_ARRANQUE: '0',
+  VENCIMIENTO_BARRIDO_ARRANQUE: '0',
+};
 
 const creados = [];
 
@@ -57,20 +68,6 @@ function paso(nombre, ok, detalle = '') {
   console.log(`  ${ok ? '✅' : '❌'} ${nombre}${detalle ? '  →  ' + detalle : ''}`);
 }
 const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function getToken(email, password) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    }
-  );
-  const data = await res.json();
-  if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
-  return data.idToken;
-}
 
 async function api(base, method, path, body, token) {
   let res;
@@ -192,27 +189,6 @@ async function cleanup(sockets = []) {
       /* noop */
     }
   }
-  // La DB esta compartida con produccion: no dejamos viajes de prueba colgados.
-  try {
-    if (creados.length > 0) {
-      await prisma.viaje.updateMany({
-        where: { id_viaje: { in: creados }, estado: { notIn: ['FINALIZADO', 'CANCELADO'] } },
-        data: { estado: 'CANCELADO', motivo_cancelacion: 'limpieza test-historial-estados' },
-      });
-    }
-  } catch (e) {
-    console.error('  ⚠️  no se pudieron limpiar los viajes de prueba:', e.message);
-  }
-  try {
-    await prisma.$disconnect();
-  } catch {
-    /* noop */
-  }
-  try {
-    await redis.quit();
-  } catch {
-    /* noop */
-  }
 }
 
 // -- Main -------------------------------------------------------------------
@@ -224,6 +200,7 @@ async function main() {
   if (SOLO.length > 0) console.log(`  (solo los casos ${SOLO.join(', ')})\n`);
 
   const stamp = Date.now();
+  reg.patron(`-hst-${stamp}`);
   const pass = 'test123456';
   const d = String(stamp).slice(-7);
   const lic = '2028-01-01T00:00:00.000Z';
@@ -540,12 +517,20 @@ async function main() {
         `ganadores=${ganadores.length} status=[${r1.status}, ${r2.status}]`
       );
 
+      // Que los dos fetch salgan en el mismo tick no garantiza que las dos
+      // LECTURAS previas ocurran antes del commit del ganador. Si la del perdedor
+      // llega despues, es el caso secuencial y el contrato es 400 (el estado ya
+      // no es CONDUCTOR_ASIGNADO); si las dos leyeron antes, es la carrera real y
+      // el guard del WHERE da 409. Las dos son correctas; lo que prueba el guard
+      // es 3b / 3d / 3e (un solo ganador, sin pisar iniciado_por ni duplicar fila).
+      const perdio = perdedores[0];
+      const secuencial = perdio?.status === 400 && /Solo se puede iniciar un viaje en estado CONDUCTOR_ASIGNADO/.test(perdio.data?.error ?? '');
       paso(
-        'CASO 3c: el perdedor recibe 409 con un error string',
+        'CASO 3c: el perdedor recibe 409 (carrera) o 400 (lectura despues del commit), con un error string',
         perdedores.length === 1 &&
-          perdedores[0].status === 409 &&
-          typeof perdedores[0].data.error === 'string',
-        `status=${perdedores[0]?.status} error=${perdedores[0]?.data?.error}`
+          (perdio.status === 409 || secuencial) &&
+          typeof perdio.data.error === 'string',
+        `${perdio?.status === 409 ? 'carrera real' : secuencial ? 'secuencial' : '?'}: status=${perdio?.status} error=${perdio?.data?.error}`
       );
 
       const vDb = await viajeDb(v);
@@ -836,11 +821,12 @@ async function main() {
     fallaron.forEach((p) => console.log(`    ❌ ${p.nombre}${p.detalle ? ': ' + p.detalle : ''}`));
   }
 
-  process.exit(fallaron.length === 0 ? 0 : 1);
+  return fallaron.length === 0;
 }
 
-main().catch(async (e) => {
-  console.error('\n💥 Error inesperado:', e.message, e.stack);
-  await cleanup();
-  process.exit(1);
-});
+main()
+  .then((ok) => terminar(reg, ok))
+  .catch((e) => {
+    console.error('\n💥 Error inesperado:', e.message, e.stack);
+    return terminar(reg, false);
+  });

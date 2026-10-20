@@ -7,9 +7,13 @@ import {
   api, getToken, conectar, esperar, registrarSiNoExiste, crearVehiculoSiNoExiste,
   crearReporter, STRESS_USERS, PARADA_A, PARADA_B,
 } from './_helpers.js';
+import { crearRegistro, cerrarConexiones } from '../_limpieza.js';
 
 // Mismo default que el backend (src/controllers/viajes.controller.js). Si el
 // server corre con otro valor, exportá RADIO_CONFIRMACION_METROS tambien aca.
+// Cuentas FIJAS del seed: al final se borra SOLO lo que esta corrida creo,
+// por ID (viajes y vehiculos nuevos). Las cuentas no se tocan. Ver _limpieza.js.
+const reg = crearRegistro();
 const RADIO_METROS = parseFloat(process.env.RADIO_CONFIRMACION_METROS || '50');
 
 // Las paradas (id_parada + orden) salen del detalle del viaje: el endpoint de
@@ -26,7 +30,7 @@ async function montarViajeEnRuta(tokenCli, tokenA) {
     zona: 'CABA', fecha_programada: fecha, condiciones_requeridas: [],
     paradas: [PARADA_A, PARADA_B],
   }, tokenCli);
-  const id_viaje = viaje.id_viaje;
+  const id_viaje = reg.viaje(viaje.id_viaje);
   const sA = await conectar(tokenA);
   await esperar(1200);
   sA.emit('viaje:aceptar', { id_viaje });
@@ -34,7 +38,7 @@ async function montarViajeEnRuta(tokenCli, tokenA) {
 
   // El viaje arranca con POST /:id/iniciar: el inicio automatico por primer ping
   // GPS ya no existe. Crear exige fecha_programada >= 1h a futuro y la ventana de
-  // inicio abre recien VENTANA_INICIO_MINUTOS antes, asi que la traemos a "ahora".
+  // inicio abre recien VENTANA_INICIO_ANTES_MINUTOS antes, asi que la traemos a "ahora".
   await prisma.viaje.update({ where: { id_viaje }, data: { fecha_programada: new Date() } });
   await api('POST', `/api/viajes/${id_viaje}/iniciar`, null, tokenA);
 
@@ -197,17 +201,28 @@ async function main() {
   v1.sA.disconnect();
   v2.sA.disconnect();
   v3.sA.disconnect();
-  await redis.quit();
-  try { await prisma.$disconnect(); } catch { /* noop */ }
   return r.resumen();
 }
 
-main().then(res => {
+// Limpieza (pase lo que pase) y exit 1 si hubo bugs o quedaron restos: el
+// runner de regresion (test-regresion.js) decide por el codigo de salida. Los
+// "huecos" son comportamiento conocido, no fallan.
+async function limpiarYSalir(res, ok) {
+  let limpio = false;
+  try {
+    limpio = (await reg.limpiar()).ok;
+  } catch (e) {
+    console.error('  ⚠️  la limpieza fallo:', e.message);
+  }
+  console.log(`  ${limpio ? '✅' : '❌'} LIMPIEZA: no quedo nada de lo creado por el test`);
   console.log('\n__RESULT_JSON__' + JSON.stringify(res));
-  process.exit(0);
-}).catch(async e => {
-  console.error('\n💥 Error inesperado:', e.message);
-  try { await redis.quit(); } catch {}
-  console.log('\n__RESULT_JSON__' + JSON.stringify({ nombre: 'cierre', error: e.message, total: 0, ok: 0, bugs: [], huecos: [], todos: [] }));
-  process.exit(1);
-});
+  await cerrarConexiones();
+  process.exit(ok && limpio ? 0 : 1);
+}
+
+main()
+  .then((res) => limpiarYSalir(res, res.bugs.length === 0))
+  .catch((e) => {
+    console.error('\n💥 Error inesperado:', e.message);
+    return limpiarYSalir({ nombre: 'cierre', error: e.message, total: 0, ok: 0, bugs: [], huecos: [], todos: [] }, false);
+  });

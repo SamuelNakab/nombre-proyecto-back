@@ -33,17 +33,28 @@
 // minutos que tarda la corrida completa.
 import { io as ioClient } from 'socket.io-client';
 import prisma from '../src/config/prisma.js';
-import redis from '../src/config/redis.js';
-import { conServer } from './_server-efimero.js';
+import { conServer, esperarLinea } from './_server-efimero.js';
+import { getToken } from './_firebase-auth.js';
+import { crearRegistro, terminar } from './_limpieza.js';
 
-const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
-const SETUP_BASE = 'http://localhost:3000'; // solo para el alta de fixtures
+// Todo lo que crea la corrida se borra al final (ver _limpieza.js): los
+// usuarios con el patron de esta corrida y lo que cuelga de ellos.
+const reg = crearRegistro();
+const SETUP_BASE = process.env.TEST_BASE_URL ?? 'http://localhost:3000'; // solo para el alta de fixtures
 
 const PARADA_1 = { lat: -34.6037, lng: -58.3816, direccion: 'Plaza de Mayo, CABA' };
 const PARADA_2 = { lat: -34.5895, lng: -58.3974, direccion: 'Recoleta, CABA' };
 
 // Sin anticipacion minima podemos programar un viaje a segundos vista.
-const ENV_SIN_ANTICIPACION = { ANTICIPACION_MINIMA_MINUTOS: '0' };
+// El marketplace esta dormido por defecto (MARKETPLACE_HABILITADO=false en el
+// .env): esta suite prueba el ciclo LEGACY, asi que su server lo prende. Los
+// barridos de arranque apagados: la DB esta compartida con produccion.
+const ENV_SIN_ANTICIPACION = {
+  ANTICIPACION_MINIMA_MINUTOS: '0',
+  MARKETPLACE_HABILITADO: 'true',
+  RESERVA_BARRIDO_ARRANQUE: '0',
+  VENCIMIENTO_BARRIDO_ARRANQUE: '0',
+};
 
 // Segundos hasta la fecha_programada de los viajes de prueba, y margen para
 // mirar el resultado despues de que el aviso tendria que haber disparado.
@@ -66,20 +77,6 @@ function paso(nombre, ok, detalle = '') {
   console.log(`  ${ok ? '✅' : '❌'} ${nombre}${detalle ? '  →  ' + detalle : ''}`);
 }
 const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function getToken(email, password) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    }
-  );
-  const data = await res.json();
-  if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
-  return data.idToken;
-}
 
 async function api(base, method, path, body, token) {
   let res;
@@ -174,28 +171,6 @@ async function cleanup(sockets = []) {
       /* noop */
     }
   }
-  // La DB esta compartida con produccion: no dejamos viajes de prueba colgados
-  // en BUSCANDO_CONDUCTOR, que es justo el estado que este test genera.
-  try {
-    if (creados.length > 0) {
-      await prisma.viaje.updateMany({
-        where: { id_viaje: { in: creados }, estado: { notIn: ['FINALIZADO', 'CANCELADO'] } },
-        data: { estado: 'CANCELADO', motivo_cancelacion: 'limpieza test-viajes-vencidos' },
-      });
-    }
-  } catch (e) {
-    console.error('  ⚠️  no se pudieron limpiar los viajes de prueba:', e.message);
-  }
-  try {
-    await prisma.$disconnect();
-  } catch {
-    /* noop */
-  }
-  try {
-    await redis.quit();
-  } catch {
-    /* noop */
-  }
 }
 
 // -- Main -------------------------------------------------------------------
@@ -207,6 +182,7 @@ async function main() {
   if (SOLO.length > 0) console.log(`  (solo los casos ${SOLO.join(', ')})\n`);
 
   const stamp = Date.now();
+  reg.patron(`-vnc-${stamp}`);
   const pass = 'test123456';
   const d = String(stamp).slice(-7);
   const lic = '2028-01-01T00:00:00.000Z';
@@ -421,7 +397,7 @@ async function main() {
       gerenteToken
     );
 
-    // La ventana de inicio abre VENTANA_INICIO_MINUTOS (30) antes de la fecha,
+    // La ventana de inicio abre VENTANA_INICIO_ANTES_MINUTOS antes de la fecha,
     // asi que ya se puede iniciar.
     const rIni = await api(base, 'POST', `/api/viajes/${id_viaje}/iniciar`, null, condToken);
     const iniciado = await estadoDe(id_viaje);
@@ -513,15 +489,19 @@ async function main() {
     await conServer(ENV_SIN_ANTICIPACION, 3306, async (base, leerLog) => {
       const cli = await espia(base, clienteToken);
 
-      const linea =
-        leerLog()
-          .split('\n')
-          .find((l) => l.includes('[viaje-vencido] barrido de arranque')) ?? '';
-      const m = linea.match(/(\d+) viajes pre-inicio con aviso programado/);
+      // Hay DOS lineas con ese prefijo, de queries async en carrera: la legacy
+      // ("barrido de arranque: N viajes pre-inicio con aviso programado") y la del
+      // ciclo interno ("barrido de arranque (ciclo interno): ..." o "... del ciclo
+      // interno DESACTIVADO"). El ':' justo despues de "arranque" las distingue.
+      // Y puede loguearse despues de /health: se espera a la linea.
+      const m = await esperarLinea(
+        leerLog,
+        /\[viaje-vencido\] barrido de arranque: (\d+) viajes pre-inicio con aviso programado/
+      );
       paso(
         'CASO 5b: al arrancar, el barrido reprograma los avisos pendientes y lo loguea',
         !!m && Number(m[1]) >= 1,
-        linea.trim() || 'no se encontro la linea del barrido en el log'
+        m ? m[0] : 'no se encontro la linea del barrido en el log'
       );
 
       const faltan = trasCaida.fecha_programada.getTime() - Date.now();
@@ -594,11 +574,12 @@ async function main() {
     fallaron.forEach((p) => console.log(`    ❌ ${p.nombre}${p.detalle ? ': ' + p.detalle : ''}`));
   }
 
-  process.exit(fallaron.length === 0 ? 0 : 1);
+  return fallaron.length === 0;
 }
 
-main().catch(async (e) => {
-  console.error('\n💥 Error inesperado:', e.message, e.stack);
-  await cleanup();
-  process.exit(1);
-});
+main()
+  .then((ok) => terminar(reg, ok))
+  .catch((e) => {
+    console.error('\n💥 Error inesperado:', e.message, e.stack);
+    return terminar(reg, false);
+  });

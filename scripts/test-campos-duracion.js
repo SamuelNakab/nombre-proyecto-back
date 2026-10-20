@@ -1,6 +1,7 @@
 import { io } from 'socket.io-client';
-import redis from '../src/config/redis.js';
 import prisma from '../src/config/prisma.js';
+import { getToken } from './_firebase-auth.js';
+import { crearRegistro, terminar } from './_limpieza.js';
 
 // Campos que el front consumia "inferidos" y ahora la API expone explicitamente:
 //   - duracion_real      (minutos) en GET /api/viajes/mis-viajes
@@ -10,8 +11,10 @@ import prisma from '../src/config/prisma.js';
 //
 // Mismo patron que scripts/test-fase5.js y scripts/test-jerarquia.js.
 
-const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
-const BASE = 'http://localhost:3000';
+// Todo lo que crea la corrida se borra al final (ver _limpieza.js): los
+// usuarios con el patron de esta corrida y lo que cuelga de ellos.
+const reg = crearRegistro();
+const BASE = process.env.TEST_BASE_URL ?? 'http://localhost:3000';
 
 const HORA = 60 * 60 * 1000;
 
@@ -36,20 +39,6 @@ function paso(nombre, ok, detalle = '') {
 }
 function esperar(ms) {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-async function getToken(email, password) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    }
-  );
-  const data = await res.json();
-  if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
-  return data.idToken;
 }
 
 async function api(method, path, body, token) {
@@ -97,16 +86,6 @@ async function cleanup(sockets) {
       /* noop */
     }
   }
-  try {
-    await prisma.$disconnect();
-  } catch {
-    /* noop */
-  }
-  try {
-    await redis.quit();
-  } catch {
-    /* noop */
-  }
 }
 
 // Lleva un viaje de la creacion al cierre y devuelve todo lo que hace falta
@@ -143,7 +122,7 @@ async function completarViaje({ paradas, clienteToken, conductorToken, sConducto
   // el vehiculo.
   const { data: detalle } = await api('GET', `/api/viajes/${id_viaje}`, null, clienteToken);
 
-  // La ventana de inicio se abre VENTANA_INICIO_MINUTOS antes de la fecha
+  // La ventana de inicio se abre VENTANA_INICIO_ANTES_MINUTOS antes de la fecha
   // programada: la traemos a "ahora" para poder iniciar (igual que test-fase5).
   await prisma.viaje.update({ where: { id_viaje }, data: { fecha_programada: new Date() } });
   const { status: sIniciar, data: dIniciar } = await api(
@@ -211,6 +190,7 @@ async function main() {
   console.log('╚══════════════════════════════════════════════════════════╝\n');
 
   const stamp = Date.now();
+  reg.patron(`-dur-${stamp}`);
   const pass = 'test123456';
   const d = String(stamp).slice(-7);
   let sConductor = null;
@@ -522,20 +502,12 @@ async function main() {
     fallaron.forEach((p) => console.log(`    ❌ ${p.nombre}${p.detalle ? ': ' + p.detalle : ''}`));
   }
 
-  process.exit(fallaron.length === 0 ? 0 : 1);
+  return fallaron.length === 0;
 }
 
-main().catch(async (e) => {
-  console.error('\n💥 Error inesperado:', e.message, e.stack);
-  try {
-    await prisma.$disconnect();
-  } catch {
-    /* noop */
-  }
-  try {
-    await redis.quit();
-  } catch {
-    /* noop */
-  }
-  process.exit(1);
-});
+main()
+  .then((ok) => terminar(reg, ok))
+  .catch((e) => {
+    console.error('\n💥 Error inesperado:', e.message, e.stack);
+    return terminar(reg, false);
+  });

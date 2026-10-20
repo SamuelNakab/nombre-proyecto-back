@@ -1,9 +1,13 @@
 import { io } from 'socket.io-client';
 import redis from '../src/config/redis.js';
 import prisma from '../src/config/prisma.js';
+import { getToken } from './_firebase-auth.js';
+import { crearRegistro, terminar } from './_limpieza.js';
 
-const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
-const BASE = 'http://localhost:3000';
+// Cuentas FIJAS del seed: al final se borra SOLO lo que esta corrida creo,
+// por ID (viajes y vehiculos nuevos). Las cuentas no se tocan. Ver _limpieza.js.
+const reg = crearRegistro();
+const BASE = process.env.TEST_BASE_URL ?? 'http://localhost:3000';
 
 // Dos paradas reales en CABA (zona CABA, sin condiciones → cualquier conductor
 // con al menos un vehiculo es elegible).
@@ -21,20 +25,6 @@ function paso(nombre, ok, detalle = '') {
 
 function esperar(ms) {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-async function getToken(email, password) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    }
-  );
-  const data = await res.json();
-  if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
-  return data.idToken;
 }
 
 async function api(method, path, body, token) {
@@ -73,7 +63,7 @@ async function registrarSiNoExiste(datos, tipo) {
 }
 
 async function crearVehiculoSiNoExiste(token, patente) {
-  await api('POST', '/api/conductores/mis-vehiculos', {
+  const r = await api('POST', '/api/conductores/mis-vehiculos', {
     patente,
     marca: 'Ford',
     modelo: 'Transit',
@@ -81,6 +71,7 @@ async function crearVehiculoSiNoExiste(token, patente) {
     color: 'Blanco',
     tipo_vehiculo: 'furgon',
   }, token);
+  if (r.status === 201) reg.vehiculo(r.data.id_vehiculo); // 409 = ya existia: no es nuestro
   // 409 = ya existe; OK para el test
 }
 
@@ -93,15 +84,13 @@ async function crearViaje(clienteToken) {
     paradas: [PARADA_1, PARADA_2],
   }, clienteToken);
   if (status !== 201) throw new Error(`No se pudo crear viaje (status ${status}): ${JSON.stringify(data)}`);
-  return data.id_viaje;
+  return reg.viaje(data.id_viaje);
 }
 
 async function cleanup(sockets) {
   for (const s of sockets) {
     try { s?.disconnect(); } catch { /* noop */ }
   }
-  try { await prisma.$disconnect(); } catch { /* noop */ }
-  try { await redis.quit(); } catch { /* noop */ }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -170,8 +159,7 @@ async function main() {
   const { data: v1Asig } = await api('GET', `/api/viajes/${v1}`, null, clienteToken);
   if (v1Asig.estado !== 'CONDUCTOR_ASIGNADO') {
     paso('PUNTO 1: viaje quedo CONDUCTOR_ASIGNADO antes de cancelar', false, v1Asig.estado);
-    await cleanup([sA, sB, sCliente]);
-    process.exit(1);
+    throw new Error('Abortado: fallo una precondicion (ver arriba)');
   }
 
   // Reset de flags de disponible para detectar SOLO la republicacion
@@ -355,11 +343,12 @@ async function main() {
   }
   console.log('\n  NOTA PUNTO 11 (no regresion): correr aparte `node scripts/test-fase5.js` → 36/36.');
 
-  process.exit(fallaron.length === 0 ? 0 : 1);
+  return fallaron.length === 0;
 }
 
-main().catch(async (e) => {
-  console.error('\n💥 Error inesperado:', e.message);
-  try { await redis.quit(); } catch { /* noop */ }
-  process.exit(1);
-});
+main()
+  .then((ok) => terminar(reg, ok))
+  .catch((e) => {
+    console.error('\n💥 Error inesperado:', e.message, e.stack);
+    return terminar(reg, false);
+  });

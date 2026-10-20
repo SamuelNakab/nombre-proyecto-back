@@ -8,8 +8,8 @@
 // Un viaje a las 10:00 se inicia entre las 9:00 y las 11:30. Pasado el fin de
 // la ventana, un viaje ASIGNADO o CONFIRMADO VENCE (ver vencimiento.service).
 //
-// VENTANA_INICIO_MINUTOS (la vieja, sin limite superior) queda REEMPLAZADA: solo
-// sobrevive como fallback del iniciar LEGACY (ventanaInicioAntesMinutosLegacy).
+// VENTANA_INICIO_MINUTOS (la vieja) ya NO la lee nadie: el iniciar LEGACY usa
+// tambien VENTANA_INICIO_ANTES_MINUTOS (sin limite superior).
 //
 // OJO: mientras la DB de Neon este compartida entre staging y produccion, las
 // dos variables tienen que valer LO MISMO en los dos environments: los dos
@@ -33,16 +33,6 @@ function minutosDeEnv(raw, porDefecto) {
 // anticipacionMinimaMinutos). `env` es inyectable para los tests.
 export function ventanaInicioAntesMinutos(env = process.env) {
   return minutosDeEnv(env.VENTANA_INICIO_ANTES_MINUTOS, VENTANA_ANTES_DEFAULT);
-}
-
-// SOLO para el iniciar LEGACY del marketplace: ANTES, y si no esta definida (o
-// esta vacia) la vieja VENTANA_INICIO_MINUTOS, que es la que ese endpoint usaba.
-// El ciclo interno NO depende de la variable reemplazada.
-export function ventanaInicioAntesMinutosLegacy(env = process.env) {
-  const raw = vacio(env.VENTANA_INICIO_ANTES_MINUTOS)
-    ? env.VENTANA_INICIO_MINUTOS
-    : env.VENTANA_INICIO_ANTES_MINUTOS;
-  return minutosDeEnv(raw, VENTANA_ANTES_DEFAULT);
 }
 
 export function ventanaInicioDespuesMinutos(env = process.env) {

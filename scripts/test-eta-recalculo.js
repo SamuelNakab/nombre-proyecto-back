@@ -2,9 +2,13 @@ import 'dotenv/config';
 import { io } from 'socket.io-client';
 import redis from '../src/config/redis.js';
 import prisma from '../src/config/prisma.js';
+import { getToken } from './_firebase-auth.js';
+import { crearRegistro, terminar } from './_limpieza.js';
 
-const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
-const BASE = 'http://localhost:3000';
+// Cuentas FIJAS del seed: al final se borra SOLO lo que esta corrida creo,
+// por ID (viajes y vehiculos nuevos). Las cuentas no se tocan. Ver _limpieza.js.
+const reg = crearRegistro();
+const BASE = process.env.TEST_BASE_URL ?? 'http://localhost:3000';
 
 // Paradas reales en CABA. El conductor arranca lejos de la parada 1 para que el
 // ETA inicial sea > 0.
@@ -37,17 +41,6 @@ async function esperarHasta(cond, ms = 10000) {
   return cond();
 }
 
-async function getToken(email, password) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }) }
-  );
-  const data = await res.json();
-  if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
-  return data.idToken;
-}
-
 async function api(method, path, body, token) {
   const res = await fetch(`${BASE}${path}`, {
     method,
@@ -77,7 +70,6 @@ async function registrarSiNoExiste(datos, tipo) {
 async function cleanup(sCond, sCli) {
   try { sCond?.disconnect(); } catch {}
   try { sCli?.disconnect(); } catch {}
-  try { await redis.quit(); } catch {}
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -110,9 +102,10 @@ async function main() {
   const conductorToken = await getToken('conductor@test.com', 'test123456');
   check('Tokens obtenidos (cliente y conductor)', true);
 
-  await api('POST', '/api/conductores/mis-vehiculos', {
+  const rVeh = await api('POST', '/api/conductores/mis-vehiculos', {
     patente: 'FLT001', marca: 'Ford', modelo: 'Transit', anio: 2020, color: 'Blanco', tipo_vehiculo: 'furgon',
   }, conductorToken); // 409 si ya existe → OK
+  if (rVeh.status === 201) reg.vehiculo(rVeh.data.id_vehiculo);
   check('Vehiculo del conductor disponible (FLT001)', true);
 
   // ── PASO 2: Crear viaje ─────────────────────────────────────────────────────
@@ -124,8 +117,8 @@ async function main() {
     paradas: [PARADA_1, PARADA_2],
   }, clienteToken);
   check('POST /api/viajes → 201', sv === 201, sv !== 201 ? JSON.stringify(viajeData) : '');
-  if (sv !== 201) { await cleanup(); process.exit(1); }
-  const id_viaje = viajeData.id_viaje;
+  if (sv !== 201) throw new Error('Abortado: fallo un paso previo (ver arriba)');
+  const id_viaje = reg.viaje(viajeData.id_viaje);
   console.log(`  viaje id = ${id_viaje}`);
 
   // ── PASO 3: Sockets + aceptar viaje ─────────────────────────────────────────
@@ -147,7 +140,7 @@ async function main() {
 
   const { data: vAsig } = await api('GET', `/api/viajes/${id_viaje}`, null, clienteToken);
   check('Viaje en CONDUCTOR_ASIGNADO', vAsig.estado === 'CONDUCTOR_ASIGNADO', vAsig.estado);
-  if (vAsig.estado !== 'CONDUCTOR_ASIGNADO') { await cleanup(sConductor, sCliente); process.exit(1); }
+  if (vAsig.estado !== 'CONDUCTOR_ASIGNADO') throw new Error('Abortado: fallo un paso previo (ver arriba)');
 
   // ── PASO 4: Iniciar + pings iniciales → arranca ETA ─────────────────────────
   console.log('\n── PASO 4: Iniciar y pings iniciales (lejos de parada 1) ─\n');
@@ -278,12 +271,12 @@ async function main() {
     console.log('\n  Fallaron:');
     fallaron.forEach((c) => console.log(`    ❌ ${c.nombre}${c.detalle ? ': ' + c.detalle : ''}`));
   }
-  await prisma.$disconnect().catch(() => {});
-  process.exit(fallaron.length === 0 ? 0 : 1);
+  return fallaron.length === 0;
 }
 
-main().catch(async (e) => {
-  console.error('\n💥 Error inesperado:', e.message, e.stack);
-  try { await redis.quit(); } catch {}
-  process.exit(1);
-});
+main()
+  .then((ok) => terminar(reg, ok))
+  .catch((e) => {
+    console.error('\n💥 Error inesperado:', e.message, e.stack);
+    return terminar(reg, false);
+  });

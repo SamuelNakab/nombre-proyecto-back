@@ -1,27 +1,13 @@
 import { io } from 'socket.io-client';
 
-export const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
-export const BASE = 'http://localhost:3000';
+export { getToken } from '../_firebase-auth.js';
+export const BASE = process.env.TEST_BASE_URL ?? 'http://localhost:3000';
 
 export const PARADA_A = { lat: -34.6037, lng: -58.3816, direccion: 'Plaza de Mayo, CABA' };
 export const PARADA_B = { lat: -34.5895, lng: -58.3974, direccion: 'Recoleta, CABA' };
 
 export function esperar(ms) {
   return new Promise(r => setTimeout(r, ms));
-}
-
-export async function getToken(email, password) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    }
-  );
-  const data = await res.json();
-  if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
-  return data.idToken;
 }
 
 export async function api(method, path, body, token) {

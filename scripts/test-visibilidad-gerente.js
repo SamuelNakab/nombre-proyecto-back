@@ -1,8 +1,11 @@
-import redis from '../src/config/redis.js';
 import prisma from '../src/config/prisma.js';
+import { getToken } from './_firebase-auth.js';
+import { crearRegistro, terminar } from './_limpieza.js';
 
-const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
-const BASE = 'http://localhost:3000';
+// Todo lo que crea la corrida se borra al final (ver _limpieza.js): los
+// usuarios con el patron de esta corrida y lo que cuelga de ellos.
+const reg = crearRegistro();
+const BASE = process.env.TEST_BASE_URL ?? 'http://localhost:3000';
 
 const PARADA_1 = { lat: -34.6037, lng: -58.3816, direccion: 'Plaza de Mayo, CABA' };
 const PARADA_2 = { lat: -34.5895, lng: -58.3974, direccion: 'Recoleta, CABA' };
@@ -15,20 +18,6 @@ const pasos = [];
 function paso(nombre, ok, detalle = '') {
   pasos.push({ nombre, ok, detalle });
   console.log(`  ${ok ? '✅' : '❌'} ${nombre}${detalle ? '  →  ' + detalle : ''}`);
-}
-
-async function getToken(email, password) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    }
-  );
-  const data = await res.json();
-  if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
-  return data.idToken;
 }
 
 async function api(method, path, body, token) {
@@ -109,19 +98,6 @@ async function conductorIdPorEmail(email) {
 const disponiblesEmpresa = (token, id_empresa) =>
   api('GET', `/api/empresas/${id_empresa}/viajes-disponibles`, null, token);
 
-async function cleanup() {
-  try {
-    await prisma.$disconnect();
-  } catch {
-    /* noop */
-  }
-  try {
-    await redis.quit();
-  } catch {
-    /* noop */
-  }
-}
-
 // ── Main ───────────────────────────────────────────────────────────────────
 
 async function main() {
@@ -130,6 +106,7 @@ async function main() {
   console.log('╚══════════════════════════════════════════════╝\n');
 
   const stamp = Date.now();
+  reg.patron(`-vis-${stamp}`);
   const pass = 'test123456';
   const d = String(stamp).slice(-7);
   const lic = '2028-01-01T00:00:00.000Z';
@@ -291,8 +268,6 @@ async function main() {
   paso('CASO 5e: un conductor random → 403', g5rnd === 403, `status=${g5rnd}`);
 
   // ── RESUMEN ──────────────────────────────────────────────────────────────
-  await cleanup();
-
   const ok = pasos.filter((p) => p.ok).length;
   const fallaron = pasos.filter((p) => !p.ok);
 
@@ -306,11 +281,12 @@ async function main() {
     fallaron.forEach((p) => console.log(`    ❌ ${p.nombre}${p.detalle ? ': ' + p.detalle : ''}`));
   }
 
-  process.exit(fallaron.length === 0 ? 0 : 1);
+  return fallaron.length === 0;
 }
 
-main().catch(async (e) => {
-  console.error('\n💥 Error inesperado:', e.message, e.stack);
-  await cleanup();
-  process.exit(1);
-});
+main()
+  .then((ok) => terminar(reg, ok))
+  .catch((e) => {
+    console.error('\n💥 Error inesperado:', e.message, e.stack);
+    return terminar(reg, false);
+  });

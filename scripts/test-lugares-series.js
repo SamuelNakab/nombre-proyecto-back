@@ -49,7 +49,8 @@
 // Acepta numeros de caso (el setup corre siempre):
 //   node scripts/test-lugares-series.js 12 13
 // Y si una corrida se corto sin limpiar:
-//   node scripts/test-lugares-series.js --restos
+//   node scripts/test-lugares-series.js --restos            (solo cuenta)
+//   node scripts/test-lugares-series.js --restos --borrar   (borra)
 //
 // LIMPIEZA: borra TODO lo que crea (viajes con su historial, paradas y
 // condiciones; series; lugares; vinculos, invitaciones, membresias, PyMEs,
@@ -57,14 +58,14 @@
 // Redis; los PDF de remito en R2) y al final verifica que no quedo nada.
 import 'dotenv/config';
 import zlib from 'node:zlib';
-import { S3Client, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { io as ioClient } from 'socket.io-client';
 import prisma from '../src/config/prisma.js';
 import redis from '../src/config/redis.js';
-import admin from '../src/config/firebase.js';
 import { conServer } from './_server-efimero.js';
+import { crearRegistro } from './_limpieza.js';
+import { restos } from './restos.js';
+import { getToken as loginFirebase } from './_firebase-auth.js';
 
-const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
 const PUERTO = 3801;
 const PUERTO_SIN_GOOGLE = 3802;
 const RONDAS = 5;
@@ -120,16 +121,7 @@ function paso(nombre, ok, detalle = '') {
 const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
 const titulo = (t) => console.log(`\n-- ${t} ${'-'.repeat(Math.max(0, 60 - t.length))}\n`);
 
-async function getToken(email, password = PASS) {
-  const res = await fetch(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, password, returnSecureToken: true }),
-  });
-  const data = await res.json();
-  if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
-  return data.idToken;
-}
+const getToken = (email, password = PASS) => loginFirebase(email, password);
 
 let BASE = `http://localhost:${PUERTO}`;
 
@@ -383,130 +375,13 @@ const sinEspacios = (t) => t.replace(/\s+/g, '');
 
 // -- Limpieza -----------------------------------------------------------------
 
-async function limpiar(emails = emailsCreados, patronRestante = `-lys-${S}-`) {
-  titulo('LIMPIEZA');
+// Borra todo lo de ESTA corrida (ver _limpieza.js) y verifica que no quedo nada.
+async function limpiar() {
   for (const s of sockets) s.disconnect();
-
-  const usuarios = await prisma.usuario.findMany({
-    where: { email: { in: emails } },
-    include: { conductor: true, cliente: true, membresias: { select: { id_organizacion: true } } },
-  });
-  const idsUsuario = usuarios.map((u) => u.id_usuario);
-  const idsConductor = usuarios.map((u) => u.conductor?.id_conductor).filter(Boolean);
-  const idsCliente = usuarios.map((u) => u.cliente?.id_cliente).filter(Boolean);
-  for (const u of usuarios) for (const m of u.membresias) orgsCreadas.add(m.id_organizacion);
-  const idsOrg = [...orgsCreadas];
-
-  const viajes = await prisma.viaje.findMany({
-    where: {
-      OR: [
-        { id_organizacion: { in: idsOrg } },
-        { id_conductor: { in: idsConductor } },
-        { id_cliente: { in: idsCliente } },
-      ],
-    },
-    select: { id_viaje: true, estado: true },
-  });
-  const idsViaje = viajes.map((v) => v.id_viaje);
-
-  let remitos = 0;
-  const finalizados = viajes.filter((v) => v.estado === 'FINALIZADO').map((v) => v.id_viaje);
-  if (finalizados.length > 0 && process.env.R2_BUCKET_NAME) {
-    const r2 = new S3Client({
-      region: 'auto',
-      endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
-      credentials: { accessKeyId: process.env.R2_ACCESS_KEY_ID, secretAccessKey: process.env.R2_SECRET_ACCESS_KEY },
-    });
-    for (const id of finalizados) {
-      try {
-        await r2.send(new DeleteObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: `remitos/${id}.pdf` }));
-        remitos++;
-      } catch (e) {
-        console.error(`  ⚠️  R2 remito ${id}: ${e.message}`);
-      }
-    }
-  }
-
-  if (redis.status === 'ready') {
-    for (const id of idsViaje) {
-      const keys = await redis.keys(`gps:${id}:*`);
-      if (keys.length > 0) await redis.del(...keys);
-    }
-  }
-
-  await prisma.historialEstadoViaje.deleteMany({ where: { id_viaje: { in: idsViaje } } });
-  await prisma.parada.deleteMany({ where: { id_viaje: { in: idsViaje } } });
-  await prisma.condicionRequerida.deleteMany({ where: { id_viaje: { in: idsViaje } } });
-  await prisma.transaccion.deleteMany({ where: { id_viaje: { in: idsViaje } } });
-  await prisma.calificacion.deleteMany({ where: { id_viaje: { in: idsViaje } } });
-  await prisma.viaje.deleteMany({ where: { id_viaje: { in: idsViaje } } });
-
-  const filtroSeries = {
-    OR: [{ id_organizacion: { in: idsOrg } }, { id_conductor: { in: idsConductor } }, { id_creador: { in: idsUsuario } }],
-  };
-  const filtroLugares = { OR: [{ id_organizacion: { in: idsOrg } }, { id_creador: { in: idsUsuario } }] };
-  const seriesBorradas = (await prisma.serieViaje.deleteMany({ where: filtroSeries })).count;
-  const lugaresBorrados = (await prisma.lugar.deleteMany({ where: filtroLugares })).count;
-
-  await prisma.vinculoChofer.deleteMany({
-    where: { OR: [{ id_organizacion: { in: idsOrg } }, { id_conductor: { in: idsConductor } }] },
-  });
-  await prisma.invitacion.deleteMany({ where: { id_organizacion: { in: idsOrg } } });
-  await prisma.miembroOrganizacion.deleteMany({
-    where: { OR: [{ id_organizacion: { in: idsOrg } }, { id_usuario: { in: idsUsuario } }] },
-  });
-  await prisma.organizacion.deleteMany({ where: { id_organizacion: { in: idsOrg } } });
-  await prisma.condicionVehiculo.deleteMany({ where: { vehiculo: { id_conductor: { in: idsConductor } } } });
-  await prisma.vehiculo.deleteMany({ where: { id_conductor: { in: idsConductor } } });
-  await prisma.conductor.deleteMany({ where: { id_usuario: { in: idsUsuario } } });
-  await prisma.cliente.deleteMany({ where: { id_usuario: { in: idsUsuario } } });
-  await prisma.usuario.deleteMany({ where: { id_usuario: { in: idsUsuario } } });
-
-  let fbBorrados = 0;
-  for (const email of emails) {
-    try {
-      const u = await admin.auth().getUserByEmail(email);
-      await admin.auth().deleteUser(u.uid);
-      fbBorrados++;
-    } catch (e) {
-      if (e.code !== 'auth/user-not-found') console.error(`  ⚠️  Firebase ${email}: ${e.message}`);
-    }
-  }
-
-  if (redis.status === 'ready') {
-    const claves = idsUsuario.map((id) => `invitacion:canje:usuario:${id}`);
-    let cursor = '0';
-    do {
-      const [sig, encontradas] = await redis.scan(cursor, 'MATCH', 'invitacion:canje:ip:*', 'COUNT', 500);
-      cursor = sig;
-      claves.push(...encontradas.filter((k) => /127\.0\.0\.1|::1$/.test(k)));
-    } while (cursor !== '0');
-    if (claves.length > 0) await redis.del(...claves);
-  }
-
-  const quedanUsuarios = await prisma.usuario.count({ where: { email: { contains: patronRestante } } });
-  const quedanOrgs = await prisma.organizacion.count({ where: { id_organizacion: { in: idsOrg } } });
-  const quedanViajes = await prisma.viaje.count({ where: { id_viaje: { in: idsViaje } } });
-  const quedanHist = await prisma.historialEstadoViaje.count({ where: { id_viaje: { in: idsViaje } } });
-  const quedanSeries = await prisma.serieViaje.count({ where: { id_organizacion: { in: idsOrg } } });
-  const quedanLugares = await prisma.lugar.count({ where: { id_organizacion: { in: idsOrg } } });
-  let quedanKeys = 0;
-  if (redis.status === 'ready') for (const id of idsViaje) quedanKeys += (await redis.keys(`gps:${id}:*`)).length;
-  console.log(
-    `  viajes: ${idsViaje.length} | series: ${seriesBorradas} | lugares: ${lugaresBorrados} | usuarios DB: ` +
-      `${idsUsuario.length} | Firebase: ${fbBorrados} | PyMEs: ${idsOrg.length} | remitos R2: ${remitos} | quedan: ` +
-      `usuarios=${quedanUsuarios} pymes=${quedanOrgs} viajes=${quedanViajes} historial=${quedanHist} ` +
-      `series=${quedanSeries} lugares=${quedanLugares} keys_gps=${quedanKeys}`
-  );
-  return (
-    quedanUsuarios === 0 &&
-    quedanOrgs === 0 &&
-    quedanViajes === 0 &&
-    quedanHist === 0 &&
-    quedanSeries === 0 &&
-    quedanLugares === 0 &&
-    quedanKeys === 0
-  );
+  const reg = crearRegistro(`-lys-${S}-`);
+  emailsCreados.forEach(reg.email);
+  orgsCreadas.forEach(reg.org);
+  return (await reg.limpiar()).ok;
 }
 
 // -- Casos: lugares -------------------------------------------------------------
@@ -1142,13 +1017,12 @@ async function casosConcurrencia(ctx, leerLog) {
 
 // -- Main ---------------------------------------------------------------------
 
-async function limpiarRestos() {
-  const usuarios = await prisma.usuario.findMany({
-    where: { email: { contains: '-lys-', endsWith: '@test.com' } },
-    select: { email: true },
-  });
-  console.log(`\n  restos: ${usuarios.length} usuarios de corridas anteriores`);
-  return limpiar(usuarios.map((u) => u.email), '-lys-');
+// node scripts/test-lugares-series.js --restos [--borrar]
+// Restos de corridas anteriores cortadas a la mitad: todo usuario
+// *-lys-*@test.com y lo que cuelga de el. SOLO CUENTA; con --borrar, borra.
+// Delega en scripts/restos.js.
+function limpiarRestos() {
+  return restos({ solo: ['-lys-'], borrarTodo: process.argv.includes('--borrar') });
 }
 
 const llamadasMaps = {};

@@ -10,9 +10,13 @@
 // viaje con un tiempo/distancia conocido).
 import redis from '../src/config/redis.js';
 import prisma from '../src/config/prisma.js';
+import { getToken } from './_firebase-auth.js';
+import { crearRegistro, terminar } from './_limpieza.js';
 
-const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
-const BASE = 'http://localhost:3000';
+// Cuentas FIJAS del seed: al final se borra SOLO lo que esta corrida creo,
+// por ID (viajes y vehiculos nuevos). Las cuentas no se tocan. Ver _limpieza.js.
+const reg = crearRegistro();
+const BASE = process.env.TEST_BASE_URL ?? 'http://localhost:3000';
 
 const HORA = 60 * 60 * 1000;
 
@@ -32,20 +36,6 @@ const pasos = [];
 function paso(nombre, ok, detalle = '') {
   pasos.push({ nombre, ok, detalle });
   console.log(`  ${ok ? '✅' : '❌'} ${nombre}${detalle ? '  →  ' + detalle : ''}`);
-}
-
-async function getToken(email, password) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    }
-  );
-  const data = await res.json();
-  if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
-  return data.idToken;
 }
 
 async function api(method, path, body, token) {
@@ -78,6 +68,7 @@ async function crearViaje(clienteToken, paradas, zonaBody) {
     clienteToken
   );
   if (status !== 201) throw new Error(`crearViaje fallo (${status}): ${JSON.stringify(data)}`);
+  reg.viaje(data.id_viaje);
   return data;
 }
 
@@ -125,19 +116,6 @@ async function cerrarConfirmandoParadas(id_viaje, clienteToken, conductorToken, 
     );
     if (esUltima) return { status, data };
     if (status !== 200) throw new Error(`confirmar-parada ${i + 1} fallo (${status}): ${JSON.stringify(data)}`);
-  }
-}
-
-async function cleanup() {
-  try {
-    await prisma.$disconnect();
-  } catch {
-    /* noop */
-  }
-  try {
-    await redis.quit();
-  } catch {
-    /* noop */
   }
 }
 
@@ -279,7 +257,6 @@ async function main() {
   );
 
   // ── RESUMEN ──────────────────────────────────────────────────────────────
-  await cleanup();
 
   const ok = pasos.filter((p) => p.ok).length;
   const fallaron = pasos.filter((p) => !p.ok);
@@ -294,11 +271,12 @@ async function main() {
     fallaron.forEach((p) => console.log(`    ❌ ${p.nombre}${p.detalle ? ': ' + p.detalle : ''}`));
   }
 
-  process.exit(fallaron.length === 0 ? 0 : 1);
+  return fallaron.length === 0;
 }
 
-main().catch(async (e) => {
-  console.error('\n💥 Error inesperado:', e.message, e.stack);
-  await cleanup();
-  process.exit(1);
-});
+main()
+  .then((ok) => terminar(reg, ok))
+  .catch((e) => {
+    console.error('\n💥 Error inesperado:', e.message, e.stack);
+    return terminar(reg, false);
+  });

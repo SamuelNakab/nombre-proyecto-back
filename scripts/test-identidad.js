@@ -40,10 +40,10 @@
 // final verifica que no quedo nada. La DB esta compartida con produccion.
 import prisma from '../src/config/prisma.js';
 import redis from '../src/config/redis.js';
-import admin from '../src/config/firebase.js';
 import { conServer } from './_server-efimero.js';
+import { crearRegistro } from './_limpieza.js';
+import { getToken as loginFirebase } from './_firebase-auth.js';
 
-const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
 const PUERTO = 3501;
 const RONDAS = 5;
 
@@ -73,19 +73,7 @@ function paso(nombre, ok, detalle = '') {
 const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
 const titulo = (t) => console.log(`\n-- ${t} ${'-'.repeat(Math.max(0, 60 - t.length))}\n`);
 
-async function getToken(email, password = PASS) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    }
-  );
-  const data = await res.json();
-  if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
-  return data.idToken;
-}
+const getToken = (email, password = PASS) => loginFirebase(email, password);
 
 let BASE = `http://localhost:${PUERTO}`;
 
@@ -225,52 +213,12 @@ async function borrarKeysRateLimit(ids = []) {
   }
 }
 
+// Borra todo lo de ESTA corrida (ver _limpieza.js) y verifica que no quedo nada.
 async function limpiar() {
-  titulo('LIMPIEZA');
-  const usuarios = await prisma.usuario.findMany({
-    where: { email: { in: emailsCreados } },
-    include: { conductor: true, membresias: { select: { id_organizacion: true } } },
-  });
-  const idsUsuario = usuarios.map((u) => u.id_usuario);
-  const idsConductor = usuarios.map((u) => u.conductor?.id_conductor).filter(Boolean);
-  // PyMEs: las que se crearon por API y cualquiera donde haya pasado un usuario
-  // del test (p. ej. una creada en una carrera del caso 11).
-  for (const u of usuarios) for (const m of u.membresias) orgsCreadas.add(m.id_organizacion);
-  const idsOrg = [...orgsCreadas];
-
-  await prisma.vinculoChofer.deleteMany({
-    where: { OR: [{ id_organizacion: { in: idsOrg } }, { id_conductor: { in: idsConductor } }] },
-  });
-  await prisma.invitacion.deleteMany({ where: { id_organizacion: { in: idsOrg } } });
-  await prisma.miembroOrganizacion.deleteMany({
-    where: { OR: [{ id_organizacion: { in: idsOrg } }, { id_usuario: { in: idsUsuario } }] },
-  });
-  await prisma.organizacion.deleteMany({ where: { id_organizacion: { in: idsOrg } } });
-  await prisma.condicionVehiculo.deleteMany({ where: { vehiculo: { id_conductor: { in: idsConductor } } } });
-  await prisma.vehiculo.deleteMany({ where: { id_conductor: { in: idsConductor } } });
-  await prisma.conductor.deleteMany({ where: { id_usuario: { in: idsUsuario } } });
-  await prisma.cliente.deleteMany({ where: { id_usuario: { in: idsUsuario } } });
-  await prisma.usuario.deleteMany({ where: { id_usuario: { in: idsUsuario } } });
-
-  let fbBorrados = 0;
-  for (const email of emailsCreados) {
-    try {
-      const u = await admin.auth().getUserByEmail(email);
-      await admin.auth().deleteUser(u.uid);
-      fbBorrados++;
-    } catch (e) {
-      if (e.code !== 'auth/user-not-found') console.error(`  ⚠️  Firebase ${email}: ${e.message}`);
-    }
-  }
-  await borrarKeysRateLimit(idsUsuario);
-
-  const quedanUsuarios = await prisma.usuario.count({ where: { email: { contains: `-idn-${S}-` } } });
-  const quedanOrgs = await prisma.organizacion.count({ where: { id_organizacion: { in: idsOrg } } });
-  const quedanInv = await prisma.invitacion.count({ where: { id_organizacion: { in: idsOrg } } });
-  console.log(
-    `  usuarios DB: ${idsUsuario.length} borrados | Firebase: ${fbBorrados} | PyMEs: ${idsOrg.length} | quedan: usuarios=${quedanUsuarios} pymes=${quedanOrgs} invitaciones=${quedanInv}`
-  );
-  return quedanUsuarios === 0 && quedanOrgs === 0 && quedanInv === 0;
+  const reg = crearRegistro(`-idn-${S}-`);
+  emailsCreados.forEach(reg.email);
+  orgsCreadas.forEach(reg.org);
+  return (await reg.limpiar()).ok;
 }
 
 // -- Casos --------------------------------------------------------------------
@@ -738,6 +686,20 @@ async function casoRateLimit(ctx) {
   const [R1, R2] = await nuevosUsuarios('cliente', 'Rl', 2);
   await borrarKeysRateLimit([R1.id_usuario, R2.id_usuario]);
   await conServer({ ...ENV_BASE, INVITACION_INTENTOS_MAX: '3', INVITACION_VENTANA_MINUTOS: '1' }, 3502, async (base) => {
+    // SONDA: /health responde antes de que el Redis del server efimero este
+    // 'ready', y sin Redis el rate limit deja pasar (fail-open): los primeros
+    // intentos no contaban y el 4to daba 400 en vez de 429. Se canjea basura
+    // hasta que aparece la key del usuario (prueba que el server ya cuenta), y
+    // despues se borran las keys para arrancar los 4 intentos desde cero.
+    const limiteSonda = Date.now() + 15000;
+    let contando = false;
+    while (!contando && Date.now() < limiteSonda) {
+      await canjear(R1, 'ZZZZZ-ZZZZZ', base);
+      contando = (await redis.exists(`invitacion:canje:usuario:${R1.id_usuario}`)) === 1;
+      if (!contando) await esperar(300);
+    }
+    await borrarKeysRateLimit([R1.id_usuario, R2.id_usuario]);
+    paso('CASO 12 (sonda): el rate limit del server efimero ya cuenta en Redis', contando, '');
     const intentos = [];
     for (let i = 0; i < 4; i++) intentos.push(await canjear(R1, 'ZZZZZ-ZZZZZ', base));
     paso(

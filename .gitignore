@@ -6,3 +6,4 @@ node_modules/
 serviceAccountKey.json
 prisma/migrations/
 /generated/prisma
+scripts/.regresion/

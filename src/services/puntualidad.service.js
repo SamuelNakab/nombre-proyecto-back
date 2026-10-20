@@ -4,7 +4,7 @@
 // CAMBIO DE SEMANTICA: antes se medida en la SALIDA (el momento en que el
 // conductor apretaba "Iniciar viaje", que lo pone EN_CAMINO_A_ORIGEN) y se
 // persistia en Viaje.puntualidad_inicio. Empezar a manejar hacia el origen no
-// es llegar: con VENTANA_INICIO_MINUTOS=30 y PUNTUALIDAD_TARDE_MINUTOS=30 la
+// es llegar: con una ventana de inicio de 30 min y PUNTUALIDAD_TARDE_MINUTOS=30 la
 // banda A_TIEMPO cubria de -30 a +30 minutos alrededor de fecha_programada, y
 // casi todo salia A_TIEMPO aunque el conductor llegara tarde.
 //

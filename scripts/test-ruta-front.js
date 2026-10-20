@@ -2,9 +2,14 @@ import 'dotenv/config';
 import { io } from 'socket.io-client';
 import { spawn } from 'child_process';
 import prisma from '../src/config/prisma.js';
+import { getToken } from './_firebase-auth.js';
+import { crearRegistro, terminar } from './_limpieza.js';
 
-const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
-const BASE = (port = 3000) => `http://localhost:${port}`;
+// Sin puerto: el server de la suite (TEST_BASE_URL, o :3000). Con puerto: el efimero.
+// Cuentas FIJAS del seed: al final se borra SOLO lo que esta corrida creo,
+// por ID (viajes y vehiculos nuevos). Las cuentas no se tocan. Ver _limpieza.js.
+const reg = crearRegistro();
+const BASE = (port) => (port ? `http://localhost:${port}` : process.env.TEST_BASE_URL ?? 'http://localhost:3000');
 
 const PARADA_1 = { lat: -34.6037, lng: -58.3816, direccion: 'Plaza de Mayo, CABA' };
 const PARADA_2 = { lat: -34.5895, lng: -58.3974, direccion: 'Recoleta, CABA' };
@@ -38,18 +43,7 @@ function distanciaMetros(lat1, lng1, lat2, lng2) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-async function getToken(email, password) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }) }
-  );
-  const data = await res.json();
-  if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
-  return data.idToken;
-}
-
-async function api(method, path, body, token, port = 3000) {
+async function api(method, path, body, token, port) {
   const res = await fetch(`${BASE(port)}${path}`, {
     method,
     headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: 'Bearer ' + token } : {}) },
@@ -61,7 +55,7 @@ async function api(method, path, body, token, port = 3000) {
   return { status: res.status, data };
 }
 
-async function conectar(token, port = 3000) {
+async function conectar(token, port) {
   return new Promise((resolve, reject) => {
     const s = io(BASE(port), { auth: { token: 'Bearer ' + token } });
     s.on('connect', () => resolve(s));
@@ -128,6 +122,7 @@ async function testMapsCaido(clienteToken) {
     zona: 'CABA', fecha_programada: fechaViaje, condiciones_requeridas: [],
     paradas: [PARADA_1, PARADA_2],
   }, clienteToken, 3001);
+  if (status === 201) reg.viaje(data.id_viaje);
   const despues = await api('GET', '/api/viajes/mis-viajes', null, clienteToken, 3001);
 
   check('POST /api/viajes con Maps caido → 503 con el mensaje de ruta',
@@ -170,9 +165,10 @@ async function main() {
 
   const clienteToken = await getToken('cliente@test.com', 'test123456');
   const conductorToken = await getToken('conductor@test.com', 'test123456');
-  await api('POST', '/api/conductores/mis-vehiculos', {
+  const rVeh = await api('POST', '/api/conductores/mis-vehiculos', {
     patente: 'FLT001', marca: 'Ford', modelo: 'Transit', anio: 2020, color: 'Blanco', tipo_vehiculo: 'furgon',
   }, conductorToken);
+  if (rVeh.status === 201) reg.vehiculo(rVeh.data.id_vehiculo); // 409 = ya existia
   check('Tokens + vehiculo del conductor listos', true);
 
   // ── PASO 2: POST /api/viajes incluye ruta_planeada ──────────────────────────
@@ -184,9 +180,9 @@ async function main() {
     paradas: [PARADA_1, PARADA_2],
   }, clienteToken);
   check('POST /api/viajes → 201', sv === 201, sv !== 201 ? JSON.stringify(viaje) : `id ${viaje.id_viaje}`);
-  if (sv !== 201) { await cleanup(sockets); process.exit(1); }
+  if (sv !== 201) throw new Error('Abortado: fallo un paso previo (ver arriba)');
 
-  const id_viaje = viaje.id_viaje;
+  const id_viaje = reg.viaje(viaje.id_viaje);
   const rutaPost = viaje.ruta_planeada;
 
   check('Respuesta incluye ruta_planeada como array no vacio',
@@ -298,11 +294,12 @@ async function main() {
     console.log('\n  Fallaron:');
     fallaron.forEach((c) => console.log(`    ❌ ${c.nombre}${c.detalle ? ': ' + c.detalle : ''}`));
   }
-  await prisma.$disconnect().catch(() => {});
-  process.exit(fallaron.length === 0 ? 0 : 1);
+  return fallaron.length === 0;
 }
 
-main().catch((e) => {
-  console.error('\n💥 Error inesperado:', e.message, e.stack);
-  process.exit(1);
-});
+main()
+  .then((ok) => terminar(reg, ok))
+  .catch((e) => {
+    console.error('\n💥 Error inesperado:', e.message, e.stack);
+    return terminar(reg, false);
+  });

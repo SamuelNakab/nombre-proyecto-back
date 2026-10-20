@@ -18,7 +18,7 @@ import {
 } from '../services/reserva.service.js';
 import { guardarRutaPlaneada, obtenerRutaPlaneada } from '../services/ruta.service.js';
 import { validarTransicion, cicloDe } from '../services/estado-viaje.service.js';
-import { ventanaInicioAntesMinutosLegacy } from '../services/ventana-inicio.js';
+import { ventanaInicioAntesMinutos } from '../services/ventana-inicio.js';
 import { salasDeViaje } from '../sockets/salas.js';
 import { horasAMinutos, calcularMetricasViaje } from '../services/duracion.service.js';
 import { calcularPuntualidadInicio } from '../services/puntualidad.service.js';
@@ -424,10 +424,10 @@ export async function iniciarViaje(req, res) {
   }
 
   // 4. Ventana de tiempo: se puede iniciar desde VENTANA_INICIO_ANTES_MINUTOS
-  //    antes de la fecha programada (fallback a la vieja VENTANA_INICIO_MINUTOS,
-  //    que esa variable reemplazo). NO hay limite superior en el ciclo LEGACY —
-  //    iniciar tarde siempre se puede. El ciclo interno tiene su propio iniciar.
-  const VENTANA_INICIO_MINUTOS = ventanaInicioAntesMinutosLegacy();
+  //    antes de la fecha programada (la misma variable que el ciclo interno). NO
+  //    hay limite superior en el ciclo LEGACY — iniciar tarde siempre se puede.
+  //    El ciclo interno tiene su propio iniciar.
+  const VENTANA_INICIO_MINUTOS = ventanaInicioAntesMinutos();
   const ahora = new Date();
   const aperturaVentana = new Date(
     viaje.fecha_programada.getTime() - VENTANA_INICIO_MINUTOS * 60000

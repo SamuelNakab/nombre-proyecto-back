@@ -1434,8 +1434,8 @@ inicio automático por primer ping GPS **ya no existe**. Registra el momento rea
 > **Flujo correcto del mobile:** botón → `200` → **recién ahí** arrancar el GPS. Los pings
 > enviados antes de iniciar se rechazan (ver el evento `conductor:ubicacion`).
 
-> **Solo viajes del marketplace.** La ventana se abre `VENTANA_INICIO_ANTES_MINUTOS` antes de la hora
-> (si no está definida, la vieja `VENTANA_INICIO_MINUTOS`), sin límite superior. Un viaje de PyME se
+> **Solo viajes del marketplace.** La ventana se abre `VENTANA_INICIO_ANTES_MINUTOS` antes de la hora,
+> sin límite superior. Un viaje de PyME se
 > inicia con [`POST /api/choferes/viajes/:id/iniciar`](#post-apichoferesviajesidiniciar).
 
 **Rol requerido:** `CONDUCTOR` (el conductor asignado) **o** `GERENTE` (el gerente de la empresa del viaje)
@@ -1456,8 +1456,8 @@ inicio automático por primer ping GPS **ya no existe**. Registra el momento rea
 inició el gerente.
 
 **Ventana de tiempo:**
-El viaje puede iniciarse a partir de `fecha_programada - VENTANA_INICIO_MINUTOS` (variable de
-entorno, default `30`). **No hay límite superior**: el conductor puede iniciar aunque la hora
+El viaje puede iniciarse a partir de `fecha_programada - VENTANA_INICIO_ANTES_MINUTOS` (variable de
+entorno, default `60`; la vieja `VENTANA_INICIO_MINUTOS` ya no se lee). **No hay límite superior**: el conductor puede iniciar aunque la hora
 programada ya haya pasado, sin importar cuánto. Si intenta iniciar antes de que abra la ventana
 → `400`, con la hora de apertura en hora local de Argentina (`America/Argentina/Buenos_Aires`),
 formato `HH:MM`.

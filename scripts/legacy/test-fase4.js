@@ -1,9 +1,9 @@
 import 'dotenv/config';
 import { io as socketClient } from 'socket.io-client';
-import prisma from '../src/config/prisma.js';
+import prisma from '../../src/config/prisma.js';
+import { getToken as loginFirebase } from '../_firebase-auth.js';
 
 const BASE = `http://localhost:${process.env.PORT || 3000}`;
-const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
 
 const CLIENTE_EMAIL = 'cliente@test.com';
 const CLIENTE_PASS = 'test123456';
@@ -29,18 +29,8 @@ async function api(method, path, body, token) {
   return { status: res.status, data: await res.json().catch(() => ({})) };
 }
 
-async function firebaseLogin(email, password) {
-  const res = await fetch(
-    'https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=' + FIREBASE_KEY,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    }
-  );
-  const data = await res.json();
-  return data.idToken || null;
-}
+// null si el login falla: los callers de este script chequean el token en null.
+const firebaseLogin = (email, password) => loginFirebase(email, password).catch(() => null);
 
 async function obtenerTokens() {
   let clienteToken = await firebaseLogin(CLIENTE_EMAIL, CLIENTE_PASS);

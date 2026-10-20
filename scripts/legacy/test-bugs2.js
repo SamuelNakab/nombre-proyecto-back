@@ -1,7 +1,7 @@
 import { io } from 'socket.io-client';
-import prisma from '../src/config/prisma.js';
+import prisma from '../../src/config/prisma.js';
+import { getToken as loginFirebase } from '../_firebase-auth.js';
 
-const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
 const BASE = 'http://localhost:3000';
 
 const checks = [];
@@ -11,15 +11,8 @@ function check(nombre, ok, detalle = '') {
 }
 function esperar(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-async function getToken(email, password) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
-    { method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ email, password, returnSecureToken: true }) }
-  );
-  const data = await res.json();
-  return data.idToken || null;
-}
+// null si el login falla: los callers de este script chequean el token en null.
+const getToken = (email, password) => loginFirebase(email, password).catch(() => null);
 
 async function api(method, path, body, token) {
   const res = await fetch(`${BASE}${path}`, {

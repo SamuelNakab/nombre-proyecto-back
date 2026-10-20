@@ -1,9 +1,14 @@
 import { io } from 'socket.io-client';
 import redis from '../src/config/redis.js';
 import prisma from '../src/config/prisma.js';
+import { getToken } from './_firebase-auth.js';
+import { crearRegistro, terminar } from './_limpieza.js';
+import { ventanaInicioAntesMinutos } from '../src/services/ventana-inicio.js';
 
-const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
-const BASE = 'http://localhost:3000';
+// Cuentas FIJAS del seed: al final se borra SOLO lo que esta corrida creo,
+// por ID (viajes y vehiculos nuevos). Las cuentas no se tocan. Ver _limpieza.js.
+const reg = crearRegistro();
+const BASE = process.env.TEST_BASE_URL ?? 'http://localhost:3000';
 
 // Dos paradas reales en CABA (zona CABA, sin condiciones → cualquier conductor
 // con al menos un vehiculo es elegible).
@@ -13,11 +18,11 @@ const PARADA_2 = { lat: -34.5895, lng: -58.3974, direccion: 'Recoleta, CABA' };
 const MIN = 60 * 1000;
 const HORA = 60 * MIN;
 
-// La ventana de inicio es configurable y el .env local NO usa el default del
-// codigo (30): hoy esta en 120. El test la lee en vez de asumirla — con un
-// valor fijo, el CASO 2 ("demasiado temprano") daba 200 y fallaba sin que
+// La ventana de inicio es configurable. El test usa la MISMA funcion que el
+// server (ventana-inicio.js) con el mismo .env, en vez de asumir un valor: con
+// uno fijo, el CASO 2 ("demasiado temprano") daba 200 y fallaba sin que
 // hubiera ningun bug.
-const VENTANA_INICIO_MINUTOS = Number(process.env.VENTANA_INICIO_MINUTOS ?? 30);
+const VENTANA_INICIO_MINUTOS = ventanaInicioAntesMinutos();
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -28,20 +33,6 @@ function paso(nombre, ok, detalle = '') {
 }
 function esperar(ms) {
   return new Promise((r) => setTimeout(r, ms));
-}
-
-async function getToken(email, password) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    }
-  );
-  const data = await res.json();
-  if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
-  return data.idToken;
 }
 
 async function api(method, path, body, token) {
@@ -80,9 +71,10 @@ async function registrarSiNoExiste(datos, tipo) {
 }
 
 async function crearVehiculoSiNoExiste(token, patente) {
-  await api('POST', '/api/conductores/mis-vehiculos', {
+  const r = await api('POST', '/api/conductores/mis-vehiculos', {
     patente, marca: 'Ford', modelo: 'Transit', anio: 2020, color: 'Blanco', tipo_vehiculo: 'furgon',
   }, token);
+  if (r.status === 201) reg.vehiculo(r.data.id_vehiculo); // 409 = ya existia: no es nuestro
 }
 
 // Crea el viaje via POST (fecha now+2h para pasar la validacion de fecha futura
@@ -94,7 +86,7 @@ async function crearViajePublicado(clienteToken) {
     zona: 'CABA', fecha_programada: fechaViaje, condiciones_requeridas: [], paradas: [PARADA_1, PARADA_2],
   }, clienteToken);
   if (status !== 201) throw new Error(`No se pudo crear viaje (${status}): ${JSON.stringify(data)}`);
-  return data.id_viaje;
+  return reg.viaje(data.id_viaje);
 }
 
 // Ajusta fecha_programada directo en DB (via Prisma). El POST /viajes exige fecha
@@ -116,8 +108,6 @@ async function estadoDe(id_viaje, token) {
 
 async function cleanup(sockets) {
   for (const s of sockets) { try { s?.disconnect(); } catch { /* noop */ } }
-  try { await prisma.$disconnect(); } catch { /* noop */ }
-  try { await redis.quit(); } catch { /* noop */ }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -423,12 +413,12 @@ async function main() {
     fallaron.forEach((p) => console.log(`    ❌ ${p.nombre}${p.detalle ? ': ' + p.detalle : ''}`));
   }
 
-  process.exit(fallaron.length === 0 ? 0 : 1);
+  return fallaron.length === 0;
 }
 
-main().catch(async (e) => {
-  console.error('\n💥 Error inesperado:', e.message);
-  try { await prisma.$disconnect(); } catch { /* noop */ }
-  try { await redis.quit(); } catch { /* noop */ }
-  process.exit(1);
-});
+main()
+  .then((ok) => terminar(reg, ok))
+  .catch((e) => {
+    console.error('\n💥 Error inesperado:', e.message, e.stack);
+    return terminar(reg, false);
+  });

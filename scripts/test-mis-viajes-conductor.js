@@ -1,7 +1,11 @@
 import { io } from 'socket.io-client';
+import { getToken } from './_firebase-auth.js';
+import { crearRegistro, terminar } from './_limpieza.js';
 
-const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
-const BASE = 'http://localhost:3000';
+// Al final se borran los conductores de la corrida y los viajes que creo
+// (con la cuenta fija cliente@, que NO se toca). Ver _limpieza.js.
+const reg = crearRegistro();
+const BASE = process.env.TEST_BASE_URL ?? 'http://localhost:3000';
 
 const PARADA_1 = { lat: -34.6037, lng: -58.3816, direccion: 'Plaza de Mayo, CABA' };
 const PARADA_2 = { lat: -34.5895, lng: -58.3974, direccion: 'Recoleta, CABA' };
@@ -14,17 +18,6 @@ function check(nombre, ok, detalle = '') {
   console.log(`  ${ok ? '✅' : '❌'} ${nombre}${detalle ? '  →  ' + detalle : ''}`);
 }
 const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function getToken(email, password) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }) }
-  );
-  const data = await res.json();
-  if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
-  return data.idToken;
-}
 
 async function api(method, path, body, token) {
   const res = await fetch(`${BASE}${path}`, {
@@ -71,6 +64,7 @@ async function main() {
   const emailA = `cond-mvc-a-${suf}@test.com`;
   const emailB = `cond-mvc-b-${suf}@test.com`;
   const emailC = `cond-mvc-c-${suf}@test.com`;
+  [emailA, emailB, emailC].forEach(reg.email);
 
   // ── PASO 1: Usuarios + vehiculos ────────────────────────────────────────────
   console.log('── PASO 1: Cliente + 2 conductores + 1 conductor sin viajes ──\n');
@@ -116,7 +110,7 @@ async function main() {
       paradas: [PARADA_1, PARADA_2],
     }, clienteToken);
     if (status !== 201) throw new Error('No se pudo crear viaje: ' + JSON.stringify(data));
-    return data.id_viaje;
+    return reg.viaje(data.id_viaje);
   };
   const viaje1 = await crearViaje();
   const viaje2 = await crearViaje();
@@ -213,10 +207,12 @@ async function main() {
     console.log('\n  Fallaron:');
     fallaron.forEach((c) => console.log(`    ❌ ${c.nombre}${c.detalle ? ': ' + c.detalle : ''}`));
   }
-  process.exit(fallaron.length === 0 ? 0 : 1);
+  return fallaron.length === 0;
 }
 
-main().catch((e) => {
-  console.error('\n💥 Error inesperado:', e.message, e.stack);
-  process.exit(1);
-});
+main()
+  .then((ok) => terminar(reg, ok))
+  .catch((e) => {
+    console.error('\n💥 Error inesperado:', e.message, e.stack);
+    return terminar(reg, false);
+  });

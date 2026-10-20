@@ -1,6 +1,6 @@
 import {
   api, getToken, registrarSiNoExiste, crearReporter, STRESS_USERS,
-} from './_helpers.js';
+} from '../../stress/_helpers.js';
 
 const TIPOS_CONDICION = ['FRAGIL', 'REFRIGERADO', 'CARGA_PESADA', 'PELIGROSO', 'VOLUMINOSO'];
 

@@ -45,6 +45,11 @@ elegibles) queda DORMIDO detras de MARKETPLACE_HABILITADO. MVP: CABA + GBA.
   nunca ve el nombre), SERIES de viajes (todo o nada, hora argentina, un
   serie:asignada) y tope GLOBAL de paradas por viaje (MAX_PARADAS_POR_VIAJE)
   COMPLETO. Ver "Lugares guardados y series (Paso 4)".
+- MANTENIMIENTO DE TESTS — key de Firebase fuera del codigo, limpieza
+  compartida en TODAS las suites, restos.js, intermitentes arreglados, runner
+  unico (npm run test:regresion), exploratorias a scripts/legacy/,
+  .env.example completo y log de desconexion de socket con motivo COMPLETO. Ver
+  "Regresion y limpieza de tests".
 
 ## Stack
 - Node.js 22, ES Modules (NUNCA require()). Async/await siempre.
@@ -459,7 +464,8 @@ existente. D3 dos tablas, un validarTransicion. D4 historial reusa ORIGENES
 el viaje ya vencio; secuencial 400, carrera 409. D6 EN_RUTA -> FINALIZADO en la
 tabla. D7 aproximacion al origen = 0. D8 SUSPENDIDA bloquea crear / editar /
 reasignar. D9 flag propio de calificaciones. D10 el admin no hace chequeo
-perezoso. D11 iniciar legacy con fallback a VENTANA_INICIO_MINUTOS, sin limite
+perezoso. D11 iniciar legacy con VENTANA_INICIO_ANTES_MINUTOS (el fallback a la
+vieja VENTANA_INICIO_MINUTOS se saco en el mantenimiento de tests), sin limite
 superior. D12 causa_cancelacion enum; quien / cuando en el historial.
 
 ### PENDIENTE (lo que quedo del Paso 2)
@@ -1587,13 +1593,13 @@ RADIO_CONFIRMACION_METROS=50      (default en codigo si no esta en .env;
                                    DOS lugares y en ninguno mas: confirmar-parada
                                    y la deteccion de llegada al origen)
 
-VENTANA_INICIO_MINUTOS            (REEMPLAZADA por VENTANA_INICIO_ANTES_MINUTOS.
-                                   Solo la lee el iniciar LEGACY, como fallback
-                                   si ANTES no esta definida o esta vacia
-                                   (ventanaInicioAntesMinutosLegacy). El ciclo
-                                   interno NO la usa. test-iniciar-viaje la LEE
-                                   del entorno: si ANTES esta seteada con otro
-                                   valor, su CASO 2 mide contra la equivocada)
+VENTANA_INICIO_MINUTOS            (ELIMINADA: ya no la lee nadie. El iniciar
+                                   LEGACY usa VENTANA_INICIO_ANTES_MINUTOS, igual
+                                   que el ciclo interno (sin cambio de
+                                   comportamiento: ANTES ya estaba cargada en
+                                   Railway). Borrarla de Railway.
+                                   test-iniciar-viaje usa la MISMA funcion que el
+                                   server, ventanaInicioAntesMinutos)
 
 VENTANA_INICIO_ANTES_MINUTOS=60   (ventana para INICIAR un viaje de PyME:
 VENTANA_INICIO_DESPUES_MINUTOS=90  [fecha - ANTES, fecha + DESPUES]; viaje a
@@ -1667,6 +1673,16 @@ SERIE_TIMEOUT_MS=60000            (tope TOTAL de las estimaciones de una serie;
 Todas se leen en CADA request (no se cachean), con guarda: un
 valor basura o <= 0 cae al default.
 
+La lista COMPLETA, agrupada, con el default de codigo de cada una y las marcas
+[SOLO TESTS] / [LEGACY] / [SCRIPT], esta en .env.example (auditada contra src/,
+scripts/, e2e/ y ci.yml en el mantenimiento de tests). Ademas de las de arriba:
+ETA_EMISION_SEGUNDOS (30), ETA_RECALCULO_SEGUNDOS (360), ETA_EMISOR_IDLE_SEGUNDOS
+(300; el .env.example viejo decia 600), RUTA_RECALCULO_COOLDOWN_SEGUNDOS (120),
+DESVIO_UMBRAL_METROS (300), PARADA_SOSPECHOSA_* (3 km/h, 5 min), FEE_PORCENTAJE
+(10), TARIFA_* (3500 / 5000 / 150 / 200), FIREBASE_WEB_API_KEY (SOLO tests: login
+de los scripts) y TEST_BASE_URL (SOLO tests: server de las suites).
+MERCADOPAGO_ACCESS_TOKEN se saco: no la lee nadie.
+
 QR_SECRET se SACO de .env.example. Puede seguir en el .env local de cada
 uno, pero ya no lo lee nadie: se elimino junto con firmarQR/verificarQR.
 
@@ -1687,6 +1703,14 @@ MATCHING_TIMEOUT eliminado POR COMPLETO — no queda ningun rastro:
   VENTANA_INICIO_DESPUES_MINUTOS (los dos procesos vencen viajes de la misma DB).
   Conviene que MAX_PARADAS_POR_VIAJE tambien valga lo mismo (un viaje creado en
   un environment se edita desde el otro).
+- NO cargar en Railway las [SOLO TESTS] (RESERVA_BARRIDO_ARRANQUE,
+  VENCIMIENTO_BARRIDO_ARRANQUE, FIREBASE_WEB_API_KEY, TEST_*). VENTANA_INICIO_MINUTOS
+  ya no la lee nadie: borrarla. Las que el codigo lee y no estan cargadas
+  (ETA_*, RUTA_RECALCULO_COOLDOWN_SEGUNDOS, FEE_PORCENTAJE, TARIFA_*) corren con
+  el default de codigo: cargarlas solo para cambiar ese valor.
+- Log de desconexion de socket: "[Socket] desconectado: ROL uid:N id:X
+  motivo:<reason de socket.io> duracion:Ns" (sin email, token ni IP), para
+  diagnosticar cortes del mobile.
 
 ## CI — .github/workflows/ci.yml
 - `quality` (PR y push a main / develop): lint + tests unitarios. NO pega
@@ -1713,6 +1737,15 @@ MATCHING_TIMEOUT eliminado POR COMPLETO — no queda ningun rastro:
 
 ## Comandos
 npm run dev / npm run lint / npm run test
+npm run test:regresion                     (TODAS las suites de abajo en serie,
+                                            con server propio en :3900; ver
+                                            "Regresion y limpieza de tests".
+                                            --solo a,b / --desde x)
+node scripts/restos.js                     (restos de tests en la DB compartida:
+                                            SOLO cuenta; --borrar borra, --solo
+                                            elige categorias)
+Todas las suites necesitan FIREBASE_WEB_API_KEY en el .env (scripts/_firebase-auth.js).
+Las que pegan a "el server" usan TEST_BASE_URL (default http://localhost:3000).
 node scripts/test-fase5.js
 node scripts/test-cancelacion-conductor.js
 node scripts/test-cancelacion-cliente.js
@@ -1825,9 +1858,10 @@ node scripts/test-viaje-interno.js         (Paso 2: crear, confirmar, rechazar,
                                             ventana de 3 s). Acepta numeros de
                                             caso, SUBCASOS=17b,17d para una sola
                                             carrera (protocolo de reversion), y
-                                            --restos para borrar lo que haya
+                                            --restos para CONTAR lo que haya
                                             dejado una corrida cortada (p. ej.
-                                            si Neon se cae a la mitad). Borra
+                                            si Neon se cae a la mitad; borrar:
+                                            --restos --borrar). Borra
                                             TODO lo suyo (DB, Firebase, Redis y
                                             remitos en R2) y lo verifica.
                                             Paso 3: usa Google REAL (~100
@@ -1850,7 +1884,7 @@ node scripts/test-lugares-series.js        (Paso 4: lugares (CRUD, nombre unico,
                                             SUBCASOS=21a). NO usa :3000 —
                                             levanta 3801 (y 3802 con key
                                             invalida). Acepta numeros de caso y
-                                            --restos. Borra TODO lo suyo y lo
+                                            --restos [--borrar]. Borra TODO lo suyo y lo
                                             verifica. Google REAL: ~60 llamadas
                                             Pro por corrida, las imprime al
                                             final junto con la tabla de series
@@ -1863,28 +1897,139 @@ test-viaje-interno y test-lugares-series. test-anticipacion tiene su propia copi
 inline, anterior a la extraccion. OJO: no hay adapter de Redis en socket.io, o
 sea que un socket conectado a :3000 NO recibe los eventos que emite un server
 efimero — los tests que verifican eventos conectan sus sockets al puerto efimero.
+Tambien exporta esperarLinea(leerLog, regex, ms): para los logs de tareas async
+del arranque (barridos), que pueden salir DESPUES de /health. El runner de
+regresion usa conServer para su propio server en :3900.
 
 Nota de entorno: si el repo esta en una carpeta sincronizada por OneDrive,
 node --watch (npm run dev) se reinicia solo cuando OneDrive toca node_modules y
 corta requests en vuelo. Sintoma tipico: "fetch failed" a mitad de un script.
 
-### PENDIENTE — mantenimiento de tests
-Va todo junto, en una tarea aparte:
-- LAS SUITES LEGACY NO LIMPIAN LO QUE CREAN: test-jerarquia (-jer-),
-  test-visibilidad-gerente (-vis-), test-acceso-gerente (-acc-),
-  test-campos-duracion (-dur-), test-concurrencia-jerarquia (-conc-),
-  test-confirmar-parada (-conf-), test-viajes-vencidos (-vnc-),
-  test-historial-estados (-hst-), test-timeout-reserva (-tmo-) y
-  test-mis-viajes-conductor (cond-mvc-*). Cada corrida deja usuarios (DB y
-  Firebase), viajes (algunos VIVOS), empresas y vehiculos en la DB COMPARTIDA
-  con produccion. El 2026-10-10 se borraron a mano 177 usuarios, 213 viajes, 88
-  empresas y 94 vehiculos acumulados desde el 3/10 (sin tocar el seed ni la
-  cuenta E2E). Hay que darles la limpieza + verificacion de 0 restos + --restos
-  que ya tienen test-identidad, test-viaje-interno y test-lugares-series.
-- test-vehiculos.
-- Flakies: test-viajes-vencidos CASO 5b busca su linea con
-  includes('[viaje-vencido] barrido de arranque'), y desde el Paso 2 hay DOS
-  lineas con ese prefijo (la legacy y la "(ciclo interno)") que salen de queries
-  async en carrera: agarra la que loguee primero. Tiene que buscar "con aviso
-  programado" (mismo problema que ya resolvio test-timeout-reserva con el prefijo
-  completo).
+## Regresion y limpieza de tests
+
+### Runner — scripts/test-regresion.js (npm run test:regresion)
+- SUITES es un array unico al principio ({ archivo, timeoutMin, args? }).
+  Corren en SERIE con spawn; cada una con su timeout (se mata el ARBOL de
+  procesos, para no dejar servers efimeros con el puerto tomado -> FALLA
+  "timeout"). Log completo de cada suite en scripts/.regresion/<suite>.log
+  (gitignored) y del server en _server.log; en vivo con prefijo y sin las
+  lineas prisma:query. Al final: tabla suite | resultado | duracion y exit 1 si
+  alguna fallo. --solo a,b (subconjunto) y --desde x (retomar).
+- Levanta SU PROPIO server en :3900 (conServer) con MARKETPLACE_HABILITADO y
+  CALIFICACIONES_HABILITADAS en true y RESERVA_BARRIDO_ARRANQUE=0 /
+  VENCIMIENTO_BARRIDO_ARRANQUE=0. No usa ni choca con un npm run dev en :3000.
+  Las suites que pegan a "el server" leen TEST_BASE_URL (sueltas siguen yendo a
+  :3000). Los flags van SOLO a ese server: las suites con servers efimeros fijan
+  los suyos (viaje-interno / maps / lugares-series los ponen en false a
+  proposito; las legacy con servers efimeros — timeout-reserva, viajes-vencidos,
+  historial-estados, jerarquia CASO 8, anticipacion — prenden el marketplace en
+  SU env, porque el .env local lo tiene en false).
+- Requisitos: FIREBASE_WEB_API_KEY, INVITACION_SECRETO, Redis y las cuentas de
+  seed-cuentas-test.js. Usa Google REAL (las suites del Paso 3/4 imprimen sus
+  llamadas Pro).
+
+### Login — scripts/_firebase-auth.js
+UNICO lugar que conoce la Web API key (FIREBASE_WEB_API_KEY del .env; sin ella
+tira "Falta FIREBASE_WEB_API_KEY ... NO la GOOGLE_MAPS_API_KEY"). getToken(email,
+password). Antes estaba hardcodeada en 28 archivos (y test-vehiculos usaba la key
+de Maps). `grep -r AIza scripts e2e src` -> vacio. La key sigue en el historial
+de git: se restringe en GCP. El e2e (vitest, CI) la sigue leyendo directo.
+
+### Limpieza — scripts/_limpieza.js
+- crearRegistro(patron?) -> { patron(p), email, viaje, vehiculo, empresa, org,
+  limpiar(), verificar() }. Con patron (las suites que registran usuarios
+  propios: '-jer-<stamp>', '_veh_<TS>'...) se suman los usuarios de la DB con ese
+  patron. A partir de los usuarios se derivan viajes (cliente / conductor /
+  creador / empresa / vehiculo), empresas que gerencian, vehiculos propios y de
+  flota, membresias y PyMEs. Las suites de CUENTAS FIJAS (fase5, cancelacion-*,
+  admin, iniciar-viaje, zona, anticipacion, eta-recalculo, ruta-front,
+  stress/cierre-exhaustivo) registran SOLO lo que crearon, por ID (viajes y
+  vehiculos con 201); jamas la cuenta ni un vehiculo preexistente (FLT001 con 409
+  no se toca).
+- Borra en orden de FKs: remitos en R2 de los FINALIZADO, keys gps:{id}:* y de
+  rate limit (usuarios + IPs de loopback), calificaciones, transacciones,
+  historial, paradas, condiciones, viajes, series, lugares, conductor_vehiculo,
+  condiciones de vehiculo, vehiculos, conductor_empresa, empresas, vinculos,
+  invitaciones, membresias, PyMEs, metodos de pago, conductor, cliente, usuario
+  y Firebase. verificar() cuenta lo que queda -> { ok, conteos }.
+- GUARD DURO: si lo que se va a borrar incluye una cuenta del seed, la cuenta del
+  E2E (TEST_USER_EMAIL, chofer-e2e@), la PyME de CUIT 30999999995 o el vehiculo
+  E2E000 -> TIRA (no filtra en silencio).
+- terminar(reg, ok): cierre comun de las suites legacy (limpia pase lo que pase,
+  reporta "LIMPIEZA: no quedo nada de lo creado por el test", cierra Prisma /
+  Redis, exit 1 si fallo un check o quedo algo). Los process.exit del medio
+  pasaron a throw para que la limpieza corra. stress/test-cierre-exhaustivo
+  ahora sale con 1 si tiene bugs (antes SIEMPRE 0: el runner no lo veia fallar).
+
+### Restos — scripts/restos.js
+Categorias: un patron por suite (-jer-, -vis-, -acc-, -dur-, -conc-, -conf-,
+-vnc-, -hst-, -tmo-, cond-mvc-, _veh_, -vin-, -idn-, -lys-, maps-; usuarios en DB
+y Firebase, incluidos los HUERFANOS de Firebase), `fijas` (viajes de las cuentas
+del seed; las cuentas no se tocan), `e2e` (viajes de la cuenta del E2E),
+`exploratorias` (vehiculos STR* de las stress viejas) y `seed-test` (Empresa
+Test / TEST001 del seed-test.js borrado). Por defecto SOLO CUENTA; --borrar
+borra, --solo elige. El --restos de test-viaje-interno y test-lugares-series
+delega aca y TAMBIEN es solo conteo salvo --borrar (CAMBIO: antes borraba
+directo).
+
+### Intermitentes arreglados (sin tocar logs de produccion)
+- test-timeout-reserva CASO 4d y test-viajes-vencidos CASO 5b: esperarLinea
+  (_server-efimero.js, poll cada 200 ms, hasta 15 s) en vez de un esperar fijo,
+  con la regex ANCLADA (en 5b el ':' justo despues de "arranque" distingue la
+  linea legacy de la "(ciclo interno)"). El barrido es async y puede loguear
+  despues de /health.
+- test-identidad CASO 12: /health responde antes de que el Redis del server
+  efimero este 'ready', y sin Redis el rate limit deja pasar (fail-open). SONDA:
+  canjea basura hasta que aparece invitacion:canje:usuario:{R1} en Redis, borra
+  las keys y recien ahi arrancan los 4 intentos.
+- test-historial-estados CASO 3c (aparecio en la primera regresion completa):
+  los dos iniciar salen en el mismo tick, pero eso no garantiza que las dos
+  lecturas previas ocurran antes del commit del ganador. Si la del perdedor
+  llega despues es el caso SECUENCIAL y el contrato es 400, no 409. 3c acepta
+  los dos (y dice cual salio); el guard lo siguen probando 3b / 3d / 3e (un solo
+  ganador, iniciado_por sin pisar, una sola fila de historial).
+- test-vehiculos TEST C: se logueaba con la key de Maps y NUNCA pasaba del
+  login, asi que nadie vio que esperaba el contrato viejo de viaje:aceptar
+  ("Debes seleccionar un vehiculo", errores como { error }). Se alineo con el
+  vigente de API.md: id_vehiculo OPCIONAL (auto-seleccion, probada en un segundo
+  viaje) y errores como { mensaje: 'Ese vehiculo no te pertenece' }.
+
+### scripts/legacy/ — exploratorias (NO entran al runner)
+Se movieron sin borrar (solo se ajustaron imports). Triage del mantenimiento de
+tests, corridas contra un server con los flags en true:
+- legacy/test-bugs2.js (c): /disponibles + doble aceptar; fecha fija 2026-09-01
+  ya pasada -> no crea el viaje. El guard lo cubre test-concurrencia-jerarquia B.
+- legacy/test-fase4.js (c): GPS / desvio / parada del ciclo viejo; depende del
+  inicio automatico por primer ping (se saco con el boton Iniciar). Cubierto por
+  fase5 / eta-recalculo / ruta-front.
+- legacy/test-matching-fix.js (c): aceptar con / sin id_vehiculo; fecha fija pasada.
+- legacy/stress/test-concurrencia.js (c): sale SIEMPRE con 0; secciones 3 y 6
+  dependen del inicio automatico.
+- legacy/stress/test-gps-exhaustivo.js (c): sale SIEMPRE con 0; 13/22 en rojo
+  por el inicio automatico (el GPS se rechaza en CONDUCTOR_ASIGNADO).
+- legacy/stress/test-vehiculos-exhaustivo.js (b): lo cubre test-vehiculos;
+  depende de que STR099 no exista.
+- legacy/stress/run-all.js + REPORTE.md: el runner viejo de las stress.
+test-bugs.js (JWT hardcodeado, 0/7 con login real) y seed-test.js (nadie lo
+referenciaba) se BORRARON: quedan en el historial de git.
+
+### PENDIENTES
+- Portar a una suite oficial (que llame a iniciar) lo que SOLO cubrian
+  gps-exhaustivo y concurrencia: bordes de lat/lng (+-90 / +-180 y apenas
+  afuera), que el acumulado no se contamine con pings invalidos, rafaga de pings
+  y carga / latencia de pings (284 pings, ~660 ms promedio en el triage).
+- LAS EXPLORATORIAS DE scripts/legacy/ NO LIMPIAN LO QUE CREAN (no usan
+  _limpieza.js). Una corrida del set deja ~24 viajes VIVOS colgados de las
+  cuentas FIJAS (cliente@, conductor@, stress-conductor2@): test-fase4 deja 1
+  EN_RUTA (lo fuerza con prisma.viaje.update, sin historial),
+  stress/test-concurrencia ~18 y stress/test-gps-exhaustivo 4 en
+  CONDUCTOR_ASIGNADO / BUSCANDO_CONDUCTOR, stress/test-vehiculos-exhaustivo 1
+  viaje + STR001 / STR002. Paso el 2026-10-19 (viajes 1526-1549, 19:56 UTC, de
+  una corrida que no fue del mantenimiento de tests; se borraron con
+  restos.js). Si se vuelven a correr: despues, `node scripts/restos.js --solo
+  fijas,exploratorias` y borrar con --borrar. Darles crearRegistro + terminar
+  si alguna se porta a suite oficial (ver el punto anterior).
+- BUG en src: PUT /api/conductores/mis-vehiculos/:id con un id no numerico da 500
+  en vez de 400 (lo destapo vehiculos-exhaustivo: PUT /mis-vehiculos/undefined).
+- Lint: scripts/ no entra en npm run lint; varias suites legacy tienen errores
+  de eslint previos (no-empty, no-useless-assignment) que no se tocaron.

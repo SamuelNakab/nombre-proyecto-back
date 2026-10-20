@@ -16,9 +16,12 @@
 //   estimar-costo NO tiene minimo: acepta una fecha pasada
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import prisma from '../src/config/prisma.js';
+import { getToken } from './_firebase-auth.js';
+import { crearRegistro, terminar } from './_limpieza.js';
 
-const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
+// Cuentas FIJAS del seed: al final se borra SOLO lo que esta corrida creo,
+// por ID (viajes y vehiculos nuevos). Las cuentas no se tocan. Ver _limpieza.js.
+const reg = crearRegistro();
 const RAIZ = fileURLToPath(new URL('..', import.meta.url));
 
 const PARADA_1 = { lat: -34.6037, lng: -58.3816, direccion: 'Plaza de Mayo, CABA' };
@@ -34,20 +37,6 @@ function paso(nombre, ok, detalle = '') {
   console.log(`  ${ok ? '✅' : '❌'} ${nombre}${detalle ? '  →  ' + detalle : ''}`);
 }
 const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function getToken(email, password) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    }
-  );
-  const data = await res.json();
-  if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
-  return data.idToken;
-}
 
 async function api(base, method, path, body, token) {
   const res = await fetch(`${base}${path}`, {
@@ -83,6 +72,11 @@ async function conServer(valor, puerto, fn) {
       ...process.env,
       PORT: String(puerto),
       ANTICIPACION_MINIMA_MINUTOS: String(valor),
+      // POST /api/viajes es la ruta dormida del marketplace (el .env la tiene en
+      // false). Barridos apagados: la DB esta compartida con produccion.
+      MARKETPLACE_HABILITADO: 'true',
+      RESERVA_BARRIDO_ARRANQUE: '0',
+      VENCIMIENTO_BARRIDO_ARRANQUE: '0',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -127,7 +121,7 @@ async function conServer(valor, puerto, fn) {
 const enMinutos = (n) => new Date(Date.now() + n * MINUTO).toISOString();
 
 async function crear(base, token, minutos) {
-  return api(
+  const r = await api(
     base,
     'POST',
     '/api/viajes',
@@ -139,18 +133,12 @@ async function crear(base, token, minutos) {
     },
     token
   );
+  if (r.status === 201) reg.viaje(r.data.id_viaje);
+  return r;
 }
 
 const MENSAJE = (min) =>
   `fecha_programada debe ser una fecha ISO futura (al menos ${min} minutos desde ahora)`;
-
-async function cleanup() {
-  try {
-    await prisma.$disconnect();
-  } catch {
-    /* noop */
-  }
-}
 
 // ── Main ───────────────────────────────────────────────────────────────────
 
@@ -252,7 +240,6 @@ async function main() {
   });
 
   // ── RESUMEN ───────────────────────────────────────────────────────────────
-  await cleanup();
 
   const ok = pasos.filter((p) => p.ok).length;
   const fallaron = pasos.filter((p) => !p.ok);
@@ -267,11 +254,12 @@ async function main() {
     fallaron.forEach((p) => console.log(`    ❌ ${p.nombre}${p.detalle ? ': ' + p.detalle : ''}`));
   }
 
-  process.exit(fallaron.length === 0 ? 0 : 1);
+  return fallaron.length === 0;
 }
 
-main().catch(async (e) => {
-  console.error('\n💥 Error inesperado:', e.message, e.stack);
-  await cleanup();
-  process.exit(1);
-});
+main()
+  .then((ok) => terminar(reg, ok))
+  .catch((e) => {
+    console.error('\n💥 Error inesperado:', e.message, e.stack);
+    return terminar(reg, false);
+  });

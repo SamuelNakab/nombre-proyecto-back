@@ -1,7 +1,7 @@
 import {
   api, getToken, conectar, esperar, registrarSiNoExiste, crearVehiculoSiNoExiste,
   crearReporter, STRESS_USERS, PARADA_A, PARADA_B,
-} from './_helpers.js';
+} from '../../stress/_helpers.js';
 
 async function crearViajeNuevo(tokenCli) {
   const fecha = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();

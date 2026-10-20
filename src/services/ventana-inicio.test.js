@@ -5,7 +5,6 @@ import {
   finVentanaInicio,
   fechaProgramadaLimiteVencimiento,
   ventanaInicioAntesMinutos,
-  ventanaInicioAntesMinutosLegacy,
   ventanaInicioDespuesMinutos,
   configVentana,
   VENTANA_ANTES_DEFAULT,
@@ -92,14 +91,8 @@ describe('lectura de env (inyectada)', () => {
     }
   });
 
-  it('el iniciar legacy cae a la vieja VENTANA_INICIO_MINUTOS; el ciclo interno no', () => {
-    expect(ventanaInicioAntesMinutosLegacy({ VENTANA_INICIO_MINUTOS: '120' })).toBe(120);
-    expect(
-      ventanaInicioAntesMinutosLegacy({ VENTANA_INICIO_MINUTOS: '120', VENTANA_INICIO_ANTES_MINUTOS: '' })
-    ).toBe(120);
-    expect(
-      ventanaInicioAntesMinutosLegacy({ VENTANA_INICIO_MINUTOS: '120', VENTANA_INICIO_ANTES_MINUTOS: '45' })
-    ).toBe(45);
+  it('la vieja VENTANA_INICIO_MINUTOS ya no se lee', () => {
     expect(ventanaInicioAntesMinutos({ VENTANA_INICIO_MINUTOS: '120' })).toBe(60);
+    expect(ventanaInicioAntesMinutos({ VENTANA_INICIO_MINUTOS: '120', VENTANA_INICIO_ANTES_MINUTOS: '45' })).toBe(45);
   });
 });

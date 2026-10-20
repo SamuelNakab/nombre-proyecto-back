@@ -1,10 +1,13 @@
 import 'dotenv/config';
 import { io as ioClient } from 'socket.io-client';
+import { getToken as loginFirebase } from './_firebase-auth.js';
+import { crearRegistro, terminar } from './_limpieza.js';
 
-const BASE = `http://localhost:${process.env.PORT || 3000}`;
-const FIREBASE_KEY = process.env.GOOGLE_MAPS_API_KEY || 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
+const BASE = process.env.TEST_BASE_URL ?? `http://localhost:${process.env.PORT || 3000}`;
 
 const TS = Date.now();
+// Al final se borran los usuarios *_veh_<TS>@ y lo que cuelga de ellos (ver _limpieza.js).
+const reg = crearRegistro(`_veh_${TS}`);
 const CLIENTE_EMAIL = `cliente_veh_${TS}@test.com`;
 const CLIENTE_PASS = 'test123456';
 const CONDUCTOR_EMAIL = `conductor_veh_${TS}@test.com`;
@@ -32,31 +35,8 @@ async function api(method, path, body, token) {
   return { status: res.status, data: await res.json().catch(() => ({})) };
 }
 
-async function firebaseSignup(email, password) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signUp?key=${FIREBASE_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    }
-  );
-  const data = await res.json();
-  return data.idToken || null;
-}
-
-async function firebaseLogin(email, password) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    }
-  );
-  const data = await res.json();
-  return data.idToken || null;
-}
+// null si el login falla: los callers de este script chequean el token en null.
+const firebaseLogin = (email, password) => loginFirebase(email, password).catch(() => null);
 
 async function registrarYLogin(tipo, email, password, extra = {}) {
   const endpoint = `/api/auth/registro-${tipo}`;
@@ -98,8 +78,7 @@ async function main() {
   ]);
 
   if (!clienteToken || !conductorToken || !conductor2Token) {
-    console.error('ERROR: No se pudo obtener tokens. Verificar que el servidor esta corriendo.');
-    process.exit(1);
+    throw new Error('No se pudo obtener tokens. Verificar que el servidor esta corriendo.');
   }
 
   // ─── TEST A — CRUD DE VEHICULOS ───────────────────────────────────────────────
@@ -283,7 +262,7 @@ async function main() {
 
   if (!viajeWSId) {
     console.log('No se pudo crear viaje para test WebSocket');
-    check('Aceptar sin id_vehiculo da error', false, 'no se pudo crear viaje');
+    check('Aceptar sin id_vehiculo auto-selecciona un vehiculo', false, 'no se pudo crear viaje');
     check('Aceptar con vehiculo de otro da error', false, 'no se pudo crear viaje');
     check('Aceptar con vehiculo correcto asigna el viaje', false, 'no se pudo crear viaje');
     check('El viaje en DB tiene id_vehiculo asignado', false, 'no se pudo crear viaje');
@@ -299,19 +278,13 @@ async function main() {
       socketCliente.emit('unirse:viaje', { id_viaje: viajeWSId });
       await esperar(500);
 
-      // C3: Intentar aceptar SIN id_vehiculo
-      const errorSinVehiculo = await new Promise((resolve) => {
-        socketConductor.once('error', (e) => resolve(e));
-        socketConductor.emit('viaje:aceptar', { id_viaje: viajeWSId });
-        setTimeout(() => resolve(null), 3000);
-      });
-      check(
-        'Aceptar sin id_vehiculo da error',
-        errorSinVehiculo?.error === 'Debes seleccionar un vehiculo',
-        `error=${JSON.stringify(errorSinVehiculo)}`
-      );
+      // Contrato vigente (API.md, viaje:aceptar): id_vehiculo es OPCIONAL (si
+      // falta, el server elige el primer vehiculo elegible del conductor) y los
+      // errores llegan como { mensaje }. Este test esperaba el contrato viejo
+      // ("Debes seleccionar un vehiculo" / { error }) y no se veia porque nunca
+      // llegaba a loguearse (usaba la key de Maps para Firebase).
 
-      // C4: Intentar aceptar con vehiculo de otro conductor
+      // C3: Intentar aceptar con vehiculo de otro conductor
       const errorOtroVehiculo = await new Promise((resolve) => {
         socketConductor.once('error', (e) => resolve(e));
         socketConductor.emit('viaje:aceptar', { id_viaje: viajeWSId, id_vehiculo: vehiculo2Id });
@@ -319,11 +292,11 @@ async function main() {
       });
       check(
         'Aceptar con vehiculo de otro da error',
-        errorOtroVehiculo?.error === 'Este vehiculo no te pertenece',
+        errorOtroVehiculo?.mensaje === 'Ese vehiculo no te pertenece',
         `error=${JSON.stringify(errorOtroVehiculo)}`
       );
 
-      // C5: Aceptar con el vehiculo correcto
+      // C4: Aceptar con el vehiculo correcto
       const asignado = await new Promise((resolve) => {
         socketConductor.once('viaje:conductor_asignado', (e) => resolve(e));
         socketConductor.emit('viaje:aceptar', { id_viaje: viajeWSId, id_vehiculo: vehiculoId });
@@ -333,6 +306,29 @@ async function main() {
         'Aceptar con vehiculo correcto asigna el viaje',
         asignado?.id_viaje === viajeWSId,
         `data=${JSON.stringify(asignado)}`
+      );
+
+      // C5: Aceptar OTRO viaje SIN id_vehiculo -> auto-seleccion
+      const rCViaje2 = await api('POST', '/api/viajes', {
+        zona: 'CABA',
+        paradas: [
+          { lat: -34.6037, lng: -58.3816, direccion: 'Origen WS 2' },
+          { lat: -34.59, lng: -58.38, direccion: 'Destino WS 2' },
+        ],
+        fecha_programada: fechaFuturaWS,
+      }, clienteToken);
+      const viajeWS2Id = rCViaje2.data?.id_viaje;
+      await esperar(500);
+      const autoAsignado = await new Promise((resolve) => {
+        socketConductor.once('viaje:conductor_asignado', (e) => resolve(e));
+        socketConductor.emit('viaje:aceptar', { id_viaje: viajeWS2Id });
+        setTimeout(() => resolve(null), 5000);
+      });
+      const rCVerif2 = viajeWS2Id ? await api('GET', `/api/viajes/${viajeWS2Id}`, undefined, conductorToken) : null;
+      check(
+        'Aceptar sin id_vehiculo auto-selecciona un vehiculo',
+        !!viajeWS2Id && autoAsignado?.id_viaje === viajeWS2Id && rCVerif2?.data?.id_vehiculo === vehiculoId,
+        `viaje=${viajeWS2Id} evento=${JSON.stringify(autoAsignado)} id_vehiculo=${rCVerif2?.data?.id_vehiculo}`
       );
 
       // Verificar que el viaje en DB tiene id_vehiculo
@@ -345,7 +341,7 @@ async function main() {
       );
     } catch (err) {
       console.log('Error en test WebSocket:', err.message);
-      check('Aceptar sin id_vehiculo da error', false, err.message);
+      check('Aceptar sin id_vehiculo auto-selecciona un vehiculo', false, err.message);
       check('Aceptar con vehiculo de otro da error', false, err.message);
       check('Aceptar con vehiculo correcto asigna el viaje', false, err.message);
       check('El viaje en DB tiene id_vehiculo asignado', false, err.message);
@@ -398,7 +394,7 @@ async function main() {
     'Quitar condicion funciona',
     'Viaje con REFRIGERADO aparece en disponibles',
     'Viaje con FRAGIL NO aparece en disponibles',
-    'Aceptar sin id_vehiculo da error',
+    'Aceptar sin id_vehiculo auto-selecciona un vehiculo',
     'Aceptar con vehiculo de otro da error',
     'Aceptar con vehiculo correcto asigna el viaje',
     'El viaje en DB tiene id_vehiculo asignado',
@@ -414,16 +410,13 @@ async function main() {
   }
 
   console.log();
-  if (todosPasan) {
-    console.log('Todos los checks pasan ✓');
-    process.exit(0);
-  } else {
-    console.log('Algunos checks fallaron ✗');
-    process.exit(1);
-  }
+  console.log(todosPasan ? 'Todos los checks pasan ✓' : 'Algunos checks fallaron ✗');
+  return todosPasan;
 }
 
-main().catch((err) => {
-  console.error('Error inesperado:', err);
-  process.exit(1);
-});
+main()
+  .then((ok) => terminar(reg, ok))
+  .catch((e) => {
+    console.error('\n💥 Error inesperado:', e.message, e.stack);
+    return terminar(reg, false);
+  });

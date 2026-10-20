@@ -70,3 +70,15 @@ export async function conServer(env, puerto, fn) {
     await esperar(500);
   }
 }
+
+// Espera (poll cada 200 ms) a que el log del server tenga una linea que matchee
+// `regex`. Devuelve el match (o null si se cumple el plazo). Para los logs que
+// salen de tareas async del arranque, que pueden aparecer DESPUES de /health.
+export async function esperarLinea(leerLog, regex, ms = 15000) {
+  const limite = Date.now() + ms;
+  for (;;) {
+    const m = leerLog().match(regex);
+    if (m || Date.now() >= limite) return m;
+    await esperar(200);
+  }
+}

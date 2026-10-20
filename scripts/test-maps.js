@@ -29,14 +29,14 @@ import 'dotenv/config';
 import { io as ioClient } from 'socket.io-client';
 import prisma from '../src/config/prisma.js';
 import redis from '../src/config/redis.js';
-import admin from '../src/config/firebase.js';
 import { conServer } from './_server-efimero.js';
+import { crearRegistro } from './_limpieza.js';
 import { estimarCosto } from '../src/services/costo.service.js';
 import { estadisticasMaps } from '../src/services/maps/index.js';
 import { clasificarZona, repartirPorZona } from '../src/services/zona.service.js';
 import { obtenerTarifas } from '../src/services/tarifa.service.js';
+import { getToken as loginFirebase } from './_firebase-auth.js';
 
-const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
 const PUERTO_OK = 3701;
 const PUERTO_ROTO = 3702;
 const PEON = 30;
@@ -82,15 +82,7 @@ const titulo = (t) => console.log(`\n-- ${t} ${'-'.repeat(Math.max(0, 60 - t.len
 const min = (horas) => horas * 60;
 const r2s = (r) => `${r.status} ${JSON.stringify(r.data).slice(0, 200)}`;
 
-async function getToken(email, password = PASS) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
-    { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password, returnSecureToken: true }) }
-  );
-  const data = await res.json();
-  if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
-  return data.idToken;
-}
+const getToken = (email, password = PASS) => loginFirebase(email, password);
 
 async function api(base, method, path, body, token) {
   const res = await fetch(`${base}${path}`, {
@@ -332,49 +324,11 @@ async function parteB() {
 // -- Limpieza -----------------------------------------------------------------
 
 async function limpiar() {
-  titulo('LIMPIEZA');
-  const usuarios = await prisma.usuario.findMany({ where: { email: { in: creados.emails } }, include: { conductor: true, cliente: true } });
-  const idsUsuario = usuarios.map((u) => u.id_usuario);
-  const idsConductor = usuarios.map((u) => u.conductor?.id_conductor).filter(Boolean);
-  const idsCliente = usuarios.map((u) => u.cliente?.id_cliente).filter(Boolean);
-  const viajes = await prisma.viaje.findMany({
-    where: { OR: [{ id_organizacion: { in: creados.orgs } }, { id_conductor: { in: idsConductor } }, { id_cliente: { in: idsCliente } }] },
-    select: { id_viaje: true },
-  });
-  const idsViaje = viajes.map((x) => x.id_viaje);
-  if (redis.status === 'ready') {
-    for (const id of idsViaje) {
-      const keys = await redis.keys(`gps:${id}:*`);
-      if (keys.length) await redis.del(...keys);
-    }
-    const claves = idsUsuario.map((id) => `invitacion:canje:usuario:${id}`);
-    if (claves.length) await redis.del(...claves);
-  }
-  await prisma.historialEstadoViaje.deleteMany({ where: { id_viaje: { in: idsViaje } } });
-  await prisma.parada.deleteMany({ where: { id_viaje: { in: idsViaje } } });
-  await prisma.condicionRequerida.deleteMany({ where: { id_viaje: { in: idsViaje } } });
-  await prisma.viaje.deleteMany({ where: { id_viaje: { in: idsViaje } } });
-  await prisma.vinculoChofer.deleteMany({ where: { OR: [{ id_organizacion: { in: creados.orgs } }, { id_conductor: { in: idsConductor } }] } });
-  await prisma.invitacion.deleteMany({ where: { id_organizacion: { in: creados.orgs } } });
-  await prisma.miembroOrganizacion.deleteMany({ where: { OR: [{ id_organizacion: { in: creados.orgs } }, { id_usuario: { in: idsUsuario } }] } });
-  await prisma.organizacion.deleteMany({ where: { id_organizacion: { in: creados.orgs } } });
-  await prisma.condicionVehiculo.deleteMany({ where: { vehiculo: { id_conductor: { in: idsConductor } } } });
-  await prisma.vehiculo.deleteMany({ where: { id_conductor: { in: idsConductor } } });
-  await prisma.conductor.deleteMany({ where: { id_usuario: { in: idsUsuario } } });
-  await prisma.cliente.deleteMany({ where: { id_usuario: { in: idsUsuario } } });
-  await prisma.usuario.deleteMany({ where: { id_usuario: { in: idsUsuario } } });
-  for (const email of creados.emails) {
-    try {
-      await admin.auth().deleteUser((await admin.auth().getUserByEmail(email)).uid);
-    } catch (e) {
-      if (e.code !== 'auth/user-not-found') console.error(`  ⚠️  Firebase ${email}: ${e.message}`);
-    }
-  }
-  const quedan =
-    (await prisma.usuario.count({ where: { email: { in: creados.emails } } })) +
-    (await prisma.viaje.count({ where: { id_viaje: { in: idsViaje } } })) +
-    (await prisma.organizacion.count({ where: { id_organizacion: { in: creados.orgs } } }));
-  paso('LIMPIEZA: no quedo nada de lo creado por el test', quedan === 0, `viajes=${idsViaje.length} usuarios=${idsUsuario.length}`);
+  const reg = crearRegistro();
+  creados.emails.forEach(reg.email);
+  creados.orgs.forEach(reg.org);
+  const { ok, conteos } = await reg.limpiar();
+  paso('LIMPIEZA: no quedo nada de lo creado por el test', ok, JSON.stringify(conteos));
 }
 
 // -- Main ---------------------------------------------------------------------

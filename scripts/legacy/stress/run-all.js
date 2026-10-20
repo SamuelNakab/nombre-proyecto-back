@@ -1,5 +1,5 @@
 // Runner para los 4 tests de stress.
-// Uso: node scripts/stress/run-all.js
+// Uso: node scripts/legacy/stress/run-all.js (LEGACY: ver CLAUDE.md)
 import { spawn } from 'node:child_process';
 import { writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -10,7 +10,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const TESTS = [
   'test-vehiculos-exhaustivo.js',
   'test-gps-exhaustivo.js',
-  'test-cierre-exhaustivo.js',
+  '../../stress/test-cierre-exhaustivo.js',
   'test-concurrencia.js',
 ];
 

@@ -18,6 +18,7 @@ export function inicializarSockets(httpServer) {
 
   io.on('connection', (socket) => {
     const { rol, id_usuario } = socket.data.usuario;
+    const conectadoEn = Date.now();
     socket.join('usuario:' + id_usuario);
     console.log(`[Socket] conectado: ${rol} id:${socket.id}`);
 
@@ -30,8 +31,12 @@ export function inicializarSockets(httpServer) {
     manejarAceptarViaje(socket, io);
     registrarHandlersGPS(socket, io);
 
-    socket.on('disconnect', () => {
-      console.log(`[Socket] desconectado: ${rol} uid:${id_usuario} id:${socket.id}`);
+    // Motivo (el `reason` de socket.io: 'transport close', 'ping timeout',
+    // 'client namespace disconnect'...) y duracion de la conexion, para
+    // diagnosticar cortes del mobile. Sin email, token ni IP.
+    socket.on('disconnect', (reason) => {
+      const seg = Math.round((Date.now() - conectadoEn) / 1000);
+      console.log(`[Socket] desconectado: ${rol} uid:${id_usuario} id:${socket.id} motivo:${reason} duracion:${seg}s`);
     });
   });
 

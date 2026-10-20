@@ -2,7 +2,7 @@ import Redis from 'ioredis';
 import {
   api, getToken, conectar, esperar, registrarSiNoExiste, crearVehiculoSiNoExiste,
   crearReporter, STRESS_USERS, PARADA_A, PARADA_B,
-} from './_helpers.js';
+} from '../../stress/_helpers.js';
 
 const redis = new Redis(process.env.REDIS_URL);
 

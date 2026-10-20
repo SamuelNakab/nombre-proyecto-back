@@ -27,11 +27,19 @@
 //      vencida escrito directo en la DB -> el server lo libera al levantar.
 import { io as ioClient } from 'socket.io-client';
 import prisma from '../src/config/prisma.js';
-import redis from '../src/config/redis.js';
-import { conServer } from './_server-efimero.js';
+import { conServer, esperarLinea } from './_server-efimero.js';
+import { getToken } from './_firebase-auth.js';
+import { crearRegistro, terminar } from './_limpieza.js';
 
-const FIREBASE_KEY = 'AIzaSyDpWEEvdenhCI6cpSvG4Kj3qnITIFDYn04';
-const SETUP_BASE = 'http://localhost:3000'; // solo para el alta de fixtures
+// El marketplace esta dormido por defecto (MARKETPLACE_HABILITADO=false en el
+// .env): esta suite prueba el ciclo LEGACY, asi que sus servers lo prenden. El
+// barrido de reservas NO se apaga aca (el CASO 4 lo prueba); el de los viajes de
+// PyME si: escribe en la DB compartida con produccion.
+// Todo lo que crea la corrida se borra al final (ver _limpieza.js): los
+// usuarios con el patron de esta corrida y lo que cuelga de ellos.
+const reg = crearRegistro();
+const ENV_MARKETPLACE = { MARKETPLACE_HABILITADO: 'true', VENCIMIENTO_BARRIDO_ARRANQUE: '0' };
+const SETUP_BASE = process.env.TEST_BASE_URL ?? 'http://localhost:3000'; // solo para el alta de fixtures
 
 const PARADA_1 = { lat: -34.6037, lng: -58.3816, direccion: 'Plaza de Mayo, CABA' };
 const PARADA_2 = { lat: -34.5895, lng: -58.3974, direccion: 'Recoleta, CABA' };
@@ -52,20 +60,6 @@ function paso(nombre, ok, detalle = '') {
   console.log(`  ${ok ? '✅' : '❌'} ${nombre}${detalle ? '  →  ' + detalle : ''}`);
 }
 const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
-
-async function getToken(email, password) {
-  const res = await fetch(
-    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_KEY}`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email, password, returnSecureToken: true }),
-    }
-  );
-  const data = await res.json();
-  if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
-  return data.idToken;
-}
 
 async function api(base, method, path, body, token) {
   const res = await fetch(`${base}${path}`, {
@@ -142,16 +136,6 @@ async function cleanup(sockets = []) {
       /* noop */
     }
   }
-  try {
-    await prisma.$disconnect();
-  } catch {
-    /* noop */
-  }
-  try {
-    await redis.quit();
-  } catch {
-    /* noop */
-  }
 }
 
 // -- Main -------------------------------------------------------------------
@@ -162,6 +146,7 @@ async function main() {
   console.log('╚══════════════════════════════════════════════╝\n');
 
   const stamp = Date.now();
+  reg.patron(`-tmo-${stamp}`);
   const pass = 'test123456';
   const d = String(stamp).slice(-7);
   const lic = '2028-01-01T00:00:00.000Z';
@@ -223,6 +208,7 @@ async function main() {
   console.log(`  setup ok: empresa=${empId} conductor=${condId} vehiculo_flota=${flotaVehId}`);
 
   const ENV_CORTO = {
+    ...ENV_MARKETPLACE,
     RESERVA_TIMEOUT_MINUTOS: String(TIMEOUT_CORTO),
     RESERVA_BARRIDO_ARRANQUE: '0',
   };
@@ -392,9 +378,15 @@ async function main() {
     `estado=${previo.estado} fecha_reserva=${previo.fecha_reserva?.toISOString()}`
   );
 
-  await conServer({}, 3204, async (_base, leerLog) => {
-    // El barrido corre al levantar; conServer ya espero a /health.
-    await esperar(2500);
+  await conServer(ENV_MARKETPLACE, 3204, async (_base, leerLog) => {
+    // El barrido corre al levantar, async: puede loguear DESPUES de /health.
+    // Se espera a su linea (que sale cuando termino) en vez de un tiempo fijo.
+    // El prefijo completo importa: desde que existe el barrido de avisos de
+    // vencimiento hay DOS lineas de 'barrido de arranque' en el log.
+    const m = await esperarLinea(
+      leerLog,
+      /\[reserva-timeout\] barrido de arranque: (\d+) reservas activas, (\d+) liberadas por vencimiento, (\d+) con timer reprogramado/
+    );
 
     const liberado = await estadoDe(vBarrido);
     paso(
@@ -412,19 +404,10 @@ async function main() {
       `estado=${vigente.estado}`
     );
 
-    const log = leerLog();
-    // El prefijo completo importa: desde que existe el barrido de avisos de
-    // vencimiento hay DOS lineas de 'barrido de arranque' en el log.
-    const linea =
-      log.split('\n').find((l) => l.includes('[reserva-timeout] barrido de arranque')) ??
-      '';
-    const m = linea.match(
-      /(\d+) reservas activas, (\d+) liberadas por vencimiento, (\d+) con timer reprogramado/
-    );
     paso(
       'CASO 4d: loguea cuantas encontro / libero / reprogramo',
       !!m && Number(m[1]) >= 2 && Number(m[2]) >= 1 && Number(m[3]) >= 1,
-      linea.trim() || 'no se encontro la linea del barrido en el log'
+      m ? m[0] : 'no se encontro la linea del barrido en el log'
     );
 
     // Limpieza: el viaje vigente queda reservado; lo soltamos para no dejar
@@ -451,11 +434,12 @@ async function main() {
     fallaron.forEach((p) => console.log(`    ❌ ${p.nombre}${p.detalle ? ': ' + p.detalle : ''}`));
   }
 
-  process.exit(fallaron.length === 0 ? 0 : 1);
+  return fallaron.length === 0;
 }
 
-main().catch(async (e) => {
-  console.error('\n💥 Error inesperado:', e.message, e.stack);
-  await cleanup();
-  process.exit(1);
-});
+main()
+  .then((ok) => terminar(reg, ok))
+  .catch((e) => {
+    console.error('\n💥 Error inesperado:', e.message, e.stack);
+    return terminar(reg, false);
+  });

@@ -54,6 +54,7 @@ const ENV_SIN_ANTICIPACION = {
   MARKETPLACE_HABILITADO: 'true',
   RESERVA_BARRIDO_ARRANQUE: '0',
   VENCIMIENTO_BARRIDO_ARRANQUE: '0',
+  CIERRE_BARRIDO_ARRANQUE: '0',
 };
 
 // Segundos hasta la fecha_programada de los viajes de prueba, y margen para

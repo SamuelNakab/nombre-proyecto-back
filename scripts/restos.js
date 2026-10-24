@@ -41,6 +41,7 @@ export const PATRONES = [
   '-vin-', // test-viaje-interno
   '-idn-', // test-identidad
   '-lys-', // test-lugares-series
+  '-cie-', // test-cierre-viaje
   'maps-', // test-maps
 ];
 const FIJAS = EMAILS_PROTEGIDOS.filter((e) => e !== 'chofer-e2e@test.com' && e !== 'admin-test@fleter.com');

@@ -27,7 +27,7 @@ import {
   INCLUDE_HISTORIAL,
 } from '../services/historial-estado.service.js';
 import { distanciaMetros } from '../services/parada.service.js';
-import { confirmarParadaInterna } from '../services/viaje-interno.service.js';
+import { confirmarParadaInterna, exigirViajeAbiertoChofer } from '../services/viaje-interno.service.js';
 import { paradaVistaChofer } from '../services/vista-parada.js';
 import {
   esViajeVencido,
@@ -750,6 +750,17 @@ export async function confirmarParada(req, res) {
   if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
   if (!viaje.conductor || viaje.conductor.id_usuario !== req.usuario.id_usuario) {
     return res.status(403).json({ error: 'No sos el conductor de este viaje' });
+  }
+
+  // Viaje INTERNO (Tarea 5): chequeo perezoso del cierre automatico y 409 si ya
+  // lo cerro la empresa o el automatico. Va antes de las validaciones de la
+  // parada: sobre un viaje cerrado, cualquier confirmacion es 409.
+  if (cicloDe(viaje) === 'INTERNO') {
+    try {
+      await exigirViajeAbiertoChofer(io, viaje.id_viaje);
+    } catch (err) {
+      return responderErrorNegocio(res, err);
+    }
   }
 
   // 400 y no 404: la parada puede existir perfectamente, solo que no es de este

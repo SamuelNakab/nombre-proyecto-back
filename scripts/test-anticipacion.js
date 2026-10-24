@@ -77,6 +77,7 @@ async function conServer(valor, puerto, fn) {
       MARKETPLACE_HABILITADO: 'true',
       RESERVA_BARRIDO_ARRANQUE: '0',
       VENCIMIENTO_BARRIDO_ARRANQUE: '0',
+      CIERRE_BARRIDO_ARRANQUE: '0',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });

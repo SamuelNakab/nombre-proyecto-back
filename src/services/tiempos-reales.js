@@ -12,7 +12,7 @@ const horasEntre = (desde, hasta) => (new Date(hasta).getTime() - new Date(desde
 //
 // Devuelve null si el viaje no arranco (la parada 1 no tiene llegada).
 // Si no: { paradas: [{ id_parada, orden, peon_real_horas, manejo_real_horas }],
-//          manejo_horas, peon_horas, total_horas }
+//          manejo_horas, peon_horas, total_horas, paradas_peon_no_medido }
 export function tiemposRealesDesdeParadas(paradas, fin = null) {
   const ordenadas = [...paradas].sort((a, b) => a.orden - b.orden);
   if (!ordenadas[0]?.llegada_real) return null;
@@ -45,7 +45,18 @@ export function tiemposRealesDesdeParadas(paradas, fin = null) {
     manejo_horas += horasEntre(ultimaSalida, fin);
   }
 
-  return { paradas: resultado, manejo_horas, peon_horas, total_horas: manejo_horas + peon_horas };
+  // Paradas a las que llego y cuyo peon no se pudo medir (sin salida y sin
+  // `fin`). En un viaje cerrado sin "Salir" y sin salida detectada (Tarea 5) es
+  // la parada abierta: su peon NO suma a peon_horas (no se inventa).
+  const paradas_peon_no_medido = resultado.filter((p) => p.peon_real_horas === null).length;
+
+  return {
+    paradas: resultado,
+    manejo_horas,
+    peon_horas,
+    total_horas: manejo_horas + peon_horas,
+    paradas_peon_no_medido,
+  };
 }
 
 const PEON_LEGACY = ['CARGANDO', 'DESCARGANDO'];

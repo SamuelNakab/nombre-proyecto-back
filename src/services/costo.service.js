@@ -1,6 +1,7 @@
 import { obtenerTarifas } from './tarifa.service.js';
 import { clasificarZona, repartirPorZona } from './zona.service.js';
 import { obtenerAcumulado } from './gps.service.js';
+import { precioDesdeMediciones } from './precio-real.js';
 import { calcularTramo } from './maps/index.js';
 import { estimarRecorrido, tiempoPeonMinutos } from './estimacion.service.js';
 import { horasAMinutos } from './duracion.service.js';
@@ -109,20 +110,16 @@ export async function calcularCostoAcumulado(viaje) {
     return { precio_acumulado: 0, desglose: null };
   }
 
-  // Mismo reparto que usan la estimacion y el cierre: en MIXTO se prorratea en
+  // La MISMA formula que el cierre (precio-real.js): en MIXTO se prorratea en
   // vez de cobrar el tiempo total Y la distancia total.
-  const { tiempo_capital, distancia_provincia, fraccion_caba } = repartirPorZona({
-    zona: viaje.zona,
-    paradas: viaje.paradas,
-    tiempo_horas: acumulado.tiempo_horas,
-    distancia_km: acumulado.distancia_km,
-  });
-
-  const precio_por_tiempo =
-    tiempo_capital === null ? null : tiempo_capital * (viaje.tarifa_hora || 0);
-  const precio_por_distancia =
-    distancia_provincia === null ? null : distancia_provincia * (viaje.tarifa_km || 0);
-  const precio_acumulado = (precio_por_tiempo ?? 0) + (precio_por_distancia ?? 0);
+  const {
+    precio_real: precio_acumulado,
+    precio_por_tiempo,
+    precio_por_distancia,
+    tiempo_capital,
+    distancia_provincia,
+    fraccion_caba,
+  } = precioDesdeMediciones(viaje, acumulado);
 
   const hora = new Date().getHours();
   const es_hora_pico = (hora >= 7 && hora <= 10) || (hora >= 17 && hora <= 20);

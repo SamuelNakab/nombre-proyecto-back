@@ -14,6 +14,11 @@ const ultimaActividad = new Map(); // id_viaje → wall-clock ms del ultimo ping
 // ping; sin entrada se emite solo al room del viaje, como siempre.
 const salasPorViaje = new Map(); // id_viaje → string[]
 const salasDe = (id_viaje) => salasPorViaje.get(id_viaje) ?? [`viaje:${id_viaje}`];
+// Viajes sin paradas pendientes (el chofer ya llego a la ultima). calcularEtaConApi
+// devuelve null sin escribir nada en Redis, asi que sin esta marca CADA tick
+// volvia a consultar la DB (findFirst de la proxima parada) para nada. Una parada
+// confirmada no vuelve a quedar pendiente: la marca dura lo que dure el emisor.
+const sinPendientes = new Set(); // id_viaje
 
 const emisionSeg = () => parseInt(process.env.ETA_EMISION_SEGUNDOS) || 30;
 const recalculoSeg = () => parseInt(process.env.ETA_RECALCULO_SEGUNDOS) || 360;
@@ -47,6 +52,7 @@ function construirPayload(id_viaje, resultado) {
 }
 
 async function emitirEta(io, id_viaje) {
+  if (sinPendientes.has(id_viaje)) return;
   const ultima = await obtenerUltimaCoordenada(id_viaje);
   if (!ultima) return; // todavia no hay posicion del conductor
 
@@ -76,7 +82,11 @@ async function emitirEta(io, id_viaje) {
     return;
   }
 
-  if (!resultado) return; // sin parada pendiente
+  if (!resultado) {
+    // Sin parada pendiente: los ticks siguientes no consultan nada.
+    sinPendientes.add(id_viaje);
+    return;
+  }
 
   io.to(salasDe(id_viaje)).emit('eta:actualizar', construirPayload(id_viaje, resultado));
 }
@@ -110,6 +120,9 @@ export function iniciarEmisorEta(io, id_viaje, salas = null) {
   emitirEta(io, id_viaje).catch(() => {});
 }
 
+// Exportada para el test unitario de la marca sinPendientes.
+export const etaSinPendientes = (id_viaje) => sinPendientes.has(id_viaje);
+
 // Detiene el emisor de un viaje y limpia el timer.
 export function detenerEmisorEta(id_viaje) {
   const handle = timers.get(id_viaje);
@@ -120,6 +133,7 @@ export function detenerEmisorEta(id_viaje) {
   }
   ultimaActividad.delete(id_viaje);
   salasPorViaje.delete(id_viaje);
+  sinPendientes.delete(id_viaje);
 }
 
 // Fuerza un recalculo con la API y emite el resultado de inmediato. Lo usan el
@@ -130,7 +144,12 @@ export async function recalcularEtaInmediato(io, id_viaje, salas = null) {
   if (!ultima) return;
 
   const resultado = await calcularConApi(id_viaje, ultima);
-  if (!resultado || resultado === FALLO) return;
+  if (resultado === FALLO) return;
+  if (!resultado) {
+    // Se confirmo la ultima parada: el emisor (si corre) deja de consultar.
+    if (timers.has(id_viaje)) sinPendientes.add(id_viaje);
+    return;
+  }
 
   io.to(salas ?? salasDe(id_viaje)).emit('eta:actualizar', construirPayload(id_viaje, resultado));
 }

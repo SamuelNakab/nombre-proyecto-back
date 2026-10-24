@@ -54,8 +54,9 @@ const ACTORES = ['CHOFER', 'PYME', 'ADMIN', 'SISTEMA'];
 
 // La tabla completa, fila por fila: [desde, hacia, quienes pueden]. Ciclo por
 // parada (Paso 3): salir = CARGANDO/DESCARGANDO -> EN_RUTA (o FINALIZADO en la
-// ultima); confirmar-parada = EN_RUTA -> DESCARGANDO. EN_RUTA -> FINALIZADO ya
-// no existe.
+// ultima); confirmar-parada = EN_RUTA -> DESCARGANDO. Tarea 5: la PyME finaliza
+// desde DESCARGANDO y el SISTEMA cierra solo desde cualquier estado en curso
+// (CARGANDO / EN_RUTA -> FINALIZADO es el cierre automatico incompleto).
 const VALIDAS_INTERNO = [
   ['ASIGNADO', 'CONFIRMADO', ['CHOFER']],
   ['ASIGNADO', 'RECHAZADO', ['CHOFER']],
@@ -67,11 +68,13 @@ const VALIDAS_INTERNO = [
   ['CONFIRMADO', 'CANCELADO', ['CHOFER', 'PYME', 'ADMIN', 'SISTEMA']],
   ['CONFIRMADO', 'VENCIDO', ['SISTEMA']],
   ['CARGANDO', 'EN_RUTA', ['CHOFER']],
+  ['CARGANDO', 'FINALIZADO', ['SISTEMA']],
   ['CARGANDO', 'CANCELADO', ['PYME', 'ADMIN', 'SISTEMA']],
   ['EN_RUTA', 'DESCARGANDO', ['CHOFER']],
+  ['EN_RUTA', 'FINALIZADO', ['SISTEMA']],
   ['EN_RUTA', 'CANCELADO', ['PYME', 'ADMIN', 'SISTEMA']],
   ['DESCARGANDO', 'EN_RUTA', ['CHOFER']],
-  ['DESCARGANDO', 'FINALIZADO', ['CHOFER']],
+  ['DESCARGANDO', 'FINALIZADO', ['CHOFER', 'PYME', 'SISTEMA']],
   ['DESCARGANDO', 'CANCELADO', ['PYME', 'ADMIN', 'SISTEMA']],
 ];
 
@@ -144,8 +147,10 @@ describe('cicloDe', () => {
 });
 
 describe('ciclo por parada (Paso 3)', () => {
-  it('EN_RUTA ya no puede pasar directo a FINALIZADO', () => {
-    expect(() => validarTransicion('EN_RUTA', 'FINALIZADO', interno('CHOFER'))).toThrow(/Transicion invalida/);
+  it('EN_RUTA -> FINALIZADO solo para el cierre automatico (el chofer no)', () => {
+    expect(() => validarTransicion('EN_RUTA', 'FINALIZADO', interno('CHOFER'))).toThrow(/no permitida/);
+    expect(() => validarTransicion('EN_RUTA', 'FINALIZADO', interno('PYME'))).toThrow(/no permitida/);
+    expect(() => validarTransicion('EN_RUTA', 'FINALIZADO', interno('SISTEMA'))).not.toThrow();
   });
 
   it('el chofer alterna entre EN_RUTA y DESCARGANDO en cada parada', () => {

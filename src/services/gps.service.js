@@ -1,5 +1,6 @@
 import * as turf from '@turf/turf';
 import redis from '../config/redis.js';
+import { medicionEn, PUNTOS_MUESTREO_MS } from './mediciones-gps.js';
 
 export async function guardarCoordenada(id_viaje, lat, lng, timestamp) {
   const payload = JSON.stringify({ lat, lng, timestamp });
@@ -76,8 +77,45 @@ export async function obtenerRuta(id_viaje) {
   return raw ? JSON.parse(raw) : null;
 }
 
+// ─── Puntos de medicion (Tarea 5) ────────────────────────────────────────────
+//
+// gps:{id}:puntos es un ZSET (score = timestamp del ping) con el acumulado en
+// ese ping, muestreado cada PUNTOS_MUESTREO_MS como minimo: ~2900 puntos en 24
+// h. Sirve para cortar el precio real en un instante anterior al ultimo ping
+// (salida detectada, hora prevista de fin): ver mediciones-gps.js. Solo los
+// viajes internos lo escriben. Solo Redis: ninguna query a la DB por ping.
+const keyPuntos = (id_viaje) => `gps:${id_viaje}:puntos`;
+
+export async function registrarPuntoMedicion(id_viaje, timestamp, acumulado) {
+  const key = keyPuntos(id_viaje);
+  const ultimo = await redis.zrevrange(key, 0, 0, 'WITHSCORES');
+  if (ultimo.length === 2 && timestamp - Number(ultimo[1]) < PUNTOS_MUESTREO_MS) return false;
+  const punto = { ts: timestamp, tiempo_horas: acumulado.tiempo_horas, distancia_km: acumulado.distancia_km };
+  await redis.multi().zadd(key, timestamp, JSON.stringify(punto)).expire(key, 86400).exec();
+  return true;
+}
+
+// { tiempo_horas, distancia_km, sin_pings } medidos hasta `instante`.
+export async function medicionesHasta(id_viaje, instante) {
+  const acumulado = await obtenerAcumulado(id_viaje);
+  if (!acumulado || new Date(instante).getTime() >= acumulado.ultima_actualizacion) {
+    return medicionEn([], acumulado, instante);
+  }
+  const crudos = await redis.zrangebyscore(keyPuntos(id_viaje), '-inf', new Date(instante).getTime());
+  return medicionEn(crudos.map((c) => JSON.parse(c)), acumulado, instante);
+}
+
+// Timestamp (Date) del ultimo ping del viaje, o null.
+export async function ultimoPing(id_viaje) {
+  const acumulado = await obtenerAcumulado(id_viaje);
+  return acumulado ? new Date(acumulado.ultima_actualizacion) : null;
+}
+
 export async function limpiarGPS(id_viaje) {
   await Promise.all([
+    // Tarea 5: estado de la deteccion de salida y puntos de medicion.
+    redis.del(`gps:${id_viaje}:salida`),
+    redis.del(keyPuntos(id_viaje)),
     redis.del(`gps:${id_viaje}:ultima`),
     redis.del(`gps:${id_viaje}:historial`),
     redis.del(`gps:${id_viaje}:ruta`),

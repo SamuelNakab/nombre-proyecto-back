@@ -20,6 +20,7 @@ import {
   barridoInicialVencimientosInternos,
 } from './services/vencimiento.service.js';
 import { marketplaceHabilitado } from './middlewares/flags.middleware.js';
+import { barridoInicialCierres } from './services/cierre-automatico.service.js';
 
 const app = express();
 
@@ -106,6 +107,23 @@ if (process.env.VENCIMIENTO_BARRIDO_ARRANQUE === '0') {
 } else {
   barridoInicialVencimientosInternos(io).catch((e) =>
     console.error('[viaje-vencido] barrido de arranque del ciclo interno fallo:', e.message)
+  );
+}
+
+// Cuarto barrido UNICO (Tarea 5): los viajes INTERNOS en curso. Los que pasaron
+// su cierre automatico (fin del dia) mientras el proceso estaba caido se cierran
+// ahora (FINALIZADO, completo o incompleto); al resto se le arman los timers.
+//
+// Lleva kill-switch (CIERRE_BARRIDO_ARRANQUE=0, SOLO tests): ESCRIBE en la DB
+// compartida con produccion, y un server efimero con CIERRE_FIN_DIA_SEGUNDOS_TEST
+// cerraria viajes reales. CIERRE_BARRIDO_ID_ORGANIZACION (SOLO tests) lo limita a
+// una PyME: lo usa el test del barrido.
+if (process.env.CIERRE_BARRIDO_ARRANQUE === '0') {
+  console.log('[cierre-automatico] barrido de arranque DESACTIVADO (CIERRE_BARRIDO_ARRANQUE=0)');
+} else {
+  const idOrg = Number(process.env.CIERRE_BARRIDO_ID_ORGANIZACION);
+  barridoInicialCierres(io, { id_organizacion: Number.isInteger(idOrg) && idOrg > 0 ? idOrg : null }).catch((e) =>
+    console.error('[cierre-automatico] barrido de arranque fallo:', e.message)
   );
 }
 

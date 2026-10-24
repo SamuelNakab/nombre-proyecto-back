@@ -314,7 +314,7 @@ export async function obtenerViaje(req, res) {
 
   return res.status(200).json({
     ...viaje,
-    paradas: paradasConTiempos(viaje.paradas),
+    paradas: paradasConTiempos(viaje.paradas, { terminado: ESTADOS_TERMINALES.includes(viaje.estado) }),
     fee,
     remito_url,
     ...calcularMetricasViaje(viaje),

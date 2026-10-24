@@ -1,5 +1,6 @@
 import { detenerEmisorEta } from './eta-emisor.js';
 import { limpiarGPS } from './gps.service.js';
+import { cancelarTimersCierre } from './timers-cierre.js';
 
 // Momento en que se limpio por ultima vez el estado activo de cada viaje. Cubre
 // la carrera con un ping GPS EN VUELO: el handler de conductor:ubicacion valida
@@ -36,8 +37,8 @@ export async function relimpiarSiCerrado(id_viaje, inicioPing) {
   return true;
 }
 
-// Cleanup del estado "activo" de un viaje: corta el emisor periodico de ETA y
-// borra TODAS las keys gps:{id_viaje}:* de Redis. Es idempotente — si no hay
+// Cleanup del estado "activo" de un viaje: corta el emisor periodico de ETA, los
+// timers de cierre (Tarea 5) y borra TODAS las keys gps:{id_viaje}:* de Redis. Es idempotente — si no hay
 // emisor corriendo (detenerEmisorEta es un no-op sin timer) ni keys en Redis
 // (limpiarGPS hace del de keys inexistentes sin fallar), no hace nada y no tira
 // error. Se reusa desde la cancelacion por conductor, por cliente, por la PyME,
@@ -48,5 +49,6 @@ export async function relimpiarSiCerrado(id_viaje, inicioPing) {
 export async function limpiarViajeActivo(id_viaje) {
   marcarViajeCerrado(id_viaje);
   detenerEmisorEta(id_viaje);
+  cancelarTimersCierre(id_viaje);
   await limpiarGPS(id_viaje);
 }

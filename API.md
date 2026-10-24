@@ -2283,8 +2283,9 @@ Authorization: Bearer <firebase-id-token>
 > **Viajes de PyME (ciclo por parada, Paso 3):** confirmar es **llegar a la siguiente parada**. Solo en
 > `EN_RUTA`, solo la siguiente en orden, y pasa a `DESCARGANDO` (guarda `llegada_real` y el manejo real
 > del tramo). **Confirmar la última ya no finaliza:** lo hace [`salir`](#post-apichoferesviajesidsalir).
-> La parada 1 queda confirmada al iniciar. Orden de validaciones: viaje `404` → chofer `403` → parada
-> ajena `400` → ya confirmada `400` → estado `400` → **no es la siguiente `400`** → distancia `400`.
+> La parada 1 queda confirmada al iniciar. Orden de validaciones: viaje `404` → chofer `403` →
+> **viaje cerrado por la empresa o automáticamente `409`** (Tarea 5) → parada ajena `400` → ya confirmada
+> `400` → estado `400` → **no es la siguiente `400`** → distancia `400`.
 > Respuesta real:
 > ```json
 > {"confirmada": true, "viaje_finalizado": false, "id_viaje": 883, "id_parada": 1788, "estado": "DESCARGANDO", "llegada_real": "2026-10-09T21:36:22.624Z"}
@@ -5139,9 +5140,11 @@ por parada con [`salir`](#post-apichoferesviajesidsalir) y
 | 400 | `{"error": "La ventana para iniciar el viaje cerro a las 22:53; el viaje vencio"}` | La ventana cerró (el viaje queda `VENCIDO`) |
 | 400 | `{ "error": "Tenes que confirmar el viaje (elegir el vehiculo) antes de iniciarlo" }` | Sigue `ASIGNADO` |
 | 404 | `{ "error": "Viaje no encontrado" }` | No es su viaje |
+| 409 | `{"error": "Ya tenes un viaje en curso (#2115): terminalo antes de iniciar otro"}` | El chofer ya tiene **otro** viaje en curso (de cualquier PyME o del marketplace). Va después de los `400` de estado y antes de la ventana y la proximidad. Dos `iniciar` a la vez del mismo chofer: arranca uno, el otro recibe este `409` |
 | 409 | `{ "error": "El viaje cambio de estado mientras se procesaba tu pedido: volve a cargarlo" }` | Carrera (lo cancelaron o lo desvincularon en ese instante) |
 
-Emite `viaje:iniciado` y `viaje:estado_cambiado` a la PyME.
+Emite `viaje:iniciado` y `viaje:estado_cambiado` a la PyME. Desde la Tarea 5, iniciar arma el
+[cierre automático](#cierre-automático) del viaje (fin del día).
 
 ---
 
@@ -5151,9 +5154,13 @@ El chofer **sale de la parada en la que está** (Paso 3). Sin body. Guarda `sali
 de esa parada.
 
 - Desde `CARGANDO` (parada 1) o `DESCARGANDO` (cualquier otra) → **`EN_RUTA`** si quedan paradas.
-- Desde la **última** parada → **`FINALIZADO`**: el cierre de siempre (precio real, remito, distancia
-  real) más los tiempos reales. Emite `viaje:finalizado`.
+- Desde la **última** parada → **`FINALIZADO`** (`cerrado_por: "CHOFER"`): el cierre de siempre
+  (precio real, remito, distancia real) más los tiempos reales. Emite `viaje:finalizado`.
 - No valida proximidad: salir es irse.
+- **Salida detectada por GPS (Tarea 5):** si el GPS ya detectó la salida de esa parada **antes** del
+  toque, `salida_real` es la hora detectada y `origen_salida` es `"GPS"`; si no, `salida_real` es la
+  hora del toque y `origen_salida` es `"CHOFER"`. El manejo del tramo siguiente parte de esa
+  `salida_real`. Ver [Detección de salida](#detección-de-salida-por-gps).
 
 **Autenticación:** Requerida — rol `CONDUCTOR`, el chofer asignado.
 
@@ -5165,6 +5172,19 @@ de esa parada.
   "id_parada": 1787,
   "estado": "EN_RUTA",
   "salida_real": "2026-10-09T21:36:19.192Z",
+  "origen_salida": "CHOFER",
+  "viaje_finalizado": false
+}
+```
+Con salida detectada antes del toque (real):
+```json
+{
+  "mensaje": "Saliste de la parada",
+  "id_viaje": 2108,
+  "id_parada": 4278,
+  "estado": "EN_RUTA",
+  "salida_real": "2026-10-23T20:42:36.329Z",
+  "origen_salida": "GPS",
   "viaje_finalizado": false
 }
 ```
@@ -5176,6 +5196,7 @@ de esa parada.
   "id_parada": 1788,
   "estado": "FINALIZADO",
   "salida_real": "2026-10-09T21:36:23.652Z",
+  "origen_salida": "CHOFER",
   "viaje_finalizado": true,
   "precio_real": 6.013888888888889,
   "remito_url": "https://pub-259e35cb295345b4b029cc3b28a349e8.r2.dev/remitos/883.pdf",
@@ -5200,6 +5221,7 @@ de esa parada.
 | 400 | `{ "error": "No estas en ninguna parada: confirma la llegada a la siguiente antes de salir" }` | El viaje está `EN_RUTA` |
 | 400 | `{ "error": "No se puede salir de una parada en un viaje en estado CONFIRMADO" }` | No está en curso |
 | 404 | `{ "error": "Viaje no encontrado" }` | No es su viaje |
+| 409 | `{ "error": "El viaje ya fue cerrado por la empresa" }` / `{ "error": "El viaje ya fue cerrado automaticamente" }` | La PyME lo [finalizó](#post-apiorganizacionesidviajesidviajefinalizar) o se [cerró solo](#cierre-automático) (también si pierde la carrera contra ese cierre) |
 | 409 | `{ "error": "El viaje cambio de estado mientras se procesaba tu pedido: volve a cargarlo" }` | Carrera (doble "salir", o lo cancelaron en ese instante) |
 
 Emite `viaje:estado_cambiado` (con `id_parada`) a la PyME.
@@ -5272,6 +5294,9 @@ personal. Todos los payloads traen `id_viaje` e `id_organizacion`.
 | `mapa:actualizar`, `costo:actualizar`, `eta:actualizar`, `alerta:desvio`, `alerta:parada`, `ruta:recalculada` | PyME | Tracking en vivo de sus viajes en curso |
 | `serie:asignada` (Paso 4) | PyME + chofer | Al crear una serie: **un** evento con todos sus viajes. Ver [Series](#websocket--serieasignada-y-seriecancelada) |
 | `serie:cancelada` (Paso 4) | PyME | Al cancelar una serie (sus viajes no cambian) |
+| `parada:salida_detectada` (Tarea 5) | PyME + chofer | El GPS detectó la salida de una parada (una vez por parada). Ver [Detección de salida](#detección-de-salida-por-gps) |
+| `viaje:cierre_habilitado` (Tarea 5) | PyME | Se habilitó el cierre manual (por tiempo o por GPS), una vez por viaje |
+| `viaje:finalizado` (Tarea 5) | PyME + **chofer** | Desde la Tarea 5 también al chofer, con `cerrado_por`, `incompleto`, `paradas_no_visitadas` y `fecha_corte_precio` |
 
 `viaje:asignado` y `viaje:vencido` tienen el mismo nombre que eventos del marketplace pero otro payload:
 en un viaje de PyME siempre traen `id_organizacion`.
@@ -5524,6 +5549,312 @@ emite `viaje:cancelado` a la PyME y al chofer. Real (recortado):
     "email": "pym1-vin-1791079343293-1@test.com"
   },
   "causa_cancelacion": null
+}
+```
+
+---
+
+## Cierre sin "Salir" y detección de salida (Tarea 5)
+
+Un viaje de PyME se cierra normalmente cuando el chofer toca [**Salir**](#post-apichoferesviajesidsalir)
+en la última parada. Si no lo toca, el viaje ya no queda abierto para siempre:
+
+1. El **GPS detecta la salida** de cada parada y avisa ("parece que ya saliste, tocá Salir").
+2. La **PyME puede finalizar** el viaje a mano una vez que el chofer llegó a la última parada y pasó la
+   hora prevista de fin, o el GPS detectó la salida.
+3. A **fin del día** el viaje se **cierra solo**.
+
+Definiciones:
+- **Hora prevista de fin** = `llegada_real` a la última parada + peón estimado de esa parada.
+- **Fin del día** = 23:59:59 (hora argentina) del día en que se inició el viaje.
+
+### Detección de salida por GPS
+
+Corre con cada ping `conductor:ubicacion` mientras el chofer está **en** una parada cuya llegada ya se
+confirmó (`CARGANDO` en la 1, `DESCARGANDO` en las demás). Solo cuentan los pings con `timestamp`
+posterior a la llegada. Si el chofer está a más de `SALIDA_DETECCION_METROS` (500 m) de la parada durante
+`SALIDA_DETECCION_SEGUNDOS` (240 s) seguidos, la parada queda con `salida_detectada` = la hora del
+**primer** ping afuera. Un ping de vuelta adentro antes de cumplirse el tiempo resetea la cuenta. Un ping
+con `timestamp` más de 60 s en el futuro respecto del server se ignora.
+
+La salida detectada **no cierra nada por sí sola**:
+- Se emite `parada:salida_detectada` al chofer y a la PyME (una vez por parada).
+- Si después el chofer toca **Salir**, `salida_real` = la detectada (`origen_salida: "GPS"`).
+- En la **última** parada, habilita el cierre manual de la PyME (`viaje:cierre_habilitado`, motivo `GPS`).
+
+`parada:salida_detectada` (real)
+```json
+{
+  "id_viaje": 2106,
+  "id_organizacion": 242,
+  "id_parada": 4275,
+  "orden": 2,
+  "salida_detectada": "2026-10-23T20:42:00.473Z",
+  "es_ultima": true,
+  "mensaje": "Parece que ya saliste de la parada 2: tocá \"Salir\""
+}
+```
+
+### POST /api/organizaciones/:id/viajes/:idViaje/finalizar
+
+La PyME **finaliza** (no cancela) un viaje en curso cuyo chofer no tocó "Salir". Sin body.
+
+**Autenticación:** Requerida — cualquier miembro activo (`RESPONSABLE` o `MIEMBRO`). Se permite con la
+PyME `SUSPENDIDA` (igual que cancelar).
+
+Solo si el chofer **ya llegó a la última parada** y se cumple al menos una:
+- pasó la **hora prevista de fin**, o
+- la última parada tiene **salida detectada** por GPS.
+
+Qué queda escrito:
+- La salida de la última parada es la detectada, si existe (`origen_salida: "GPS"`). Si no, queda
+  **vacía** y su peón **no medido** (`peon_medido: false`): no se inventa. Ese peón queda afuera de
+  `real.peon_horas`, `duracion_real` y `duracion_descarga`, y `real.peon_completo` es `false`.
+- El precio real se **corta** en la salida detectada, o si no la hay en la hora prevista de fin
+  (`fecha_corte_precio`). El precio no sigue creciendo con el GPS.
+- `cerrado_por: "ORGANIZACION"`.
+- La limpieza es la del cierre de siempre: GPS, ETA, Redis y timers.
+
+**Respuesta exitosa — 200** (real, sin salida detectada: peón no medido. `precio_real` 0 porque el test
+recorre las paradas en segundos y el acumulado GPS al corte es de un solo ping):
+```json
+{
+  "mensaje": "Viaje finalizado",
+  "id_viaje": 2105,
+  "estado": "FINALIZADO",
+  "cerrado_por": "ORGANIZACION",
+  "precio_real": 0,
+  "remito_url": "https://pub-259e35cb295345b4b029cc3b28a349e8.r2.dev/remitos/2105.pdf",
+  "salida_real": null,
+  "origen_salida": null,
+  "peon_medido": false,
+  "fecha_corte_precio": "2026-10-23T20:41:49.270Z",
+  "estimado": {
+    "manejo_horas": 0.2602777777777778,
+    "peon_horas": 1,
+    "total_horas": 1.2602777777777778,
+    "distancia_km": 4.337
+  },
+  "real": {
+    "manejo_horas": 0.0002622222222222222,
+    "peon_horas": 0.0002427777777777778,
+    "total_horas": 0.000505,
+    "distancia_km": 0,
+    "peon_completo": false
+  }
+}
+```
+Con salida detectada (real): `salida_real` = la detectada, `origen_salida: "GPS"`, `peon_medido: true`. El
+corte es el primer ping afuera: lo que el GPS siguio midiendo despues (4 s afuera) ya no suma:
+```json
+{
+  "mensaje": "Viaje finalizado",
+  "id_viaje": 2106,
+  "estado": "FINALIZADO",
+  "cerrado_por": "ORGANIZACION",
+  "precio_real": 0,
+  "remito_url": "https://pub-259e35cb295345b4b029cc3b28a349e8.r2.dev/remitos/2106.pdf",
+  "salida_real": "2026-10-23T20:42:00.473Z",
+  "origen_salida": "GPS",
+  "peon_medido": true,
+  "fecha_corte_precio": "2026-10-23T20:42:00.473Z",
+  "estimado": {
+    "manejo_horas": 0.2586111111111111,
+    "peon_horas": 1,
+    "total_horas": 1.2586111111111111,
+    "distancia_km": 4.337
+  },
+  "real": {
+    "manejo_horas": 0.0002666666666666667,
+    "peon_horas": 0.0003972222222222222,
+    "total_horas": 0.0006638888888888889,
+    "distancia_km": 0,
+    "peon_completo": true
+  }
+}
+```
+
+**Errores posibles** (en este orden):
+| Status | Body | Causa |
+|--------|------|-------|
+| 404 | `{ "error": "Viaje no encontrado" }` | No existe o es de otra PyME |
+| 409 | `{ "error": "El viaje ya fue cerrado por el chofer" }` (o `por la empresa` / `automaticamente`) | Ya está `FINALIZADO` |
+| 400 | `{ "error": "No se puede finalizar un viaje en estado CONFIRMADO" }` | No está en curso |
+| 409 | `{ "error": "El chofer todavia no llego a la ultima parada: no se puede finalizar el viaje" }` | No llegó a la última |
+| 409 | `{"error": "Todavia no se puede finalizar: el cierre manual se habilita a las 18:11 (hora prevista de fin) o cuando el GPS detecte la salida de la ultima parada"}` | Antes de la hora prevista y sin salida detectada |
+| 409 | `{ "error": "El viaje ya fue cerrado por el chofer" }` | Carrera: el chofer tocó Salir (o se cerró solo) en ese instante. Gana uno solo |
+
+Emite `viaje:finalizado` a la PyME y al chofer.
+
+### Cierre automático
+
+Todo viaje de PyME en curso (`CARGANDO`, `EN_RUTA` o `DESCARGANDO`) se **cierra solo** (`FINALIZADO`,
+`cerrado_por: "AUTOMATICO"`):
+- a fin del día;
+- si el chofer ya llegó a la última parada y la hora prevista de fin cae **después** del fin del día, a
+  la hora prevista de fin + `CIERRE_EXTENSION_MINUTOS` (2 h).
+
+Qué queda escrito:
+- **Llegó a la última:** se cierra completo, con las mismas reglas de datos que el finalizar de la PyME.
+- **No llegó:** se cierra **incompleto**. Las paradas que no visitó quedan `no_visitada: true` y el
+  bloque `cierre.incompleto` es `true`.
+- La parada en la que estaba usa su salida detectada si la hay; si no, queda vacía y su peón no medido.
+- El precio se corta así:
+  - en esa parada: en la salida detectada, o si no en la llegada + su peón estimado;
+  - manejando (`EN_RUTA`): en el menor entre el último ping y la salida de la parada anterior + el
+    manejo estimado del tramo, y nunca antes de esa salida.
+
+Emite `viaje:finalizado` a la PyME y al chofer. No hay pollers: hay un timer por viaje (armado al
+iniciar y re-armado al llegar a la última), un barrido al arrancar el server y un chequeo perezoso
+antes de las lecturas y acciones de la PyME y del chofer.
+
+Cualquier acción del chofer sobre un viaje cerrado por la empresa o por el automático (`salir`,
+`confirmar-parada`) da `409` con `"El viaje ya fue cerrado por la empresa"` /
+`"El viaje ya fue cerrado automaticamente"`. Los pings GPS de un viaje cerrado se ignoran sin error.
+
+### Campos nuevos en el viaje
+
+Las listas y el detalle de la PyME y del chofer suman el bloque **`cierre`** (real, en la última parada
+antes de la hora prevista):
+```json
+"cierre": {
+  "cerrado_por": null,
+  "incompleto": false,
+  "cierre_manual_desde": "2026-10-23T21:11:33.713Z",
+  "cierre_manual_habilitado": false,
+  "motivo_habilitacion": null,
+  "hora_prevista_fin": "2026-10-23T21:11:33.713Z",
+  "salida_detectada": null,
+  "cierre_automatico_en": "2026-10-24T02:59:59.000Z",
+  "fecha_corte_precio": null
+}
+```
+| Campo | Qué es |
+|---|---|
+| `cerrado_por` | `CHOFER` (Salir) / `ORGANIZACION` (finalizar) / `AUTOMATICO`. `null` si no está `FINALIZADO` o es anterior a este cambio |
+| `incompleto` | `true` si se cerró solo sin que el chofer llegara a la última parada |
+| `cierre_manual_desde` | Desde cuándo la PyME puede finalizar: `min(hora prevista de fin, salida detectada de la última)`. `null` si no llegó a la última o si no está en curso |
+| `cierre_manual_habilitado` | `true` si ese momento ya pasó |
+| `motivo_habilitacion` | `TIEMPO` / `GPS` (lo que lo habilitó primero), si está habilitado |
+| `hora_prevista_fin` | `llegada_real` a la última + su peón estimado |
+| `salida_detectada` | La salida detectada de la **última** parada, si hay |
+| `cierre_automatico_en` | Cuándo se va a cerrar solo, si está en curso |
+| `fecha_corte_precio` | En qué instante terminó la medición del precio real (cuando está `FINALIZADO`) |
+
+Cada parada suma `salida_detectada`, `origen_salida` (`CHOFER` / `GPS`), `no_visitada` y `peon_medido`:
+- `true`: se midió;
+- `false`: el viaje terminó sin salida ni peón (no medido, excluido de las métricas);
+- `null`: no llegó, o todavía está en la parada.
+
+El bloque `real` suma `peon_completo` (`false` si alguna parada visitada quedó sin peón medido). La fila
+del viaje trae también las columnas `cerrado_por` y `fecha_corte_precio`.
+
+`viaje:cierre_habilitado` (solo a la PyME, una vez por viaje; real, por TIEMPO)
+```json
+{
+  "id_viaje": 2105,
+  "id_organizacion": 242,
+  "motivo": "TIEMPO",
+  "cierre_manual_desde": "2026-10-23T20:41:49.270Z",
+  "hora_prevista_fin": "2026-10-23T20:41:49.270Z",
+  "salida_detectada": null
+}
+```
+Por GPS (real):
+```json
+{
+  "id_viaje": 2106,
+  "id_organizacion": 242,
+  "motivo": "GPS",
+  "cierre_manual_desde": "2026-10-23T20:42:00.473Z",
+  "hora_prevista_fin": "2026-10-23T21:11:59.806Z",
+  "salida_detectada": "2026-10-23T20:42:00.473Z"
+}
+```
+
+`viaje:finalizado` suma `cerrado_por`, `incompleto`, `paradas_no_visitadas` (ids) y
+`fecha_corte_precio`. Cada parada del evento suma `salida_detectada`, `origen_salida`, `no_visitada` y
+`peon_medido`.
+
+`viaje:finalizado` de un cierre automatico **incompleto** (real). El chofer salio de la parada 1, mando
+un ping manejando y no llego a la 2. El corte es ese ping (el minimo entre el ultimo ping y la salida
++ el manejo estimado del tramo). `real.manejo_horas` es justo salida de la 1 -> corte: el tramo en curso
+suma al manejo. `precio_real` da 0 porque el acumulado GPS al corte es de un solo ping:
+```json
+{
+  "id_viaje": 2363,
+  "precio_real": 0,
+  "desglose": {
+    "precio_por_tiempo": 0,
+    "precio_por_distancia": null,
+    "tiempo_horas": 0,
+    "distancia_km": 0,
+    "tiempo_capital": 0,
+    "distancia_provincia": null,
+    "tarifa_hora": 3500,
+    "tarifa_km": null
+  },
+  "remito_url": "https://pub-259e35cb295345b4b029cc3b28a349e8.r2.dev/remitos/2363.pdf",
+  "duracion_real": null,
+  "duracion_carga": 0,
+  "duracion_descarga": null,
+  "duracion_aproximacion_origen": 0,
+  "puntualidad_inicio": "A_TIEMPO",
+  "estimado": {
+    "manejo_horas": 0.2088888888888889,
+    "peon_horas": 1,
+    "total_horas": 1.208888888888889,
+    "distancia_km": 4.337
+  },
+  "real": {
+    "manejo_horas": 0.0002033333333333333,
+    "peon_horas": 0.0002069444444444444,
+    "total_horas": 0.00041027777777777775,
+    "distancia_km": 0,
+    "peon_completo": true
+  },
+  "paradas": [
+    {
+      "id_parada": 4797,
+      "orden": 1,
+      "llegada_estimada": "2026-10-24T03:05:59.884Z",
+      "salida_estimada": "2026-10-24T03:35:59.884Z",
+      "llegada_real": "2026-10-24T03:04:02.342Z",
+      "salida_real": "2026-10-24T03:04:03.087Z",
+      "salida_detectada": null,
+      "origen_salida": "CHOFER",
+      "no_visitada": false,
+      "peon_medido": true,
+      "peon_estimado_min": 30,
+      "manejo_estimado_min": null,
+      "peon_real_min": 0,
+      "manejo_real_min": null,
+      "diferencia_min": -2
+    },
+    {
+      "id_parada": 4798,
+      "orden": 2,
+      "llegada_estimada": "2026-10-24T03:48:31.884Z",
+      "salida_estimada": "2026-10-24T04:18:31.884Z",
+      "llegada_real": null,
+      "salida_real": null,
+      "salida_detectada": null,
+      "origen_salida": null,
+      "no_visitada": true,
+      "peon_medido": null,
+      "peon_estimado_min": 30,
+      "manejo_estimado_min": 13,
+      "peon_real_min": null,
+      "manejo_real_min": null,
+      "diferencia_min": null
+    }
+  ],
+  "cerrado_por": "AUTOMATICO",
+  "incompleto": true,
+  "paradas_no_visitadas": [
+    4798
+  ],
+  "fecha_corte_precio": "2026-10-24T03:04:03.819Z"
 }
 ```
 

@@ -124,6 +124,24 @@ enum CausaCancelacion {
   DESVINCULACION
 }
 
+// ── Cierre sin "Salir" (Tarea 5) ──
+
+// Quien cerro (FINALIZADO) un viaje del ciclo interno: el chofer con "Salir" en
+// la ultima parada, la PyME con "finalizar", o el cierre automatico de fin del
+// dia. null en los viajes legacy y en los internos anteriores a este cambio.
+enum CierreViaje {
+  CHOFER
+  ORGANIZACION
+  AUTOMATICO
+}
+
+// De donde salio Parada.salida_real: el toque de "Salir" (CHOFER) o la salida
+// detectada por GPS antes del toque (GPS).
+enum OrigenSalida {
+  CHOFER
+  GPS
+}
+
 // ── Viajes recurrentes (Paso 4) ──
 
 // DIAS_SEMANA usa dias_semana (ISO, 1 = lunes ... 7 = domingo), SEMANAL usa
@@ -634,7 +652,15 @@ model Viaje {
   // reasignar o cancelar el viaje NO toca la serie ni a los otros viajes.
   id_serie              Int?
 
-  cliente             Cliente                @relation(fields: [id_cliente], references: [id_cliente])
+  // ── Cierre sin "Salir" (Tarea 5) ──
+  // Nullable: legacy y viajes anteriores no las tienen.
+  // cerrado_por: quien cerro un FINALIZADO interno (ver CierreViaje).
+  // fecha_corte_precio: el instante en que termino la medicion del precio real
+  // (cierre-plan.js). En el flujo normal es la salida de la ultima parada.
+  cerrado_por           CierreViaje?
+  fecha_corte_precio    DateTime?
+
+  cliente             Cliente               @relation(fields: [id_cliente], references: [id_cliente])
   organizacion        Organizacion?          @relation(fields: [id_organizacion], references: [id_organizacion])
   creador             Usuario?               @relation("ViajesCreados", fields: [id_creador], references: [id_usuario])
   conductor           Conductor?             @relation(fields: [id_conductor], references: [id_conductor])
@@ -721,6 +747,19 @@ model Parada {
   // despues no cambia el viaje. El NOMBRE del lugar no se copia: la PyME lo ve
   // por join y el chofer nunca (ver vista-parada.js).
   id_lugar              Int?
+
+  // ── Cierre sin "Salir" (Tarea 5) ──
+  // salida_detectada: hora del PRIMER ping GPS afuera de la parada (a mas de
+  // SALIDA_DETECCION_METROS durante SALIDA_DETECCION_SEGUNDOS). Una vez por
+  // parada. No cierra nada por si sola (ver salida-deteccion.service.js).
+  // origen_salida: CHOFER (toque de "Salir") o GPS (la detectada, anterior al
+  // toque o usada por un cierre sin "Salir").
+  // no_visitada: true si el cierre automatico llego sin que el chofer llegara a
+  // esta parada. Columna y no valor de EstadoParada: agregar un valor a un enum
+  // con la DB compartida rompe al Prisma del deploy viejo.
+  salida_detectada      DateTime?
+  origen_salida         OrigenSalida?
+  no_visitada           Boolean?
 
   viaje Viaje  @relation(fields: [id_viaje], references: [id_viaje])
   lugar Lugar? @relation(fields: [id_lugar], references: [id_lugar], onDelete: SetNull)

@@ -26,6 +26,7 @@ import {
   editarViaje,
   reasignarViaje,
   cancelarViajePyme,
+  finalizarViajePyme,
   costoAcumulado,
   remito,
 } from '../controllers/viajes-internos.controller.js';
@@ -65,6 +66,9 @@ router.get('/:id/viajes/:idViaje', requireMiembro, obtenerViaje);
 router.put('/:id/viajes/:idViaje', requireMiembro, editarViaje);
 router.post('/:id/viajes/:idViaje/reasignar', requireMiembro, reasignarViaje);
 router.post('/:id/viajes/:idViaje/cancelar', requireMiembro, cancelarViajePyme);
+// Tarea 5: finalizar a mano un viaje cuyo chofer no toco "Salir" en la ultima
+// parada (RESPONSABLE y MIEMBRO).
+router.post('/:id/viajes/:idViaje/finalizar', requireMiembro, finalizarViajePyme);
 router.get('/:id/viajes/:idViaje/costo-acumulado', requireMiembro, costoAcumulado);
 router.get('/:id/viajes/:idViaje/remito', requireMiembro, remito);
 

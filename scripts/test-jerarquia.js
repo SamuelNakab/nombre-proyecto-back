@@ -283,7 +283,7 @@ async function main() {
   console.log('\n── CASO 8: timeout de reserva → republica a un tardio ────────\n');
   await conServer(
     // MARKETPLACE en true: el .env lo tiene dormido y este es el ciclo legacy.
-    { RESERVA_TIMEOUT_MINUTOS: '0.1', RESERVA_BARRIDO_ARRANQUE: '0', VENCIMIENTO_BARRIDO_ARRANQUE: '0', MARKETPLACE_HABILITADO: 'true' },
+    { RESERVA_TIMEOUT_MINUTOS: '0.1', RESERVA_BARRIDO_ARRANQUE: '0', VENCIMIENTO_BARRIDO_ARRANQUE: '0', CIERRE_BARRIDO_ARRANQUE: '0', MARKETPLACE_HABILITADO: 'true' },
     3210,
     async (base8) => {
       const v8 = await crearViaje(clienteToken, [], base8);

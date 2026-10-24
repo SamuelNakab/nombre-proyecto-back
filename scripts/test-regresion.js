@@ -27,6 +27,7 @@ const SUITES = [
   { archivo: 'test-viaje-interno.js', timeoutMin: 30 },
   { archivo: 'test-maps.js', timeoutMin: 10 },
   { archivo: 'test-lugares-series.js', timeoutMin: 25 },
+  { archivo: 'test-cierre-viaje.js', timeoutMin: 15 },
   { archivo: 'test-fase5.js', timeoutMin: 5 },
   { archivo: 'test-cancelacion-conductor.js', timeoutMin: 5 },
   { archivo: 'test-cancelacion-cliente.js', timeoutMin: 5 },
@@ -56,6 +57,7 @@ const ENV_SERVER = {
   CALIFICACIONES_HABILITADAS: 'true',
   RESERVA_BARRIDO_ARRANQUE: '0',
   VENCIMIENTO_BARRIDO_ARRANQUE: '0',
+  CIERRE_BARRIDO_ARRANQUE: '0',
 };
 
 const DIR_SCRIPTS = path.dirname(fileURLToPath(import.meta.url));

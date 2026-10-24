@@ -30,13 +30,18 @@ import {
   conEstimacionPorParada,
 } from './estimacion.service.js';
 import { escribirRealesInterno, guardarMedicionParcial } from './medicion-real.service.js';
-import { cerrarViaje } from './cierre.service.js';
+import { cerrarViajeInterno } from './cierre.service.js';
+import { elegirSalidaReal } from './cierre-plan.js';
+import { configCierre, cierreManualDesde, momentoCierreAutomatico, llegoALaUltima } from './cierre-fechas.js';
+import { ponerAlDia, cerrarSiCorresponde, reprogramarCierres } from './cierre-automatico.service.js';
 import { recalcularEtaInmediato } from './eta-emisor.js';
 import { guardarRutaPlaneada, obtenerRutaPlaneada } from './ruta.service.js';
 import { registrarCambioEstado, INCLUDE_HISTORIAL } from './historial-estado.service.js';
 import {
   validarTransicion,
   ESTADOS_TERMINALES,
+  ESTADOS_EN_CURSO,
+  ESTADOS_CURSO_INTERNO,
   ESTADOS_PRE_INICIO_INTERNO,
   ESTADOS_EN_PARADA_INTERNO,
   ORIGEN_HISTORIAL,
@@ -81,7 +86,6 @@ export const ESTADOS_INTERNOS = [
   'VENCIDO',
 ];
 
-const ESTADOS_CURSO_INTERNO = ['CARGANDO', 'EN_RUTA', 'DESCARGANDO'];
 const NO_FINALES = ESTADOS_INTERNOS.filter((e) => !ESTADOS_TERMINALES.includes(e));
 
 // Filtros por grupo de las listas. La PyME y el chofer ven grupos distintos.
@@ -213,6 +217,40 @@ function mensajeEstado(accion, estado) {
   return `No se puede ${accion} un viaje en estado ${estado}`;
 }
 
+// Un viaje FINALIZADO, segun quien lo cerro (Tarea 5).
+const MENSAJE_CERRADO = {
+  CHOFER: 'El viaje ya fue cerrado por el chofer',
+  ORGANIZACION: 'El viaje ya fue cerrado por la empresa',
+  AUTOMATICO: 'El viaje ya fue cerrado automaticamente',
+};
+const mensajeYaCerrado = (cerrado_por) => MENSAJE_CERRADO[cerrado_por] ?? 'El viaje ya fue finalizado';
+
+// El chofer accionando sobre un viaje que cerro OTRO (la empresa o el
+// automatico): 409 con el motivo. Los cerrados por el mismo chofer siguen con
+// sus 400 de siempre.
+function exigirNoCerradoPorOtro(viaje) {
+  if (viaje?.estado === 'FINALIZADO' && ['ORGANIZACION', 'AUTOMATICO'].includes(viaje.cerrado_por)) {
+    throw new ErrorNegocio(409, mensajeYaCerrado(viaje.cerrado_por));
+  }
+}
+
+// La accion perdio la carrera (count 0 en la tx): si fue contra un cierre, el
+// 409 dice quien lo cerro; si no, el conflicto generico.
+async function conflictoTrasCarrera(id_viaje) {
+  const v = await prisma.viaje.findUnique({ where: { id_viaje }, select: { estado: true, cerrado_por: true } });
+  if (v?.estado === 'FINALIZADO') return new ErrorNegocio(409, mensajeYaCerrado(v.cerrado_por));
+  return conflicto();
+}
+
+// Para POST /api/viajes/:id/confirmar-parada de un viaje interno (Tarea 5): el
+// chequeo perezoso del cierre automatico y el 409 si ya lo cerro la empresa o el
+// automatico. Va despues del 403 y antes de las validaciones de la parada.
+export async function exigirViajeAbiertoChofer(io, id_viaje) {
+  await cerrarSiCorresponde(io, { id_viaje });
+  const v = await prisma.viaje.findUnique({ where: { id_viaje }, select: { estado: true, cerrado_por: true } });
+  exigirNoCerradoPorOtro(v);
+}
+
 export async function guardarRutaSinTirar(id_viaje, polilinea) {
   try {
     return await guardarRutaPlaneada(id_viaje, polilinea);
@@ -236,11 +274,33 @@ const remitoUrl = (id_viaje) => `${process.env.R2_PUBLIC_URL}/remitos/${id_viaje
 //
 // DOS vistas (Paso 4): la PyME ve el lugar guardado de cada parada (su nombre
 // actual); el chofer NO: sus paradas salen sin lugar ni id_lugar.
+// Bloque `cierre` (Tarea 5): quien cerro, si quedo incompleto, desde cuando la
+// PyME puede finalizar a mano (y por que) y cuando se cierra solo. Los campos
+// "en vivo" (cierre manual, cierre automatico) son null fuera de curso.
+function bloqueCierre(viaje) {
+  const cfg = configCierre();
+  const enCurso = ESTADOS_CURSO_INTERNO.includes(viaje.estado);
+  const manual = enCurso ? cierreManualDesde(viaje.paradas, cfg) : null;
+  const habilitado = Boolean(manual?.desde) && manual.desde.getTime() <= Date.now();
+  return {
+    cerrado_por: viaje.cerrado_por ?? null,
+    incompleto: viaje.estado === 'FINALIZADO' && viaje.paradas.some((p) => p.no_visitada === true),
+    cierre_manual_desde: manual?.desde ?? null,
+    cierre_manual_habilitado: habilitado,
+    motivo_habilitacion: habilitado ? manual.motivo : null,
+    hora_prevista_fin: manual?.hora_prevista_fin ?? null,
+    salida_detectada: manual?.salida_detectada ?? null,
+    cierre_automatico_en: enCurso && viaje.fecha_inicio ? momentoCierreAutomatico(viaje, cfg) : null,
+    fecha_corte_precio: viaje.fecha_corte_precio ?? null,
+  };
+}
+
 function serializarViaje(viaje, vistaParada) {
   const { condiciones_req, conductor, ...resto } = viaje;
+  const terminado = ESTADOS_TERMINALES.includes(viaje.estado);
   return {
     ...resto,
-    paradas: paradasConTiempos(viaje.paradas).map(vistaParada),
+    paradas: paradasConTiempos(viaje.paradas, { terminado }).map(vistaParada),
     ...bloqueTiempos(viaje),
     condiciones_requeridas: condiciones_req.map((c) => c.condicion),
     conductor: conductor
@@ -255,6 +315,7 @@ function serializarViaje(viaje, vistaParada) {
     duracion_estimada: horasAMinutos(viaje.duracion_estimada_horas),
     ...calcularMetricasViaje(viaje),
     vencido: esViajeVencido(viaje),
+    cierre: bloqueCierre(viaje),
     remito_url: viaje.estado === 'FINALIZADO' ? remitoUrl(viaje.id_viaje) : null,
   };
 }
@@ -308,7 +369,7 @@ function filtroEstado({ estado, grupo }, grupos) {
 // La PyME ve TODOS los viajes de su organizacion (scoping por id_organizacion,
 // nunca por usuario). Antes de leer, chequeo perezoso de vencimiento.
 export async function listarViajesOrganizacion(io, id_organizacion, filtros = {}) {
-  await vencerSiCorresponde(io, { id_organizacion });
+  await ponerAlDia(io, { id_organizacion });
   const viajes = await prisma.viaje.findMany({
     where: { id_organizacion, ...filtroEstado(filtros, GRUPOS_PYME) },
     include: INCLUDE_VIAJE_INTERNO,
@@ -325,7 +386,7 @@ async function viajeDeOrganizacion(id_organizacion, id_viaje, include = INCLUDE_
 }
 
 export async function obtenerViajeOrganizacion(io, id_organizacion, id_viaje) {
-  await vencerSiCorresponde(io, { id_viaje, id_organizacion });
+  await ponerAlDia(io, { id_viaje, id_organizacion });
   const viaje = await viajeDeOrganizacion(id_organizacion, id_viaje);
   return { ...serializarViajePyme(viaje), ruta_planeada: await obtenerRutaPlaneada(id_viaje) };
 }
@@ -334,7 +395,7 @@ export async function obtenerViajeOrganizacion(io, id_organizacion, id_viaje) {
 // nombre de la PyME (organizacion.nombre).
 export async function listarViajesChofer(io, id_usuario, filtros = {}) {
   const id_conductor = await conductorDe(id_usuario);
-  await vencerSiCorresponde(io, { id_conductor });
+  await ponerAlDia(io, { id_conductor });
   const viajes = await prisma.viaje.findMany({
     where: {
       id_conductor,
@@ -358,7 +419,7 @@ async function viajeDeChofer(id_conductor, id_viaje, include = INCLUDE_VIAJE_INT
 
 export async function obtenerViajeChofer(io, id_usuario, id_viaje) {
   const id_conductor = await conductorDe(id_usuario);
-  await vencerSiCorresponde(io, { id_viaje, id_conductor });
+  await ponerAlDia(io, { id_viaje, id_conductor });
   const viaje = await viajeDeChofer(id_conductor, id_viaje);
   return { ...serializarViajeChofer(viaje), ruta_planeada: await obtenerRutaPlaneada(id_viaje) };
 }
@@ -573,6 +634,29 @@ export async function rechazarViaje({ io, id_usuario, id_viaje }) {
   return { mensaje: 'Viaje rechazado', id_viaje, estado: 'RECHAZADO', fecha_rechazo: ahora };
 }
 
+// El otro viaje EN CURSO del chofer (cualquier ciclo), o null.
+async function otroViajeEnCurso(db, id_conductor, id_viaje) {
+  const otro = await db.viaje.findFirst({
+    where: { id_conductor, id_viaje: { not: id_viaje }, estado: { in: ESTADOS_EN_CURSO } },
+    select: { id_viaje: true },
+  });
+  return otro?.id_viaje ?? null;
+}
+
+function mensajeOtroEnCurso(id_otro) {
+  return `Ya tenes un viaje en curso (#${id_otro}): terminalo antes de iniciar otro`;
+}
+
+// Los timers de cierre son best-effort: el barrido y el chequeo perezoso cubren
+// lo que un fallo aca deje sin armar.
+async function reprogramarCierresSinTirar(io, id_viaje, opciones) {
+  try {
+    await reprogramarCierres(io, id_viaje, opciones);
+  } catch (err) {
+    console.error(`[viaje-interno] viaje ${id_viaje}: no se pudieron programar los cierres: ${err.message}`);
+  }
+}
+
 // Iniciar: CONFIRMADO -> CARGANDO directo (el ciclo interno no tiene
 // EN_CAMINO_A_ORIGEN). Exige estar dentro de la ventana Y a <=
 // RADIO_CONFIRMACION_METROS del origen (la parada de orden 1), con la MISMA
@@ -581,6 +665,9 @@ export async function rechazarViaje({ io, id_usuario, id_viaje }) {
 export async function iniciarViajeInterno({ io, id_usuario, id_viaje, lat, lng }) {
   const id_conductor = await conductorDe(id_usuario);
   await vencerSiCorresponde(io, { id_viaje, id_conductor });
+  // Antes del chequeo de "otro viaje en curso": un viaje de ayer que se quedo
+  // colgado se cierra solo aca y no bloquea el de hoy.
+  await cerrarSiCorresponde(io, { id_conductor });
   const viaje = await viajeDeChofer(id_conductor, id_viaje, {
     paradas: { orderBy: { orden: 'asc' } },
   });
@@ -601,6 +688,12 @@ export async function iniciarViajeInterno({ io, id_usuario, id_viaje, lat, lng }
     throw new ErrorNegocio(400, mensajeEstado('iniciar', viaje.estado));
   }
   validarTransicion(viaje.estado, 'CARGANDO', { ciclo: 'INTERNO', quien: 'CHOFER' });
+
+  // Un chofer no puede tener dos viajes en curso (de ningun ciclo). Caso
+  // secuencial aca; la carrera (dos iniciar a la vez) la cierra el lock del
+  // chofer en la tx.
+  const otro = await otroViajeEnCurso(prisma, id_conductor, id_viaje);
+  if (otro) throw new ErrorNegocio(409, mensajeOtroEnCurso(otro));
 
   const ahora = new Date();
   const fallas = [];
@@ -631,6 +724,12 @@ export async function iniciarViajeInterno({ io, id_usuario, id_viaje, lat, lng }
 
   const limite = fechaProgramadaLimiteVencimiento(ahora, despues);
   await transaccion(async (tx) => {
+    // Lock del chofer: serializa los iniciar del MISMO chofer. Orden de locks
+    // chofer -> viaje; nadie mas bloquea la fila del conductor.
+    await tx.$queryRaw`SELECT id_conductor FROM conductores WHERE id_conductor = ${id_conductor} FOR UPDATE`;
+    const enCurso = await otroViajeEnCurso(tx, id_conductor, id_viaje);
+    if (enCurso) throw new ErrorNegocio(409, mensajeOtroEnCurso(enCurso));
+
     const r = await tx.viaje.updateMany({
       where: {
         id_viaje,
@@ -666,8 +765,9 @@ export async function iniciarViajeInterno({ io, id_usuario, id_viaje, lat, lng }
     origen: ORIGEN_HISTORIAL.CHOFER,
     fecha: ahora,
   });
-  // Arranco: ya no puede vencer.
+  // Arranco: ya no puede vencer. Desde ahora se cierra solo a fin del dia.
   cancelarAvisoVencimiento(id_viaje);
+  await reprogramarCierresSinTirar(io, id_viaje);
 
   if (io) {
     const salas = salasDeViaje(viaje);
@@ -712,9 +812,16 @@ const ordenadas = (paradas) => [...paradas].sort((a, b) => a.orden - b.orden);
 // FINALIZADO (el cierre de siempre: precio real, remito, distancia real).
 // GUARD: el estado leido Y la parada abierta (salida_real null) en el WHERE; dos
 // "salir" a la vez o un salir contra una cancelacion: gana uno, el otro 409.
+//
+// Tarea 5: si el GPS detecto la salida de esa parada ANTES del toque, la
+// salida_real es la detectada (origen GPS); si no, el toque (origen CHOFER). El
+// manejo del tramo siguiente parte de esa salida_real. Sobre un viaje que ya
+// cerro la empresa o el automatico -> 409.
 export async function salirDeParada({ io, id_usuario, id_viaje }) {
   const id_conductor = await conductorDe(id_usuario);
+  await cerrarSiCorresponde(io, { id_viaje, id_conductor });
   const viaje = await viajeDeChofer(id_conductor, id_viaje, { paradas: { orderBy: { orden: 'asc' } } });
+  exigirNoCerradoPorOtro(viaje);
 
   if (!ESTADOS_EN_PARADA_INTERNO.includes(viaje.estado)) {
     if (viaje.estado === 'EN_RUTA') {
@@ -734,16 +841,19 @@ export async function salirDeParada({ io, id_usuario, id_viaje }) {
   const ahora = new Date();
 
   if (!quedan) {
-    // Ultima parada: el cierre escribe la salida, los reales y FINALIZADO en
-    // UNA transaccion. null = perdio la carrera (otro salir, una cancelacion).
-    const cierre = await cerrarViaje(id_viaje, io, actor, { paradaQueSale: abierta.id_parada, ahora });
-    if (!cierre) throw conflicto();
+    // Ultima parada: el cierre (modo CHOFER) elige la salida (GPS o toque) y
+    // escribe la salida, los reales y FINALIZADO en UNA transaccion. null =
+    // perdio la carrera (otro salir, el finalizar de la PyME, el automatico, una
+    // cancelacion).
+    const cierre = await cerrarViajeInterno({ io, id_viaje, modo: 'CHOFER', actor, ahora });
+    if (!cierre) throw await conflictoTrasCarrera(id_viaje);
     return {
       mensaje: 'Viaje finalizado',
       id_viaje,
       id_parada: abierta.id_parada,
       estado: 'FINALIZADO',
-      salida_real: ahora,
+      salida_real: cierre.salida.fecha,
+      origen_salida: cierre.salida.origen,
       viaje_finalizado: true,
       precio_real: cierre.precio_real,
       remito_url: cierre.remito_url,
@@ -752,26 +862,37 @@ export async function salirDeParada({ io, id_usuario, id_viaje }) {
     };
   }
 
-  await transaccion(async (tx) => {
-    const r = await tx.viaje.updateMany({
-      where: { id_viaje, id_conductor, estado: viaje.estado },
-      data: { estado: 'EN_RUTA' },
-    });
-    if (r.count === 0) throw conflicto();
-    const p = await tx.parada.updateMany({
-      where: { id_parada: abierta.id_parada, id_viaje, salida_real: null },
-      data: { salida_real: ahora },
-    });
-    if (p.count === 0) throw conflicto();
-    // Peon de esta parada y totales del viaje, con las paradas frescas.
-    const frescas = await tx.parada.findMany({
-      where: { id_viaje },
-      select: { id_parada: true, orden: true, llegada_real: true, salida_real: true },
-    });
-    await escribirRealesInterno(tx, id_viaje, frescas);
+  const { salida_real, origen_salida } = elegirSalidaReal({
+    salida_detectada: abierta.salida_detectada,
+    toque: ahora,
   });
 
-  await registrarCambioEstado({ id_viaje, estado: 'EN_RUTA', ...actor, fecha: ahora });
+  try {
+    await transaccion(async (tx) => {
+      const r = await tx.viaje.updateMany({
+        where: { id_viaje, id_conductor, estado: viaje.estado },
+        data: { estado: 'EN_RUTA' },
+      });
+      if (r.count === 0) throw conflicto();
+      const p = await tx.parada.updateMany({
+        where: { id_parada: abierta.id_parada, id_viaje, salida_real: null },
+        data: { salida_real, origen_salida },
+      });
+      if (p.count === 0) throw conflicto();
+      // Peon de esta parada y totales del viaje, con las paradas frescas.
+      const frescas = await tx.parada.findMany({
+        where: { id_viaje },
+        select: { id_parada: true, orden: true, llegada_real: true, salida_real: true },
+      });
+      await escribirRealesInterno(tx, id_viaje, frescas);
+    });
+  } catch (err) {
+    if (err instanceof ErrorNegocio && err.status === 409) throw await conflictoTrasCarrera(id_viaje);
+    throw err;
+  }
+
+  // El mismo instante que la salida de la parada (la detectada, si fue GPS).
+  await registrarCambioEstado({ id_viaje, estado: 'EN_RUTA', ...actor, fecha: salida_real });
 
   if (io) {
     const salas = salasDeViaje(viaje);
@@ -791,7 +912,8 @@ export async function salirDeParada({ io, id_usuario, id_viaje }) {
     id_viaje,
     id_parada: abierta.id_parada,
     estado: 'EN_RUTA',
-    salida_real: ahora,
+    salida_real,
+    origen_salida,
     viaje_finalizado: false,
   };
 }
@@ -864,6 +986,12 @@ export async function confirmarParadaInterna({ io, viaje, parada, id_usuario, la
     origen: ORIGEN_HISTORIAL.CHOFER,
     fecha: ahora,
   });
+
+  // Llego a la ULTIMA: el cierre automatico puede correrse (si la hora prevista
+  // de fin cae despues del fin del dia) y se arma el aviso de "cierre manual
+  // habilitado" para la hora prevista de fin.
+  const esUltima = !paradas.some((p) => p.id_parada !== parada.id_parada && !p.llegada_real);
+  if (esUltima) await reprogramarCierresSinTirar(io, viaje.id_viaje, { avisarSiYaPaso: true });
 
   if (io) {
     const salas = salasDeViaje(viaje);
@@ -971,11 +1099,66 @@ export async function cancelarViajeChofer({ io, id_usuario, id_viaje }) {
 }
 
 export async function cancelarViajeOrganizacion({ io, id_organizacion, id_usuario, id_viaje, motivo }) {
-  await vencerSiCorresponde(io, { id_viaje, id_organizacion });
+  await ponerAlDia(io, { id_viaje, id_organizacion });
   const viaje = await viajeDeOrganizacion(id_organizacion, id_viaje, {
     conductor: { select: { id_usuario: true } },
   });
   return cancelar({ io, viaje, quien: 'PYME', id_usuario, motivo });
+}
+
+// ─── PyME: finalizar (Tarea 5) ───────────────────────────────────────────────
+
+// La PyME FINALIZA a mano (no cancela) un viaje cuyo chofer no toco "Salir" en la
+// ultima parada. Solo si ya llego a la ultima y: paso la hora prevista de fin, o
+// el GPS detecto la salida de la ultima. La salida de la parada es la detectada
+// (origen GPS) o queda vacia (peon "no medido"); el precio se corta en la
+// detectada o en la hora prevista de fin (cierre-plan.js).
+// Permitido con la PyME SUSPENDIDA (es cerrar algo, como cancelar).
+export async function finalizarViajeOrganizacion({ io, id_organizacion, id_usuario, id_viaje }) {
+  await ponerAlDia(io, { id_viaje, id_organizacion });
+  const viaje = await viajeDeOrganizacion(id_organizacion, id_viaje, { paradas: { orderBy: { orden: 'asc' } } });
+
+  if (viaje.estado === 'FINALIZADO') throw new ErrorNegocio(409, mensajeYaCerrado(viaje.cerrado_por));
+  if (!ESTADOS_CURSO_INTERNO.includes(viaje.estado)) {
+    throw new ErrorNegocio(400, mensajeEstado('finalizar', viaje.estado));
+  }
+  if (!llegoALaUltima(viaje.paradas)) {
+    throw new ErrorNegocio(409, 'El chofer todavia no llego a la ultima parada: no se puede finalizar el viaje');
+  }
+  const ahora = new Date();
+  const manual = cierreManualDesde(viaje.paradas, configCierre());
+  if (manual.desde.getTime() > ahora.getTime()) {
+    throw new ErrorNegocio(
+      409,
+      `Todavia no se puede finalizar: el cierre manual se habilita a las ${horaLocal(manual.desde)} ` +
+        '(hora prevista de fin) o cuando el GPS detecte la salida de la ultima parada'
+    );
+  }
+  validarTransicion(viaje.estado, 'FINALIZADO', { ciclo: 'INTERNO', quien: 'PYME' });
+
+  const cierre = await cerrarViajeInterno({
+    io,
+    id_viaje,
+    modo: 'ORGANIZACION',
+    actor: { id_usuario },
+    ahora,
+  });
+  if (!cierre) throw await conflictoTrasCarrera(id_viaje);
+
+  return {
+    mensaje: 'Viaje finalizado',
+    id_viaje,
+    estado: 'FINALIZADO',
+    cerrado_por: 'ORGANIZACION',
+    precio_real: cierre.precio_real,
+    remito_url: cierre.remito_url,
+    salida_real: cierre.salida?.fecha ?? null,
+    origen_salida: cierre.salida?.origen ?? null,
+    peon_medido: cierre.salida !== null,
+    fecha_corte_precio: cierre.corte,
+    estimado: cierre.estimado,
+    real: cierre.real,
+  };
 }
 
 // ─── PyME: reasignar / editar ────────────────────────────────────────────────

@@ -70,6 +70,9 @@ export const ORIGEN_HISTORIAL = {
 const CANCELABLE_POR_TODOS = { quien: ['CHOFER', 'PYME', 'ADMIN', 'SISTEMA'], accion: 'cancelar' };
 const CANCELABLE_EN_CURSO = { quien: ['PYME', 'ADMIN', 'SISTEMA'], accion: 'cancelar' };
 const VENCE = { quien: ['SISTEMA'], accion: 'vencer' };
+// Cierre automatico de fin del dia sin haber llegado a la ultima parada:
+// FINALIZADO incompleto (Tarea 5). Solo el sistema.
+const CIERRE_INCOMPLETO = { quien: ['SISTEMA'], accion: 'cierre-automatico' };
 
 // desde -> hacia -> { quien, accion }.
 //
@@ -82,6 +85,9 @@ const VENCE = { quien: ['SISTEMA'], accion: 'vencer' };
 //   - salir    (CARGANDO / DESCARGANDO -> EN_RUTA): se va de la parada actual.
 //   - confirmar-parada (EN_RUTA -> DESCARGANDO): llega a la SIGUIENTE parada.
 //   - salir de la ULTIMA (DESCARGANDO -> FINALIZADO): cierra el viaje.
+// Tarea 5: si el chofer no toca "Salir", la PyME puede finalizar (DESCARGANDO
+// -> FINALIZADO) y el sistema lo cierra solo a fin del dia, desde cualquier
+// estado en curso (CARGANDO / EN_RUTA -> FINALIZADO es el cierre incompleto).
 // Cada parada queda con llegada_real y salida_real (ver medicion-real.service).
 // El PATCH /api/viajes/:id/estado NO aplica a viajes internos: todas las
 // transiciones van por estas tres acciones.
@@ -101,15 +107,20 @@ export const TRANSICIONES_INTERNO = {
   },
   CARGANDO: {
     EN_RUTA: { quien: ['CHOFER'], accion: 'salir' },
+    FINALIZADO: CIERRE_INCOMPLETO,
     CANCELADO: CANCELABLE_EN_CURSO,
   },
   EN_RUTA: {
     DESCARGANDO: { quien: ['CHOFER'], accion: 'confirmar-parada' },
+    FINALIZADO: CIERRE_INCOMPLETO,
     CANCELADO: CANCELABLE_EN_CURSO,
   },
   DESCARGANDO: {
     EN_RUTA: { quien: ['CHOFER'], accion: 'salir' },
-    FINALIZADO: { quien: ['CHOFER'], accion: 'salir' },
+    // CHOFER: "salir" de la ultima. PYME: finalizar a mano (Tarea 5). SISTEMA:
+    // cierre automatico de fin del dia (completo si estaba en la ultima parada,
+    // incompleto si no).
+    FINALIZADO: { quien: ['CHOFER', 'PYME', 'SISTEMA'], accion: 'salir/finalizar/cierre-automatico' },
     CANCELADO: CANCELABLE_EN_CURSO,
   },
   FINALIZADO: {},
@@ -122,6 +133,10 @@ export const TRANSICIONES_INTERNO = {
 // todavia no salio). En la 1 es CARGANDO; en las demas, DESCARGANDO (que desde
 // el Paso 3 significa "en una parada": carga o descarga).
 export const ESTADOS_EN_PARADA_INTERNO = ['CARGANDO', 'DESCARGANDO'];
+
+// Estados del ciclo interno en los que el viaje esta EN CURSO (arranco y no
+// termino). Son los que cierra el cierre automatico de fin del dia (Tarea 5).
+export const ESTADOS_CURSO_INTERNO = ['CARGANDO', 'EN_RUTA', 'DESCARGANDO'];
 
 // Estados del ciclo interno en los que el viaje todavia no arranco y puede
 // vencer. Son tambien los unicos en los que la PyME puede reasignar o editar.

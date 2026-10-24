@@ -117,12 +117,13 @@ function offsetMs(instanteMs, tz) {
 // Fecha + hora LOCALES de la zona -> instante (Date, UTC). Dos pasadas: la
 // primera estima el offset con la hora "ingenua"; si en el instante resultante
 // el offset es otro (un cambio de horario en el medio), se recalcula con ese.
-export function localAUtc({ anio, mes, dia, hora, minuto }, tz = ZONA_HORARIA) {
-  const ingenuo = Date.UTC(anio, mes - 1, dia, hora, minuto);
+// `segundo` es opcional (default 0): lo usa el fin del dia del cierre automatico.
+export function localAUtc({ anio, mes, dia, hora, minuto, segundo = 0 }, tz = ZONA_HORARIA) {
+  const ingenuo = Date.UTC(anio, mes - 1, dia, hora, minuto, segundo);
   const primero = offsetMs(ingenuo, tz);
   let instante = ingenuo - primero;
-  const segundo = offsetMs(instante, tz);
-  if (segundo !== primero) instante = ingenuo - segundo;
+  const segundaPasada = offsetMs(instante, tz);
+  if (segundaPasada !== primero) instante = ingenuo - segundaPasada;
   return new Date(instante);
 }
 

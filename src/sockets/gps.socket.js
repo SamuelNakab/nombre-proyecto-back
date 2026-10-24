@@ -4,12 +4,19 @@ import {
   obtenerUltimaCoordenada,
   actualizarAcumulado,
   calcularVelocidad,
+  registrarPuntoMedicion,
 } from '../services/gps.service.js';
+import { procesarPingSalida } from '../services/salida-deteccion.service.js';
+import { paradaDetectable } from '../services/salida-deteccion.js';
 import { manejarDesvio } from '../services/desvio.service.js';
 import { obtenerRutaPlaneada, calcularYGuardarRuta } from '../services/ruta.service.js';
 import { verificarParadaSospechosa, distanciaMetros } from '../services/parada.service.js';
 import { iniciarEmisorEta } from '../services/eta-emisor.js';
-import { ESTADOS_EN_CURSO, ESTADOS_TERMINALES } from '../services/estado-viaje.service.js';
+import {
+  ESTADOS_EN_CURSO,
+  ESTADOS_TERMINALES,
+  ESTADOS_EN_PARADA_INTERNO,
+} from '../services/estado-viaje.service.js';
 import { salasDeViaje } from './salas.js';
 import { relimpiarSiCerrado } from '../services/cancelacion.service.js';
 
@@ -136,6 +143,24 @@ export function registrarHandlersGPS(socket, io) {
       // las keys que acabamos de escribir quedarian huerfanas. Re-limpiar y cortar
       // sin arrancar el ETA ni emitir.
       if (await relimpiarSiCerrado(id_viaje, inicioPing)) return;
+
+      // Tarea 5, solo viajes INTERNOS. Usa las paradas que ya trajo el findUnique
+      // de arriba: CERO queries nuevas por ping.
+      //   - Puntos de medicion (Redis): para cortar el precio real en un
+      //     instante anterior al ultimo ping (salida detectada, hora prevista).
+      //   - Deteccion de salida de la parada ACTUAL, si ya se confirmo la llegada
+      //     y el viaje esta en ella (CARGANDO / DESCARGANDO). Estado en Redis;
+      //     escribe en la DB solo al detectar (una vez por parada). No cierra
+      //     nada: avisa. Nunca tira.
+      if (viaje.id_organizacion !== null) {
+        await registrarPuntoMedicion(id_viaje, timestamp, acumulado);
+        if (ESTADOS_EN_PARADA_INTERNO.includes(viaje.estado)) {
+          const abierta = viaje.paradas.find((p) => p.llegada_real && !p.salida_real);
+          if (paradaDetectable(abierta)) {
+            await procesarPingSalida(io, viaje, abierta, { lat, lng, timestamp });
+          }
+        }
+      }
 
       // El viaje tiene GPS activo: arrancamos el emisor periodico de ETA
       // (idempotente — si ya corre, no hace nada). Se detiene al cerrar/cancelar.

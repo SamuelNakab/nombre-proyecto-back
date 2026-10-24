@@ -188,7 +188,7 @@ describe('bloqueTiempos', () => {
   it('estimado siempre; real solo cuando termino', () => {
     const fin = bloqueTiempos({ estado: 'FINALIZADO', ...columnas() });
     expect(fin.estimado).toEqual({ manejo_horas: 1, peon_horas: 1.5, total_horas: 2.5, distancia_km: 12 });
-    expect(fin.real).toEqual({ manejo_horas: 1.25, peon_horas: 1, total_horas: 2.25, distancia_km: 13.4 });
+    expect(fin.real).toEqual({ manejo_horas: 1.25, peon_horas: 1, total_horas: 2.25, distancia_km: 13.4, peon_completo: null });
     expect(bloqueTiempos({ estado: 'EN_RUTA', ...columnas() }).real).toBeNull();
   });
 
@@ -220,11 +220,57 @@ describe('tiemposParada', () => {
         llegada_estimada: en(0),
         llegada_real: en(7),
       })
-    ).toEqual({ peon_estimado_min: 30, manejo_estimado_min: 40, peon_real_min: 18, manejo_real_min: null, diferencia_min: 7 });
+    ).toEqual({
+      peon_medido: true,
+      peon_estimado_min: 30,
+      manejo_estimado_min: 40,
+      peon_real_min: 18,
+      manejo_real_min: null,
+      diferencia_min: 7,
+    });
   });
 
   it('sin llegada real: diferencia null', () => {
     expect(tiemposParada({ llegada_estimada: en(0), llegada_real: null }).diferencia_min).toBeNull();
+  });
+
+  it('peon_medido: null sin llegar o en la parada; false si el viaje termino sin salida ni peon', () => {
+    const abierta = { llegada_real: en(0), salida_real: null, peon_real_horas: null };
+    expect(tiemposParada({ llegada_real: null }).peon_medido).toBeNull();
+    expect(tiemposParada(abierta).peon_medido).toBeNull();
+    expect(tiemposParada(abierta, { terminado: true }).peon_medido).toBe(false);
+    expect(tiemposParada({ ...abierta, salida_real: en(20), peon_real_horas: 1 / 3 }, { terminado: true }).peon_medido).toBe(true);
+  });
+});
+
+describe('bloqueTiempos — peon_completo (Tarea 5)', () => {
+  const cerrado = (paradas) => ({
+    estado: 'FINALIZADO',
+    manejo_estimado_horas: 1,
+    peon_estimado_horas: 1,
+    distancia_estimada_km: 10,
+    manejo_real_horas: 1,
+    peon_real_horas: 0.5,
+    distancia_real_km: 10,
+    paradas,
+  });
+  it('false si una parada a la que llego quedo sin peon medido', () => {
+    const r = bloqueTiempos(
+      cerrado([
+        { llegada_real: en(0), peon_real_horas: 0.5 },
+        { llegada_real: en(60), peon_real_horas: null },
+      ])
+    ).real;
+    expect(r.peon_completo).toBe(false);
+  });
+  it('true si todas las visitadas tienen peon (las no visitadas no cuentan)', () => {
+    const r = bloqueTiempos(
+      cerrado([
+        { llegada_real: en(0), peon_real_horas: 0.5 },
+        { llegada_real: null, peon_real_horas: null },
+      ])
+    ).real;
+    expect(r.peon_completo).toBe(true);
   });
 });
 

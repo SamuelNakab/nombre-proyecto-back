@@ -48,11 +48,15 @@ export async function procesarPingSalida(io, viaje, parada, { lat, lng, timestam
       return null;
     }
 
-    await redis.del(keySalida(viaje.id_viaje));
+    // GUARD: salida_real y salida_detectada null en el WHERE. Dos pings que
+    // cumplen el umbral a la vez detectan UNA vez; un "Salir" que se adelanto gana.
     const r = await prisma.parada.updateMany({
       where: { id_parada: parada.id_parada, id_viaje: viaje.id_viaje, salida_real: null, salida_detectada: null },
       data: { salida_detectada: detectada },
     });
+    // El estado se borra DESPUES de escribir: si la escritura falla, el proximo
+    // ping vuelve a detectar en vez de perder la racha.
+    await redis.del(keySalida(viaje.id_viaje));
     if (r.count === 0) return null;
 
     console.log(

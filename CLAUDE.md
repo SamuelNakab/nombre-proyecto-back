@@ -840,7 +840,8 @@ limpiarViajeActivo lo corte sin import circular).
   Afuera durante >= SALIDA_DETECCION_SEGUNDOS -> detectada = fuera_desde (la hora
   del PRIMER ping afuera, hora del celular: falsificarla solo perjudica al chofer).
 - UNICA escritura: parada.updateMany { salida_real: null, salida_detectada: null }
-  (una vez por parada; si un Salir se adelanto, gana el Salir). Eventos:
+  (una vez por parada; si un Salir se adelanto, gana el Salir). El estado de Redis
+  se borra DESPUES de esa escritura: si falla, el proximo ping re-detecta. Eventos:
   parada:salida_detectada (chofer + PyME) y, si es la ultima y la prevista no
   habia pasado, viaje:cierre_habilitado GPS. Nunca tira.
 - NO cierra nada. Salir: elegirSalidaReal (cierre-plan) -> la detectada si es
@@ -931,7 +932,7 @@ GUARDS VERIFICADOS REVIRTIENDOLOS (test-cierre-viaje.js):
 | eta-emisor: sinPendientes | eta-emisor.test.js (6 consultas en vez de 1) |
 | cierre: estado en el WHERE del updateMany del viaje | 8b (orden FORZADO, la PyME commitea primero: finalizar 200 + salir 200 y 2 filas FINALIZADO). En la carrera libre (8, aun con RONDAS=20) no se ve: "salir" llega casi siempre antes a su tx, y en ese orden el guard de la parada abierta (salida_real null) tambien lo cubre. 8b toma el lock de la fila del viaje desde el test para fijar el orden |
 | iniciar: lock del chofer + re-chequeo en la tx | 11c (200,200 y dos viajes CARGANDO del mismo chofer) |
-| deteccion: salida_real / salida_detectada null en el updateMany | 13 (3 pings simultaneos al umbral -> 3 parada:salida_detectada) |
+| deteccion: salida_real / salida_detectada null en el updateMany | 13 (orden FORZADO: el test toma el lock de la fila de la parada, los 3 pings que cumplen el umbral se encolan en el updateMany -> 3 parada:salida_detectada). Sin el lock la carrera no se ve: el primero escribe antes de que los otros lean |
 
 ### PENDIENTES
 - Remito: marcar las paradas no visitadas y quien cerro.
@@ -2190,6 +2191,14 @@ directo).
   llega despues es el caso SECUENCIAL y el contrato es 400, no 409. 3c acepta
   los dos (y dice cual salio); el guard lo siguen probando 3b / 3d / 3e (un solo
   ganador, iniciado_por sin pisar, una sola fila de historial).
+- test-concurrencia-jerarquia CASO A2 (aparecio en la regresion de la Tarea 5): el
+  MISMO patron con dos reservar. El perdedor recibia el 400 de validarTransicion
+  ("RESERVADO_POR_EMPRESA a RESERVADO_POR_EMPRESA") en vez del 409. NO es de la
+  Tarea 5: el codigo BASE (3930e20) dio 1/3 en rojo y la version nueva 1/5,
+  siempre en la PRIMERA corrida contra un server recien levantado (por eso
+  `--solo`, que levanta uno nuevo cada vez, daba 3/3). A2 acepta 409 o ese 400 y
+  dice cual salio; el guard lo siguen probando A1 / A3 (un solo ganador, la
+  empresa ganadora sin pisar).
 - test-vehiculos TEST C: se logueaba con la key de Maps y NUNCA pasaba del
   login, asi que nadie vio que esperaba el contrato viejo de viaje:aceptar
   ("Debes seleccionar un vehiculo", errores como { error }). Se alineo con el

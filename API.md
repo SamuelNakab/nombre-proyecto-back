@@ -5776,6 +5776,88 @@ Por GPS (real):
 `fecha_corte_precio`. Cada parada del evento suma `salida_detectada`, `origen_salida`, `no_visitada` y
 `peon_medido`.
 
+`viaje:finalizado` de un cierre automatico **incompleto** (real). El chofer salio de la parada 1, mando
+un ping manejando y no llego a la 2. El corte es ese ping (el minimo entre el ultimo ping y la salida
++ el manejo estimado del tramo). `real.manejo_horas` es justo salida de la 1 -> corte: el tramo en curso
+suma al manejo. `precio_real` da 0 porque el acumulado GPS al corte es de un solo ping:
+```json
+{
+  "id_viaje": 2363,
+  "precio_real": 0,
+  "desglose": {
+    "precio_por_tiempo": 0,
+    "precio_por_distancia": null,
+    "tiempo_horas": 0,
+    "distancia_km": 0,
+    "tiempo_capital": 0,
+    "distancia_provincia": null,
+    "tarifa_hora": 3500,
+    "tarifa_km": null
+  },
+  "remito_url": "https://pub-259e35cb295345b4b029cc3b28a349e8.r2.dev/remitos/2363.pdf",
+  "duracion_real": null,
+  "duracion_carga": 0,
+  "duracion_descarga": null,
+  "duracion_aproximacion_origen": 0,
+  "puntualidad_inicio": "A_TIEMPO",
+  "estimado": {
+    "manejo_horas": 0.2088888888888889,
+    "peon_horas": 1,
+    "total_horas": 1.208888888888889,
+    "distancia_km": 4.337
+  },
+  "real": {
+    "manejo_horas": 0.0002033333333333333,
+    "peon_horas": 0.0002069444444444444,
+    "total_horas": 0.00041027777777777775,
+    "distancia_km": 0,
+    "peon_completo": true
+  },
+  "paradas": [
+    {
+      "id_parada": 4797,
+      "orden": 1,
+      "llegada_estimada": "2026-10-24T03:05:59.884Z",
+      "salida_estimada": "2026-10-24T03:35:59.884Z",
+      "llegada_real": "2026-10-24T03:04:02.342Z",
+      "salida_real": "2026-10-24T03:04:03.087Z",
+      "salida_detectada": null,
+      "origen_salida": "CHOFER",
+      "no_visitada": false,
+      "peon_medido": true,
+      "peon_estimado_min": 30,
+      "manejo_estimado_min": null,
+      "peon_real_min": 0,
+      "manejo_real_min": null,
+      "diferencia_min": -2
+    },
+    {
+      "id_parada": 4798,
+      "orden": 2,
+      "llegada_estimada": "2026-10-24T03:48:31.884Z",
+      "salida_estimada": "2026-10-24T04:18:31.884Z",
+      "llegada_real": null,
+      "salida_real": null,
+      "salida_detectada": null,
+      "origen_salida": null,
+      "no_visitada": true,
+      "peon_medido": null,
+      "peon_estimado_min": 30,
+      "manejo_estimado_min": 13,
+      "peon_real_min": null,
+      "manejo_real_min": null,
+      "diferencia_min": null
+    }
+  ],
+  "cerrado_por": "AUTOMATICO",
+  "incompleto": true,
+  "paradas_no_visitadas": [
+    4798
+  ],
+  "fecha_corte_precio": "2026-10-24T03:04:03.819Z"
+}
+```
+
 ---
 
 ## Lugares guardados y series de viajes (Paso 4)

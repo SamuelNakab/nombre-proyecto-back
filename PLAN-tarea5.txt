@@ -1,0 +1,606 @@
+# Tarea 5 — Cierre de viajes internos sin "Salir" + detección de salida por GPS
+
+## Contexto
+Hoy un viaje interno solo se cierra cuando el chofer toca "Salir" en la última parada
+(`salirDeParada` → `cerrarViaje(..., { paradaQueSale })`). Si no lo toca, el viaje queda en
+DESCARGANDO para siempre: no vence, el emisor de ETA sigue vivo (y le pega a la DB en cada tick,
+porque `calcularEtaConApi` no cachea el "no hay paradas pendientes") y el precio real sale de un
+acumulado GPS que sigue creciendo. Es el pendiente del Paso 3. Esta tarea agrega: (A) detección
+de salida por GPS en cualquier parada, (B) un cierre manual por la PyME, (C) un cierre automático
+a fin del día, (D) reglas de datos para los cierres sin "Salir", con el corte de precio separado
+de la fórmula, y (E) el 409 sobre viajes cerrados, el bloqueo de dos viajes en curso y el arreglo
+del ETA. El flujo normal (el chofer toca Salir a tiempo) no cambia.
+
+---
+
+## 1. Schema: solo aditivo (el `db push` lo corrés vos)
+
+```prisma
+enum CierreViaje  { CHOFER ORGANIZACION AUTOMATICO }   // nuevo, no toca enums existentes
+enum OrigenSalida { CHOFER GPS }                        // nuevo
+
+model Viaje {  // + 2 nullable
+  cerrado_por        CierreViaje?   // quién cerró un FINALIZADO interno (null en legacy / viejos)
+  fecha_corte_precio DateTime?      // instante en que terminó la medición del precio real
+}
+model Parada { // + 3 nullable
+  salida_detectada DateTime?        // hora del PRIMER ping afuera (una vez por parada)
+  origen_salida    OrigenSalida?    // de dónde salió salida_real
+  no_visitada      Boolean?         // true = cierre automático sin llegar a esta parada
+}
+```
+
+SQL esperado. Antes de mostrártelo final lo verifico con `npx prisma migrate diff
+--from-schema-datasource prisma/schema.prisma --to-schema-datamodel prisma/schema.prisma --script`:
+```sql
+CREATE TYPE "CierreViaje" AS ENUM ('CHOFER', 'ORGANIZACION', 'AUTOMATICO');
+CREATE TYPE "OrigenSalida" AS ENUM ('CHOFER', 'GPS');
+ALTER TABLE "viajes"  ADD COLUMN "cerrado_por" "CierreViaje",
+                      ADD COLUMN "fecha_corte_precio" TIMESTAMP(3);
+ALTER TABLE "paradas" ADD COLUMN "salida_detectada" TIMESTAMP(3),
+                      ADD COLUMN "origen_salida" "OrigenSalida",
+                      ADD COLUMN "no_visitada" BOOLEAN;
+```
+Decisiones:
+- "No visitada" es una columna nueva y NO un valor nuevo en `EstadoParada`. Así no hay
+  `ALTER TYPE ... ADD VALUE`, que rompe al Prisma de un deploy viejo que lea la fila (ver la regla
+  de enums en CLAUDE.md). La parada queda `estado PENDIENTE` + `no_visitada true`.
+- Los dos enums nuevos solo viven en columnas nuevas. El Prisma viejo no las selecciona, así que
+  no tira.
+- "FINALIZADO incompleto" se deriva en el read (`paradas.some(no_visitada)`); no lleva columna
+  propia.
+- "Peón no medido" también se deriva: la parada tiene `llegada_real`, `salida_real` en null y
+  `peon_real_horas` en null en un viaje terminado. No lleva columna.
+- Sin índices ni FKs nuevos.
+
+---
+
+## 2. Funciones puras (unit tests sin red)
+
+**`src/services/cierre-fechas.js`** (reusa `partesLocales` / `localAUtc` de `serie-fechas.js`; a
+`localAUtc` se le suma un `segundo` opcional, default 0, compatible con lo que ya hay):
+- `horaPrevistaFin(ultimaParada)` = `llegada_real + peon_estimado_horas`. Es null si todavía no
+  llegó. Si la parada no tiene peón estimado (viaje viejo), usa `tiempoPeonMinutos()`.
+- `finDelDia(fecha_inicio)` = 23:59:59 America/Argentina/Buenos_Aires del día LOCAL de inicio.
+  Con la variable [SOLO TESTS] `CIERRE_FIN_DIA_SEGUNDOS_TEST`: `fecha_inicio + N s`.
+- `momentoCierreAutomatico(viaje)`: si llegó a la última y `prevista > finDelDia`, devuelve
+  `prevista + CIERRE_EXTENSION_MINUTOS` (120). Si no, `finDelDia(fecha_inicio)`.
+- `cierreManualDisponibleDesde(viaje)`: si llegó a la última,
+  `min(prevista, salida_detectada de la última)`. Si no, null.
+
+**`src/services/salida-deteccion.js`**:
+- `evaluarPingSalida(estado, ping, parada, { metros, segundos, ahora })` →
+  `{ estado: nuevo|null, detectada: Date|null }`.
+  - No corre si la parada no tiene `llegada_real`, si ya tiene `salida_real` o
+    `salida_detectada`, o si `ping.ts <= llegada_real`.
+  - El timestamp del ping se descarta si está más de 60 s en el futuro respecto del server: es
+    hora del celular, y así no se puede adelantar la detección.
+  - Pings desordenados (`ts <= estado.ultimo_ts`): se ignoran.
+  - Un ping afuera (> metros, con `distanciaMetros` de parada.service, que es turf/haversine
+    local) arranca `fuera_desde = ts` si no estaba armado.
+  - Un ping adentro → `estado null` (reset).
+  - Un ping afuera con `ts - fuera_desde >= segundos*1000` → `detectada = fuera_desde`.
+  - Si el estado guardado es de otra parada (`id_parada` distinto), se arranca de cero.
+
+**`src/services/cierre-plan.js`** (dice el instante de corte; no sabe de precios):
+- `elegirSalidaReal({ salida_detectada, toque })`: si hay detectada y es anterior al toque,
+  `{ salida_real: salida_detectada, origen_salida: 'GPS' }`. Si no,
+  `{ salida_real: toque, origen_salida: 'CHOFER' }`.
+- `planCierre(viaje, modo, ahora)` → `{ estadosEsperados, abierta, salida
+  ({fecha, origen}|null), noVisitadas[], corte, incompleto }`.
+  - `instanteCorte` está adentro y es lo único que decide CUÁNDO termina la medición. La tabla
+    está en la sección 6.
+
+**`src/services/mediciones-gps.js`** (puro): `medicionEn(puntos, acumulado, T)` →
+`{ tiempo_horas, distancia_km }` hasta T. Detalle en la sección 6.
+
+**`src/services/precio-real.js`** (puro, la FÓRMULA, la única): `precioDesdeMediciones({ zona,
+paradas, tarifa_hora, tarifa_km }, { tiempo_horas, distancia_km })` →
+`{ precio_real, precio_por_tiempo, precio_por_distancia, tiempo_capital, distancia_provincia }`.
+Es el bloque que hoy está duplicado en `cerrarViaje` (líneas 64-75) y en
+`calcularCostoAcumulado`; los dos pasan a usarlo y el resultado es idéntico. El día que cambie la
+fórmula, se cambia solo acá.
+
+`tiempos-reales.js`: no cambia el cálculo. Una parada abierta sin salida y sin `fin` ya da peón
+null y no suma a `peon_horas`. Se agrega `paradas_peon_no_medido` al resultado, y `bloqueTiempos`
+expone en `real` el campo `peon_completo: false` cuando hay alguna. `duracion_real` y
+`duracion_descarga` salen null solas, porque la última no tiene `salida_real`. Con eso queda
+excluido de métricas y promedios.
+
+---
+
+## 3. Detección en `gps.socket.js` (A)
+
+Dónde se engancha: después de `actualizarAcumulado` y del primer `relimpiarSiCerrado`, y antes
+de `iniciarEmisorEta`. Solo corre si el viaje es interno y está en CARGANDO o DESCARGANDO. Usa
+las `paradas` que ya trae el `findUnique` del ping: hoy trae todas las columnas, y desde ahora
+también `salida_detectada`. **Cero queries nuevas por ping.**
+
+```
+const abierta = paradas.find(p => p.llegada_real && !p.salida_real)
+if (interno && ESTADOS_EN_PARADA_INTERNO.includes(estado) && abierta && !abierta.salida_detectada)
+  await procesarPingSalida(io, viaje, abierta, { lat, lng, timestamp })
+```
+Además, para viajes internos, en cada ping va `registrarPuntoMedicion(id_viaje, timestamp,
+acumulado)` (solo Redis, ver sección 6).
+
+**`src/services/salida-deteccion.service.js`** → `procesarPingSalida`:
+1. Lee `gps:{id}:salida` (JSON `{ id_parada, fuera_desde, ultimo_ts }`) y llama a
+   `evaluarPingSalida`.
+2. Guarda el estado nuevo con `EX` = `segundos + 600`, o hace DEL si quedó en null.
+3. Si detectó: `parada.updateMany({ where: { id_parada, salida_real: null, salida_detectada:
+   null }, data: { salida_detectada } })`. Es la ÚNICA escritura a la DB, una vez por parada.
+   Con `count === 1`:
+   - emite `parada:salida_detectada` al chofer y a la PyME;
+   - si es la última parada y el cierre manual todavía no estaba habilitado por tiempo,
+     emite `viaje:cierre_habilitado` con motivo GPS;
+   - hace DEL de la key.
+4. Nunca tira: loguea `[salida-deteccion] ...`. Un fallo no puede romper el ping.
+
+`limpiarGPS` suma las keys `gps:{id}:salida` y `gps:{id}:puntos`.
+
+**Salir con salida detectada (A6)**: en `salirDeParada` (intermedia y última), `ahora` pasa a ser
+el "toque" y `elegirSalidaReal` decide `salida_real` y `origen_salida`. El guard sigue igual
+(`salida_real: null` en el WHERE). El manejo del tramo siguiente ya sale de
+`anterior.salida_real` en `confirmarParadaInterna`, así que toma la hora detectada sin tocar
+nada. Si no hubo detección, el flujo es el de hoy y solo se suma `origen_salida: 'CHOFER'`.
+
+---
+
+## 4. Cierre unificado: `cierre.service.js`
+
+`cerrarViaje` LEGACY no cambia, salvo que usa `precioDesdeMediciones`. El camino interno pasa a
+`cerrarViajeInterno({ io, id_viaje, modo: 'CHOFER'|'ORGANIZACION'|'AUTOMATICO', actor, ahora })`,
+y lo usan los tres modos:
+1. Lee el viaje con sus paradas y arma `planCierre(viaje, modo, ahora)`.
+2. Calcula `mediciones = medicionesHasta(id_viaje, plan.corte)` (Redis) y el precio con
+   `precioDesdeMediciones(...)`. Todo fuera de la tx.
+3. Abre UNA tx (OPCIONES_TX):
+   - `viaje.updateMany({ where: { id_viaje, estado: { in: plan.estadosEsperados } }, data:
+     { FINALIZADO, cerrado_por, precio_real, tiempo_capital, distancia_provincia,
+     distancia_real_km: mediciones.distancia_km, fecha_corte_precio } })`. `count === 0` →
+     CierrePerdido.
+   - Si hay salida, la parada abierta: `updateMany({ salida_real: null })` → salida y
+     `origen_salida`. `count === 0` → CierrePerdido.
+   - Las paradas no visitadas: `updateMany({ llegada_real: null })` → `no_visitada: true`.
+   - `escribirRealesInterno(tx, ...)` sin `fin`: la parada abierta sin salida queda con peón null.
+4. Fuera de la tx, lo de siempre:
+   - historial FINALIZADO (origen CONDUCTOR / CLIENTE / SISTEMA);
+   - remito y relectura;
+   - `viaje:finalizado`, que ahora también llega a la sala del chofer y suma `cerrado_por`,
+     `incompleto` y `paradas_no_visitadas`;
+   - `marcarViajeCerrado`, `detenerEmisorEta`, `cancelarAvisoVencimiento`,
+     `cancelarTimersCierre` y `limpiarGPS` (que ahora incluye las keys de detección y de puntos).
+
+Si dos cierres compiten (Salir del chofer, finalizar de la PyME, el automático), todos usan
+`updateMany` con el estado en el WHERE: gana uno y el resto ve `count 0` → 409. Para que el que
+pierde reciba el mensaje del punto E16 y no un 409 genérico, se relee `cerrado_por`.
+
+`limpiarViajeActivo` (cancelaciones de chofer, PyME y admin, y desvinculación) suma
+`cancelarTimersCierre`. El Map vive en un módulo chico (`timers-cierre.js`) para no armar un
+import circular con cierre.service.
+
+Transiciones nuevas en `TRANSICIONES_INTERNO` (la tabla de estado-viaje.service.test.js se
+actualiza):
+- DESCARGANDO → FINALIZADO: además del chofer, ahora PYME y SISTEMA.
+- CARGANDO → FINALIZADO y EN_RUTA → FINALIZADO: solo SISTEMA (el automático incompleto).
+
+---
+
+## 5. Endpoint nuevo y campos del read (B)
+
+**`POST /api/organizaciones/:id/viajes/:idViaje/finalizar`**: sin body, cualquier miembro activo
+(RESPONSABLE o MIEMBRO, por `requireMiembro`). Se permite con la PyME SUSPENDIDA, igual que
+cancelar. Orden:
+1. Chequeos perezosos (vencimiento y cierre).
+2. Viaje de otra PyME o inexistente → 404.
+3. Ya FINALIZADO → 409 "El viaje ya fue cerrado (por el chofer / la empresa / automáticamente)".
+4. Otro estado que no sea en curso → 400 `mensajeEstado('finalizar', estado)`.
+5. Todavía no llegó a la última parada → 409 "El chofer todavía no llegó a la última parada".
+6. No está habilitado → 409 "El cierre manual se habilita a las HH:MM (hora prevista de fin) o
+   cuando el GPS detecte la salida de la última parada".
+7. Carrera perdida → 409.
+
+Respuesta: `{ mensaje, id_viaje, estado: 'FINALIZADO', cerrado_por: 'ORGANIZACION', precio_real,
+remito_url, salida_real, origen_salida, peon_medido, estimado, real }`.
+
+Cableado: `finalizarViajeOrganizacion` en viaje-interno.service, `finalizarViajePyme` en
+viajes-internos.controller, y la ruta en organizaciones.routes.
+
+**Read** (`serializarViaje`: PyME y chofer, en listas y detalle):
+- bloque `cierre`: `{ cerrado_por, incompleto, cierre_manual_desde, cierre_manual_habilitado,
+  motivo_habilitacion: 'TIEMPO'|'GPS'|null, hora_prevista_fin, cierre_automatico_en,
+  fecha_corte_precio }`;
+- en cada parada: `salida_detectada`, `origen_salida`, `no_visitada` y `peon_medido`.
+
+El chofer ve los mismos campos (le sirven para el "tocá Salir"). `paradaVistaChofer` sigue
+sacando solo el lugar.
+
+---
+
+## 6. Timer, barrido y chequeo perezoso (C), sin pollers
+
+**`src/services/cierre-automatico.service.js`**, mismo idiom que `vencimiento.service`:
+- `programarCierreAutomatico(io, id_viaje, momento)`. Se arma en `iniciarViajeInterno`, con
+  `finDelDia`. Se REprograma en `confirmarParadaInterna` cuando confirma la ÚLTIMA parada: ahí
+  cambia `momentoCierreAutomatico` si la prevista pasa el fin del día. Al disparar RELEE la
+  fila; si todavía no toca (overflow de setTimeout, reloj corrido), se re-arma.
+- `programarAvisoCierreHabilitado(io, id_viaje, prevista)`: se arma al confirmar la última. Al
+  disparar relee, y si el viaje sigue en curso y no lo había habilitado ya el GPS, emite
+  `viaje:cierre_habilitado` con motivo TIEMPO.
+- `cerrarSiCorresponde(io, where)`, el chequeo perezoso. Lo scopea cada caller:
+  `{ id_organizacion }`, `{ id_conductor }` o `{ id_viaje }`.
+  - Hace UNA query de viajes internos en curso con un filtro grueso en SQL (`fecha_inicio` antes
+    del día local siguiente a `ahora`) y decide exacto en JS con `momentoCierreAutomatico`.
+  - Se llama junto a `vencerSiCorresponde`, con un helper `ponerAlDia(io, where)` que corre los
+    dos.
+  - Lo usan: las listas y el detalle de la PyME y del chofer, `salir`, `confirmar-parada`
+    interno, `iniciar` (scope `{ id_conductor }`, para que un viaje de ayer colgado no bloquee el
+    de hoy), `finalizar` y `cancelar` de la PyME.
+  - El admin NO lo usa (mismo criterio que D10).
+- `barridoInicialCierres(io)` en app.js, UNA query (los internos en curso con sus paradas):
+  - los vencidos se cierran AUTOMATICO, en secuencia;
+  - al resto se le arma el timer de cierre y, si ya llegó a la última y la prevista no pasó, el
+    aviso de habilitación;
+  - log `[cierre-automatico] barrido de arranque: N en curso, X cerrados, Y programados`;
+  - kill-switch `CIERRE_BARRIDO_ARRANQUE=0` [SOLO TESTS], porque escribe en la DB compartida;
+  - `CIERRE_BARRIDO_ID_ORGANIZACION` [SOLO TESTS] lo limita a una PyME, para que el test del
+    barrido no cierre viajes reales.
+
+**Instante de corte (`instanteCorte`, en cierre-plan.js) y precio en cada caso**:
+
+| Cierre | Salida de la parada abierta | Corte del precio |
+|---|---|---|
+| CHOFER, Salir sin detección (flujo normal) | toque, origen CHOFER | toque → mediciones = acumulado completo (**idéntico a hoy**) |
+| CHOFER, Salir con detección anterior | detectada, origen GPS | detectada |
+| PyME o AUTO, llegó a la última, con detección | detectada, origen GPS | detectada |
+| PyME o AUTO, llegó a la última, sin detección | vacía, peón no medido | llegada a la última + peón estimado (= hora prevista de fin) |
+| AUTO sin llegar, parado en una parada | detectada si hay; si no, vacía | detectada; si no, llegada a ESA parada + su peón estimado |
+| AUTO sin llegar, EN_RUTA | — | `min(último ping, salida_real de la anterior + manejo estimado del tramo siguiente)` |
+
+Justificación del último caso, que pediste que propusiera. El manejo después de salir existió (el
+GPS lo prueba), pero sin llegada no se sabe cuándo terminó. "Último instante medido = salida
+anterior" le cobraría de menos al chofer un tramo que hizo. "Último ping" le cobraría el viaje a
+su casa. El manejo estimado del tramo es la cota razonable, y el último ping la recorta si el GPS
+se cortó antes. En las paradas que no visitó no se inventa nada: quedan `no_visitada` y sin
+tiempos.
+
+**Mediciones hasta T** (para que el precio NO siga creciendo con el GPS): `registrarPuntoMedicion`
+hace ZADD a `gps:{id}:puntos` (score = ts del ping, valor = `{ts, tiempo_horas, distancia_km}` del
+acumulado), con muestreo de 30 s como mínimo: unos 2900 puntos en 24 h, con TTL de 24 h como el
+acumulado. `medicionesHasta(id, T)`:
+- si T es igual o posterior al último ping, devuelve el acumulado tal cual (flujo normal sin
+  cambios);
+- si no, toma el último punto ≤ T: el tiempo es exacto (`punto.t + (T - punto.ts)`) y la distancia
+  es la del punto, con un error de 30 s de manejo como máximo.
+
+`medicionEn` es la parte pura. Si no hubo pings, las mediciones son 0 y la distancia real queda
+null, como hoy.
+
+Precio en vivo (`costo:actualizar` / `costo-acumulado`): sigue creciendo mientras el viaje esté
+abierto. El corte aplica al precio REAL del cierre. Si querés, en otra tarea se puede congelar el
+vivo pasada la prevista.
+
+---
+
+## 7. Otros (E)
+
+- **E16**: `salirDeParada` y `confirmar-parada` interno, sobre un FINALIZADO con `cerrado_por`
+  ORGANIZACION o AUTOMATICO → 409 "El viaje ya fue cerrado por la empresa" / "...
+  automáticamente". En confirmar-parada el chequeo va justo después del 403 (orden nuevo para
+  internos: 404 → 403 → cerrado 409 → parada ajena → ...; queda documentado en API.md). Los pings
+  de un viaje cerrado ya se ignoran en silencio (`ESTADOS_TERMINALES`) y no se toca.
+- **E17**: en `iniciarViajeInterno`, después de los 400 de estado y antes de la ventana y la
+  proximidad, si el chofer tiene otro viaje en `ESTADOS_EN_CURSO` (cualquier ciclo) → 409 "Ya
+  tenés un viaje en curso (#N): terminalo antes de iniciar otro". Se re-chequea en la tx con
+  `SELECT ... FROM conductores WHERE id_conductor = $1 FOR UPDATE` antes del `updateMany`. Orden
+  de locks: chofer → viaje; nadie más bloquea al conductor, así que no hay deadlock. Se saca de
+  "PENDIENTE" en CLAUDE.md.
+- **E18**: `eta-emisor.js` suma un Map `sinPendientes`. Cuando `calcularEtaConApi` (o
+  `recalcularEtaInmediato`) devuelve null, se marca, y los ticks siguientes salen sin tocar la DB
+  ni Redis. Se borra en `detenerEmisorEta`. En los dos ciclos, una parada confirmada no vuelve a
+  quedar pendiente, así que la marca es definitiva para ese emisor.
+- **E19**: el flujo normal cambia solo en que escribe `origen_salida: 'CHOFER'` y
+  `cerrado_por: 'CHOFER'`. El precio sale del mismo acumulado.
+
+---
+
+## 8. Eventos de socket nuevos o cambiados
+
+| Evento | Destino | Payload |
+|---|---|---|
+| `parada:salida_detectada` (nuevo) | chofer (`usuario:{id}`) + PyME | `{ id_viaje, id_organizacion, id_parada, orden, salida_detectada, es_ultima, mensaje: 'Parece que ya saliste de la parada N: tocá "Salir"' }`, una vez por parada |
+| `viaje:cierre_habilitado` (nuevo) | PyME | `{ id_viaje, id_organizacion, motivo: 'TIEMPO'\|'GPS', cierre_manual_desde, hora_prevista_fin, salida_detectada }`, una vez por viaje (el primero que habilita) |
+| `viaje:finalizado` (cambia) | viaje:{id} + PyME + **chofer** | suma `cerrado_por`, `incompleto`, `paradas_no_visitadas` |
+
+Ningún payload lleva el nombre del lugar (los arma `resumenViaje` o tienen campos explícitos).
+
+---
+
+## 9. Variables nuevas (`.env.example` + CLAUDE.md)
+
+- `SALIDA_DETECCION_METROS=500`
+- `SALIDA_DETECCION_SEGUNDOS=240`
+- `CIERRE_EXTENSION_MINUTOS=120`
+
+Se leen en cada uso, con `parseFloat` + guarda: basura o un valor ≤ 0 cae al default.
+
+[SOLO TESTS]:
+- `CIERRE_BARRIDO_ARRANQUE=1`: se agrega `=0` al server de `test-regresion.js` y a los servers
+  efímeros de viaje-interno, lugares-series e identidad.
+- `CIERRE_BARRIDO_ID_ORGANIZACION`.
+- `CIERRE_FIN_DIA_SEGUNDOS_TEST`.
+
+En los tests, la prevista se acorta con el `TIEMPO_PEON_MINUTOS` que ya existe (acepta
+fraccionarios) en el server efímero.
+
+---
+
+## 10. Tests
+
+**Unitarios** (vitest, `src/services/*.test.js`):
+- `cierre-fechas.test.js`:
+  - prevista (con y sin peón estimado);
+  - `finDelDia` con inicio 23:30 AR (= 02:30Z del día siguiente en UTC) y 00:10 AR;
+  - prevista que cruza la medianoche → +2 h;
+  - zona horaria con `America/New_York` inyectada, como en serie-fechas;
+  - `cierreManualDisponibleDesde` (min de prevista y detectada; null sin llegar);
+  - la variable de test.
+- `salida-deteccion.test.js`:
+  - no corre sin `llegada_real`, ni con `salida_real` o `salida_detectada`;
+  - ignora pings anteriores a la llegada, desordenados y del futuro;
+  - 499 m adentro / 501 m afuera;
+  - reset al volver;
+  - umbral exacto de tiempo (239 s no detecta, 240 s sí), con detectada = primer ping afuera;
+  - cambio de parada.
+- `cierre-plan.test.js`:
+  - `elegirSalidaReal` (GPS anterior / posterior al toque / sin detección);
+  - `planCierre` e `instanteCorte`, las 6 filas de la tabla;
+  - paradas no visitadas.
+- `tiempos-reales.test.js` (+): peón no medido excluido de `peon_horas` y contado en
+  `paradas_peon_no_medido`.
+- `precio-real.test.js`: la fórmula da lo mismo que el cálculo actual en CABA, PROVINCIA y MIXTO;
+  `medicionEn` (T después del último ping = acumulado; T entre puntos; sin puntos).
+- `estado-viaje.service.test.js`: filas nuevas de la tabla.
+- `eta-emisor`: el emisor no vuelve a consultar sin pendientes (con mock de calcularEtaConApi).
+
+**Suite nueva `scripts/test-cierre-viaje.js`**:
+- Usa `crearRegistro('-cie-<stamp>')` + `terminar`, y el patrón `-cie-` en `restos.js`.
+- Levanta su server en 3951, más 3952-3954 para los casos de timer y de barrido. Corre con
+  `SALIDA_DETECCION_SEGUNDOS=4`, `TIEMPO_PEON_MINUTOS` chico y `CIERRE_BARRIDO_ARRANQUE=0` (salvo
+  el caso de barrido).
+- Los sockets se conectan al puerto efímero. Usa Google REAL: unos 25 llamados Pro, que imprime
+  al final.
+- Acepta números de caso y `--restos [--borrar]`.
+
+Casos:
+1. La PyME finaliza antes de la prevista y sin detección → 409.
+2. La PyME finaliza pasada la prevista → FINALIZADO, `cerrado_por ORGANIZACION`, salida vacía,
+   `peon_medido false`, `fecha_corte_precio` = prevista. Llegan `viaje:finalizado` al chofer y
+   `viaje:cierre_habilitado` (TIEMPO).
+3. Salida detectada en la última → `parada:salida_detectada` y `cierre_habilitado` (GPS); la PyME
+   cierra antes de la prevista; `salida_real` = detectada, origen GPS.
+4. Pings afuera ANTES de confirmar la llegada (EN_RUTA) → sin detección ni escritura.
+5. Salir tardío con detección: (a) en una parada intermedia → `salida_real` = detectada y el
+   manejo del tramo siguiente parte de ahí; (b) en la última → idem, con cierre CHOFER.
+6. Un ping de vuelta adentro resetea la detección; después de eso, sin pasar el umbral no hay
+   detección.
+7. Cierre automático por timer (`CIERRE_FIN_DIA_SEGUNDOS_TEST`): (a) llegó a la última →
+   FINALIZADO completo con peón no medido; (b) no llegó → incompleto, con paradas `no_visitada`;
+   eventos a la PyME y al chofer; el emisor de ETA detenido y las keys de Redis borradas.
+8. Carrera Salir vs. finalizar de la PyME, 5 rondas → un 200 y un 409, una fila FINALIZADO.
+9. Salir y confirmar-parada sobre un viaje cerrado por la empresa o por el automático → 409 con
+   el mensaje.
+10. Barrido de arranque: `fecha_inicio` corrida a ayer por prisma, server con el barrido limitado
+    a la PyME del test → cerrado AUTOMATICO.
+11. Chofer con un viaje en curso intenta iniciar otro → 409; con el primero cerrado, inicia.
+12. Flujo normal sin detección → igual que hoy: `origen_salida CHOFER`, mismo precio que el
+    acumulado.
+
+Protocolo de reversión: hay que sacar cada guard y ver que su caso se pone en rojo.
+- 8 = `estado` en el WHERE del cierre.
+- 11 = lock del chofer (subcaso concurrente: dos iniciar de viajes distintos a la vez).
+- 3/5 = el `salida_detectada: null` del updateMany.
+
+Se agrega a `SUITES` de `test-regresion.js` (timeoutMin 15).
+
+---
+
+## 11. Archivos
+
+**Nuevos**:
+- `src/services/cierre-fechas.js`
+- `src/services/salida-deteccion.js`
+- `src/services/salida-deteccion.service.js`
+- `src/services/cierre-plan.js`
+- `src/services/mediciones-gps.js`
+- `src/services/precio-real.js`
+- `src/services/cierre-automatico.service.js`
+- `src/services/timers-cierre.js`
+- sus `.test.js`
+- `scripts/test-cierre-viaje.js`
+
+**Modificados**:
+- `prisma/schema.prisma`
+- `src/services/cierre.service.js`
+- `src/services/viaje-interno.service.js` (salir, confirmar, iniciar, serializar, finalizar,
+  perezosos)
+- `src/sockets/gps.socket.js`
+- `src/services/gps.service.js` (puntos y keys en limpiarGPS)
+- `src/services/eta-emisor.js`
+- `src/services/cancelacion.service.js`
+- `src/services/estado-viaje.service.js`
+- `src/services/duracion.service.js` (`peon_completo`)
+- `src/services/tiempos-reales.js`
+- `src/services/costo.service.js` (usa la fórmula extraída)
+- `src/services/serie-fechas.js` (`segundo` en `localAUtc`)
+- `src/controllers/viajes.controller.js` (409 cerrado en confirmar-parada)
+- `src/controllers/viajes-internos.controller.js`
+- `src/routes/organizaciones.routes.js`
+- `src/app.js` (barrido)
+- `.env.example`
+- `scripts/test-regresion.js`
+- `scripts/restos.js`
+- los servers efímeros de 3 suites (kill-switch)
+- `API.md` (endpoint, campos, eventos, 409, orden de confirmar-parada)
+- `CLAUDE.md` (sección nueva "Cierre sin Salir y detección de salida (Tarea 5)", sitios 24-25 del
+  historial, migraciones, variables, se sacan los dos pendientes resueltos)
+
+Fuera de alcance: remito con marca de "no visitada", congelar el precio en vivo, y que el iniciar
+LEGACY bloquee un segundo viaje en curso.
+
+---
+
+## 12. Verificación (en este orden)
+
+1. `npx prisma migrate diff ... --script`. Te muestro el SQL y frenamos: el `db push` lo corrés
+   vos. Después, `npx prisma generate`.
+2. `npm run lint` y `npm run test` (unitarios).
+3. `node scripts/test-cierre-viaje.js`, más el protocolo de reversión de los 3 guards.
+4. `npm run test:regresion` completo. Te reporto la tabla de suites, cualquier rojo con su log de
+   `scripts/.regresion/` y las llamadas Pro.
+5. `node scripts/restos.js` (solo cuenta) para confirmar que no quedó nada.
+
+Sin operaciones de git.
+
+---
+
+## Estado (2026-10-24)
+
+El plan de arriba es el APROBADO, sin tocar. Esta seccion dice que se hizo, que se cambio
+respecto del plan y por que, y que falta verificar. Rama feature/cierre-viaje, commit WIP 6b19df0.
+
+### Hecho
+- Schema: el db push esta hecho (las 5 columnas y los 2 enums estan en Neon; el SQL es el de la
+  seccion 1, verificado con migrate diff).
+- Codigo: todo lo de las secciones 2-9.
+- Lint limpio. Unitarios: 268/268 (23 archivos), incluidos los nuevos: cierre-fechas,
+  salida-deteccion, cierre-plan, precio-real (con medicionEn), eta-emisor, y lo agregado a
+  duracion / tiempos-reales / estado-viaje.
+- test-cierre-viaje.js:
+  - primera corrida completa: 40/41;
+  - los rojos los arreglaron los cambios 1 y 6 de la lista de abajo;
+  - despues corrieron sueltos en verde los casos 12, 13 y 8 + 8b.
+- Protocolo de reversion: los 3 guards se pusieron en rojo sin su guard y volvieron a verde al
+  restaurarlo.
+  - estado en el WHERE del cierre -> 8b: finalizar 200 + salir 200 y 2 filas FINALIZADO.
+  - lock del chofer en iniciar -> 11c: 200,200 y dos viajes CARGANDO.
+  - WHERE del updateMany de la deteccion -> 13: 3 eventos.
+  - Ademas, eta-emisor.test.js con la marca sinPendientes sacada da 6 consultas en vez de 1.
+- API.md: endpoint, campos, eventos y 409. Los ejemplos ya son payloads REALES, salvo el de
+  viaje:finalizado del cierre automatico incompleto (ver "Falta").
+- CLAUDE.md (seccion "Cierre sin Salir y deteccion de salida (Tarea 5)", migraciones, sitios 24-25,
+  eventos, variables, deploy, comandos, guards verificados), .env.example, restos.js (-cie-), la
+  suite en test:regresion y el kill-switch CIERRE_BARRIDO_ARRANQUE=0 en los servers efimeros de 10
+  suites.
+
+### Cambios fuera del plan (y por que)
+1. "Code fix" — bug de Prisma en el cierre sin salida (src/services/cierre.service.js).
+   - Cuando el cierre de la PyME o el automatico no tenia salida detectada, la parada abierta se
+     "verificaba" con un parada.updateMany({ where: ..., data: {} }).
+   - Prisma NO ejecuta un updateMany con data vacia: devuelve count 0 sin tocar la base. El cierre
+     lo tomaba como carrera perdida y hacia rollback, asi que TODO finalizar sin deteccion daba 409.
+     Lo encontro el CASO 2 en la primera corrida.
+   - Arreglo: en ese caso es un parada.count con el mismo WHERE (salida_real null). Va adentro de la
+     tx, despues del updateMany del viaje, que ya tiene el lock de la fila y serializa contra
+     "salir". Con salida (toque o GPS) sigue siendo el updateMany que la escribe.
+2. Manejo real del tramo en curso en el cierre automatico incompleto EN_RUTA (cierre.service.js).
+   - Los payloads reales mostraron que el precio se cortaba en min(ultimo ping, salida + manejo
+     estimado), pero real.manejo_horas no incluia el tramo entre la ultima salida y el corte. El real
+     y el precio median ventanas distintas.
+   - Ahora, SOLO si no hay parada abierta (EN_RUTA), escribirRealesInterno recibe fin = corte, igual
+     que al cancelar en curso, y el tramo parcial suma al manejo del viaje.
+   - Con una parada abierta NO se pasa fin: cerraria su peon en el corte, o sea lo inventaria.
+3. CASO 7b (test-cierre-viaje.js).
+   - Antes el viaje quedaba EN_RUTA sin pings, asi que el corte era la salida de la parada 1 y la
+     rama "min(ultimo ping, cota)" nunca corria.
+   - Ahora 7b manda un ping manejando y verifica corte = ese ping y manejo_real_horas = ping -
+     salida. Cubre el cambio 2.
+   - Antes del corte de luz NO llego a correr con esta version: falta verificarlo.
+4. Aviso inmediato de "cierre manual habilitado" (cierre-automatico.service.js, avisarSiYaPaso).
+   - Si la hora prevista de fin ya paso en el momento de llegar a la ultima parada (peon estimado 0,
+     que es valido), el timer TIEMPO no se armaba y la PyME no recibia nunca viaje:cierre_habilitado.
+   - Ahora, al llegar a la ultima, se avisa en el momento. El barrido de arranque no re-avisa.
+5. CASO 8b, carrera con orden FORZADO, y RONDAS=N.
+   - Revirtiendo el estado del WHERE del cierre, el CASO 8 seguia verde, aun con 20 rondas: "salir"
+     llega casi siempre antes a su tx, y en ese orden el guard de la parada abierta tambien cubre.
+   - El orden en el que el estado es la UNICA proteccion es el de la PyME primero, y la carrera
+     libre no lo produce. En 8b el test toma un SELECT ... FOR UPDATE de la fila del viaje, manda
+     finalizar, despues salir, y suelta el lock: la PyME commitea primero de forma determinista.
+   - RONDAS=N pisa las rondas de las carreras (protocolo de reversion).
+6. Arreglos de timing de la suite.
+   - CASO 12: el test leia el acumulado de Redis antes de que el server procesara el segundo ping
+     (rojo falso: esperado 0 contra 2.65 real). Ahora espera hasta que el acumulado refleja ese ping.
+   - Deteccion: rachaAfuera y el CASO 6 esperan 1.5 s antes de leer la base (la deteccion escribe
+     despues del ping).
+   - CASO 2 cierra su viaje (asegurarCerrado) para que un rojo no tumbe los casos siguientes (un solo
+     viaje en curso por chofer).
+7. CASO 13 (nuevo): 3 pings simultaneos al cumplirse el umbral -> una sola deteccion.
+   - El plan asignaba ese guard a los casos 3/5, pero con pings secuenciales el siguiente ping ya
+     ve salida_detectada y saltea: sacar el guard no ponia nada en rojo.
+   - La primera version de 13 (3 pings en el mismo tick) tambien resulto NO determinista: en una
+     pasada del protocolo dio 3 eventos sin el guard y en la siguiente 1.
+   - Ahora el orden es FORZADO, como en 8b: el test toma el lock de la fila de la parada y los 3
+     pings se encolan en el updateMany. Verificado dos veces seguidas: 3 eventos sin el guard, 1 con
+     el guard.
+   - Para eso, en salida-deteccion.service el DEL del estado de Redis paso a ir DESPUES del
+     updateMany. Antes el DEL del primer ping vaciaba el estado de los otros aun con el lock.
+   - Tambien es mejor comportamiento: si la escritura a la base falla, la key queda y el proximo
+     ping re-detecta en vez de perder la racha.
+8. EJEMPLOS_JSON en test-cierre-viaje.js (mismo idiom que test-viaje-interno): de ahi salen los
+   ejemplos de API.md.
+9. Detalles de implementacion menores:
+   - el bloque cierre del read suma salida_detectada (la de la ultima parada; el punto 8 del enunciado
+     pide exponer "si hay salida detectada");
+   - la regla pura de deteccion recibe la distancia ya calculada, porque parada.service importa Redis:
+     sigue siendo la MISMA distanciaMetros;
+   - en localAUtc se renombro una variable local que chocaba con el parametro nuevo "segundo".
+
+### Corrida de regresion interrumpida (2026-10-23)
+- La PC se suspendio durante test-cierre-viaje (5 de 27). Al despertar el runner SIGUIO solo, pero
+  test-cierre-viaje y test-fase5 murieron por la red ("Can't reach database server", ECONNRESET), y su
+  limpieza tambien fallo.
+- El runner se cerro a mano (taskkill /T) con test-jerarquia a la mitad. No quedaron procesos ni
+  puertos (3900 / 3951-3954 / 3210) tomados.
+- Lo que si termino antes, verde: identidad 72/72, viaje-interno 127/127, maps 13/13, lugares-series
+  86/86 y, despues del corte, cancelacion-conductor 13/13, cancelacion-cliente 9/9, admin 20/20 e
+  iniciar-viaje 21/21. No cuenta como regresion valida: hay que correrla entera.
+- Restos que dejo (restos.js, solo conteo, NADA borrado):
+  - -jer-: 6 usuarios (DB + Firebase), 3 empresas, 3 vehiculos y 4 viajes vivos: 2334 y 2335
+    EN_CAMINO_A_ORIGEN, 2336 y 2337 BUSCANDO_CONDUCTOR.
+  - -cie-: 5 usuarios, 2 PyMEs, 3 vehiculos y 2 viajes: 2309 CANCELADO y 2310 vivo en DESCARGANDO.
+  - e2e: viaje 2090 CANCELADO del 2026-10-20. Es de un e2e anterior de CI, no de esta corrida.
+
+### Verificacion final (2026-10-24)
+- Restos de la corrida cortada borrados con OK de Samuel:
+  - -jer- con restos.js --solo -jer- --borrar;
+  - -cie- SOLO de la corrida cortada (stamp 1792789829875: viajes 2309 y 2310, 5 usuarios, 2 PyMEs y
+    3 vehiculos), con resolver / borrar de _limpieza.js filtrando por el stamp, despues de que
+    terminara la suite;
+  - e2e (viaje 2090) se dejo.
+- test-cierre-viaje.js entero: 43/43, limpieza OK, 33 Pro + 1 Essentials.
+- Protocolo de reversion (segunda pasada, con la version actual):
+  - estado en el WHERE del cierre -> 8b rojo (2 filas FINALIZADO);
+  - lock del chofer -> 11c rojo (200,200);
+  - WHERE de la deteccion -> 13 rojo (3 eventos), dos veces seguidas, despues del cambio a orden
+    forzado (cambio 7).
+  Los tres vuelven a verde con el guard.
+- Regresion completa (26 suites, 39m26s): 24/26 OK. Los 2 rojos NO son de la Tarea 5:
+  - iniciar-viaje: ReferenceError por una "s" suelta al final de scripts/test-iniciar-viaje.js
+    (linea 425). No esta en el commit WIP: es un cambio sin commitear del working tree, del
+    2026-10-24 00:32. NO se toco. La version del commit, corrida aparte contra el server en :3900:
+    21/21.
+  - concurrencia-jerarquia CASO A2: el reservar legacy (no tocado por la Tarea 5). El perdedor
+    recibe el 400 del caso secuencial en vez del 409. El guard de un solo ganador se cumple (A1/A3).
+    Pasa tambien con el codigo BASE 3930e20 (extraido con git archive a un directorio temporal):
+    1/3 rojo con la base y 1/5 con la version actual, siempre en la PRIMERA corrida contra un server
+    recien levantado. Es el mismo patron que historial-estados 3c, que se arreglo aceptando 400 o
+    409. Por eso --solo (server nuevo cada vez) dio 3/3 rojo.
+- Llamadas a Google de la regresion: viaje-interno 96 Pro + 1 Ess, maps 16 Pro (+ Distance Matrix
+  de la columna "antes"), lugares-series 64 Pro, cierre-viaje 34 Pro + 1 Ess. Total ~210 Pro + 2
+  Essentials.
+- restos.js final: todo en 0 salvo e2e (el viaje 2090, que no es de esta corrida).
+
+### Pendiente de decision (no es de la Tarea 5)
+- La "s" suelta en scripts/test-iniciar-viaje.js: borrarla o descartar ese cambio.
+- concurrencia-jerarquia A2: aceptar 400 o 409 en el perdedor, como historial-estados 3c.

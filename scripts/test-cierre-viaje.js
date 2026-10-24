@@ -542,15 +542,32 @@ async function casos(ctx) {
   if (correr(13)) {
     titulo('CASO 13: pings simultaneos al cumplirse el umbral → una sola deteccion');
     const id = await iniciado(ctx, K1);
-    await llevarAUltima(K1, id);
+    const ps = await llevarAUltima(K1, id);
     const { ts: t0 } = await ping(sK1, id, lejosDe(DESTINO));
     await esperar(DETECCION_MS - 700 + 400);
-    // Tres pings en el mismo tick: los tres ven la racha cumplida.
+    // ORDEN FORZADO: el test toma el lock de la fila de la parada. Los tres pings
+    // leen el viaje (un SELECT no espera el lock) y el estado de Redis, cumplen el
+    // umbral y se encolan en el updateMany de la deteccion; al soltar, el WHERE
+    // (salida_detectada null) es lo unico que impide tres detecciones. Sin el lock,
+    // el primero suele escribir antes de que los otros lean y la carrera no se ve.
+    let soltar;
+    const liberado = new Promise((r) => (soltar = r));
+    const lock = prisma.$transaction(
+      async (tx) => {
+        await tx.$queryRaw`SELECT id_parada FROM paradas WHERE id_parada = ${ps.at(-1).id_parada} FOR UPDATE`;
+        await liberado;
+      },
+      { timeout: 30000, maxWait: 10000 }
+    );
+    await esperar(800);
     const base = Date.now();
     for (let i = 0; i < 3; i++) {
       sK1.socket.emit('conductor:ubicacion', { id_viaje: id, ...lejosDe(DESTINO), timestamp: base + i });
     }
     await esperar(3000);
+    soltar();
+    await lock;
+    await esperar(2500);
     const evs = eventosDe(sK1, 'parada:salida_detectada', id);
     const detectada = (await paradasDb(id)).at(-1).salida_detectada;
     paso('CASO 13: un solo parada:salida_detectada y la hora del primer ping afuera', evs.length === 1 && ms(detectada) === t0, `eventos=${evs.length} detectada=${detectada?.toISOString()}`);

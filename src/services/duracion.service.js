@@ -199,6 +199,12 @@ export function bloqueTiempos(viaje) {
           peon_horas: viaje.peon_real_horas,
           total_horas: viaje.manejo_real_horas + (viaje.peon_real_horas ?? 0),
           distancia_km: viaje.distancia_real_km,
+          // false si alguna parada a la que llego quedo con el peon NO medido
+          // (cierre sin "Salir" ni salida detectada, Tarea 5): peon_horas y
+          // total_horas no la incluyen. null si el viaje no trae sus paradas.
+          peon_completo: viaje.paradas
+            ? !viaje.paradas.some((p) => p.llegada_real && p.peon_real_horas == null)
+            : null,
         }
       : null;
   return { estimado, real };
@@ -207,9 +213,20 @@ export function bloqueTiempos(viaje) {
 // Campos en MINUTOS de una parada (los *_horas y los timestamps vienen en la
 // fila cruda). diferencia_min = llegada real - llegada estimada (positivo =
 // llego tarde); null mientras no llego.
-export function tiemposParada(parada) {
+//
+// peon_medido (Tarea 5): true si el peon de la parada se midio; false si el
+// viaje TERMINO y la parada quedo sin salida ni peon (cierre sin "Salir" y sin
+// salida detectada: "no medido", excluido de las metricas); null si no llego o
+// si todavia esta en la parada.
+export function tiemposParada(parada, { terminado = false } = {}) {
   const { llegada_real, llegada_estimada } = parada;
+  let peon_medido = null;
+  if (llegada_real) {
+    if (parada.peon_real_horas != null || parada.salida_real) peon_medido = true;
+    else if (terminado) peon_medido = false;
+  }
   return {
+    peon_medido,
     peon_estimado_min: horasAMinutos(parada.peon_estimado_horas),
     manejo_estimado_min: horasAMinutos(parada.manejo_estimado_horas),
     peon_real_min: horasAMinutos(parada.peon_real_horas),
@@ -221,5 +238,7 @@ export function tiemposParada(parada) {
   };
 }
 
-// Las paradas de un viaje con sus campos en minutos sumados.
-export const paradasConTiempos = (paradas) => paradas.map((p) => ({ ...p, ...tiemposParada(p) }));
+// Las paradas de un viaje con sus campos en minutos sumados. `terminado`: el
+// viaje esta en un estado final (define peon_medido false vs null).
+export const paradasConTiempos = (paradas, opciones) =>
+  paradas.map((p) => ({ ...p, ...tiemposParada(p, opciones) }));

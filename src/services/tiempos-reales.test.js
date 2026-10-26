@@ -60,6 +60,23 @@ describe('tiemposRealesDesdeParadas (viaje interno)', () => {
   });
 });
 
+describe('tiemposRealesDesdeParadas — peon no medido (Tarea 5)', () => {
+  it('cierre sin Salir ni deteccion: la parada abierta no suma peon y se cuenta como no medida', () => {
+    const sinSalida = [completo[0], completo[1], { ...completo[2], salida_real: null }];
+    const r = tiemposRealesDesdeParadas(sinSalida);
+    expect(r.paradas_peon_no_medido).toBe(1);
+    expect(r.paradas[2].peon_real_horas).toBeNull();
+    // 20 + 15: el peon de la 3 queda afuera, no se inventa.
+    expect(min(r.peon_horas)).toBe(35);
+    // El manejo del tramo que llega a la 3 si se midio.
+    expect(min(r.paradas[2].manejo_real_horas)).toBe(25);
+  });
+
+  it('viaje completo: 0 paradas sin medir', () => {
+    expect(tiemposRealesDesdeParadas(completo).paradas_peon_no_medido).toBe(0);
+  });
+});
+
 describe('tiemposRealesDesdeHistorial (legacy)', () => {
   const h = (estado, hhmm) => ({ estado, fecha: t(hhmm) });
 

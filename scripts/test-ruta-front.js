@@ -97,6 +97,7 @@ async function testMapsCaido(clienteToken) {
       MARKETPLACE_HABILITADO: 'true',
       RESERVA_BARRIDO_ARRANQUE: '0',
       VENCIMIENTO_BARRIDO_ARRANQUE: '0',
+      CIERRE_BARRIDO_ARRANQUE: '0',
     },
   });
   let childLog = '';

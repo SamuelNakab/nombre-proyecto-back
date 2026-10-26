@@ -34,6 +34,7 @@ import {
   salirDeParada,
   cancelarViajeChofer as cancelarViajeChoferSrv,
   cancelarViajeOrganizacion,
+  finalizarViajeOrganizacion,
   reasignarViaje as reasignarViajeSrv,
   editarViaje as editarViajeSrv,
 } from '../services/viaje-interno.service.js';
@@ -185,6 +186,19 @@ export const cancelarViajePyme = manejar(async (req, res) => {
     id_usuario: req.usuario.id_usuario,
     id_viaje,
     motivo: parsed.data.motivo,
+  });
+  return res.status(200).json(r);
+});
+
+// POST /api/organizaciones/:id/viajes/:idViaje/finalizar — sin body (Tarea 5).
+export const finalizarViajePyme = manejar(async (req, res) => {
+  const id_viaje = idViajeDe(req, res, 'idViaje');
+  if (!id_viaje) return;
+  const r = await finalizarViajeOrganizacion({
+    io,
+    id_organizacion: req.id_organizacion,
+    id_usuario: req.usuario.id_usuario,
+    id_viaje,
   });
   return res.status(200).json(r);
 });

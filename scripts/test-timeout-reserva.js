@@ -38,7 +38,7 @@ import { crearRegistro, terminar } from './_limpieza.js';
 // Todo lo que crea la corrida se borra al final (ver _limpieza.js): los
 // usuarios con el patron de esta corrida y lo que cuelga de ellos.
 const reg = crearRegistro();
-const ENV_MARKETPLACE = { MARKETPLACE_HABILITADO: 'true', VENCIMIENTO_BARRIDO_ARRANQUE: '0' };
+const ENV_MARKETPLACE = { MARKETPLACE_HABILITADO: 'true', VENCIMIENTO_BARRIDO_ARRANQUE: '0', CIERRE_BARRIDO_ARRANQUE: '0' };
 const SETUP_BASE = process.env.TEST_BASE_URL ?? 'http://localhost:3000'; // solo para el alta de fixtures
 
 const PARADA_1 = { lat: -34.6037, lng: -58.3816, direccion: 'Plaza de Mayo, CABA' };

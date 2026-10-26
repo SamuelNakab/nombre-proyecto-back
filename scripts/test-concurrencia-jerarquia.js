@@ -261,10 +261,23 @@ async function main() {
   const idEmpresaGanadoraA = resA1.status === 200 ? emp1.id_empresa : resA2.status === 200 ? emp2.id_empresa : null;
 
   paso('CASO A1: exactamente un gerente gana (200)', ganadoresA.length === 1, `ganadores=${ganadoresA.length}`);
+  // Que los dos fetch salgan en el mismo tick no garantiza que las dos LECTURAS
+  // previas ocurran antes del commit del ganador (mismo caso que
+  // test-historial-estados 3c). Si la del perdedor llega despues, es el caso
+  // secuencial y el contrato es 400 (validarTransicion: el viaje ya no esta en
+  // BUSCANDO_CONDUCTOR); si las dos leyeron antes, es la carrera real y el guard
+  // del WHERE da 409. Las dos son correctas; lo que prueba el guard es A1 / A3
+  // (un solo ganador, la empresa ganadora sin pisar). Pasa sobre todo en la
+  // primera corrida contra un server recien levantado.
+  const perdioA = perdedoresA[0];
+  const secuencialA =
+    perdioA?.status === 400 && /RESERVADO_POR_EMPRESA a RESERVADO_POR_EMPRESA/.test(perdioA.data?.error ?? '');
   paso(
-    'CASO A2: el otro gerente recibe 409 "no disponible"',
-    perdedoresA.length === 1 && perdedoresA[0].status === 409 && typeof perdedoresA[0].data.error === 'string',
-    perdedoresA.length === 1 ? `status=${perdedoresA[0].status} err=${perdedoresA[0].data.error}` : 'no hubo un unico perdedor'
+    'CASO A2: el otro gerente recibe 409 (carrera) o 400 (lectura despues del commit), con un error string',
+    perdedoresA.length === 1 && (perdioA.status === 409 || secuencialA) && typeof perdioA.data.error === 'string',
+    perdedoresA.length === 1
+      ? `${perdioA.status === 409 ? 'carrera real' : secuencialA ? 'secuencial' : '?'}: status=${perdioA.status} err=${perdioA.data.error}`
+      : 'no hubo un unico perdedor'
   );
   paso(
     'CASO A3: la DB queda RESERVADO_POR_EMPRESA con la empresa ganadora unicamente',

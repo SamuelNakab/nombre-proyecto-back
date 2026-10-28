@@ -1,0 +1,15 @@
+{
+  "name": "fleter-sim-finalizar",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "sim": "node sim-finalizar-viaje.mjs",
+    "postman": "newman run postman/fleter-finalizar-viaje.postman_collection.json --env-var firebase_api_key=$FIREBASE_WEB_API_KEY"
+  },
+  "dependencies": {
+    "socket.io-client": "4.8.3"
+  },
+  "devDependencies": {
+    "newman": "^6.2.1"
+  }
+}

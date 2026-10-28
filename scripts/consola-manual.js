@@ -424,9 +424,12 @@ async function elegirChofer() {
   return preguntarNumero('  id_conductor', lista[0].id_conductor);
 }
 
-async function preguntarCondiciones() {
-  const raw = await pregunta('  Condiciones separadas por coma (FRAGIL, REFRIGERADO, CARGA_PESADA, PELIGROSO, VOLUMINOSO) []: ');
-  return raw ? raw.split(',').map((c) => c.trim().toUpperCase()).filter(Boolean) : [];
+// motivo y descripcion: obligatorios al crear un viaje interno o una serie
+// (pedido del front 20-10-2026). El ciclo interno ya no tiene condiciones.
+async function preguntarMotivoDescripcion() {
+  const motivo = (await pregunta('  Motivo (1 a 120) [Prueba manual]: ')) || 'Prueba manual';
+  const descripcion = (await pregunta('  Descripcion / indicaciones [Llamar al llegar]: ')) || 'Llamar al llegar';
+  return { motivo, descripcion };
 }
 
 const siONo = async (texto) => (await pregunta(`  ${texto} (s/N): `)).toLowerCase() === 's';
@@ -436,11 +439,11 @@ async function accionCrearViajePyme() {
   const id_conductor = await elegirChofer();
   if (id_conductor == null) return;
   const minutos = await preguntarNumero('  Minutos desde ahora para fecha_programada', 30);
-  const condiciones_requeridas = await preguntarCondiciones();
+  const texto = await preguntarMotivoDescripcion();
   const r = await api('POST', `/api/organizaciones/${estado.idOrganizacion}/viajes`, {
     id_conductor,
     fecha_programada: new Date(Date.now() + minutos * 60000).toISOString(),
-    condiciones_requeridas,
+    ...texto,
     paradas: [PARADA_1, PARADA_2],
   }, estado.clienteToken);
   if (r.status === 201) estado.idViaje = r.data.id_viaje;
@@ -535,8 +538,9 @@ async function accionEditar() {
   const body = {};
   const minutos = await pregunta('  Nueva fecha: minutos desde ahora (vacio = no cambiar): ');
   if (minutos) body.fecha_programada = new Date(Date.now() + Number(minutos) * 60000).toISOString();
-  if (await siONo('Cambiar condiciones?')) body.condiciones_requeridas = await preguntarCondiciones();
   if (await siONo('Invertir las paradas?')) body.paradas = [PARADA_2, PARADA_1];
+  const motivo = await pregunta('  Motivo (vacio = no cambiar): ');
+  if (motivo) body.motivo = motivo;
   const descripcion = await pregunta('  Descripcion (vacio = no cambiar): ');
   if (descripcion) body.descripcion = descripcion;
   mostrar('PUT /api/organizaciones/:id/viajes/:idViaje', await api('PUT', rutaViajePyme(), body, estado.clienteToken));
@@ -603,7 +607,7 @@ async function accionCrearSerie() {
   if (hasta) body.fecha_hasta = hasta;
   const usarLugar = estado.idLugar != null && (await siONo(`Usar el lugar #${estado.idLugar} como origen`));
   body.paradas = [usarLugar ? { id_lugar: estado.idLugar } : PARADA_1, PARADA_2];
-  body.condiciones_requeridas = await preguntarCondiciones();
+  Object.assign(body, await preguntarMotivoDescripcion());
   console.log('  Creando la serie (una estimacion de Google por viaje, puede tardar unos segundos)...');
   const r = await api('POST', rutaPyme('/series'), body, estado.clienteToken);
   if (r.status !== 201) return mostrar('POST /api/organizaciones/:id/series', r);

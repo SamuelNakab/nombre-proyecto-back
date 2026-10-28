@@ -9,8 +9,13 @@
 //   2. $transaction: updateMany CONDICIONADO al estado esperado (y al chofer, y
 //      a la fecha cuando importa). count === 0 -> 409: otro camino se adelanto.
 //      Ese update toma el lock de la fila; lo que puede haber cambiado otra
-//      transaccion (condiciones del viaje, vinculo) se re-valida DESPUES, en la
-//      misma tx, y si falla se tira -> rollback.
+//      transaccion (el vinculo) se re-valida DESPUES, en la misma tx, y si
+//      falla se tira -> rollback.
+//
+// CONDICIONES ESPECIALES: el ciclo interno NO las tiene (pedido del front
+// 20-10-2026). No se piden, no se validan (crear, confirmar, reasignar, editar,
+// series) y no se devuelven. Las filas de condicion_requerida de viajes viejos
+// quedan en la base sin uso; las condiciones del VEHICULO son del marketplace.
 //   3. Fuera de la tx: historial (regla vigente: un fallo del historial no
 //      revierte el cambio de estado), timers, Redis y eventos.
 //
@@ -69,7 +74,7 @@ import {
   bloqueTiempos,
   paradasConTiempos,
 } from './duracion.service.js';
-import { paradasParaCrear } from './viaje-validacion.js';
+import { paradasParaCrear, faltantesContenido, mensajeFaltantes } from './viaje-validacion.js';
 import { emitirViajeInterno, salasDeViaje } from '../sockets/salas.js';
 
 // ─── Constantes ──────────────────────────────────────────────────────────────
@@ -109,7 +114,6 @@ export const INCLUDE_VIAJE_INTERNO = {
     orderBy: { orden: 'asc' },
     include: { lugar: { select: { id_lugar: true, nombre: true, activo: true } } },
   },
-  condiciones_req: true,
   organizacion: { select: { id_organizacion: true, nombre: true, cuit: true } },
   creador: { select: { id_usuario: true, nombre: true, apellido: true } },
   conductor: {
@@ -134,22 +138,12 @@ export const INCLUDE_VIAJE_INTERNO = {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-const condicionesDe = (viaje) => viaje.condiciones_req.map((c) => c.condicion);
-
-function vehiculoCumple(vehiculo, condiciones) {
-  const tiene = vehiculo.condiciones.map((c) => c.condicion);
-  return condiciones.every((req) => tiene.includes(req));
-}
-
 // Los vehiculos que cuentan son los PROPIOS del chofer (Vehiculo.id_conductor).
 // La flota de las empresas de logistica donde trabaje (conductor_vehiculos) es
 // de otra organizacion y no cuenta. Vehiculo no tiene columna `activo`: el
 // borrado es fisico y esta bloqueado mientras el vehiculo tenga un viaje no
 // final, asi que "activo" = que exista.
-const vehiculosPropios = (db, id_conductor) =>
-  db.vehiculo.findMany({ where: { id_conductor }, include: { condiciones: true } });
-
-const listaCondiciones = (condiciones) => (condiciones.length ? `: ${condiciones.join(', ')}` : '');
+const contarVehiculosPropios = (id_conductor) => prisma.vehiculo.count({ where: { id_conductor } });
 
 export { exigirPymeOperativa };
 
@@ -163,24 +157,18 @@ export async function conductorDe(id_usuario) {
 }
 
 // El chofer puede recibir este viaje: vinculo ACTIVO con la PyME y al menos un
-// vehiculo propio que cumpla las condiciones. Las mismas validaciones al crear,
-// reasignar y editar (y una vez por serie).
-export async function validarChoferAsignable(id_organizacion, id_conductor, condiciones) {
+// vehiculo propio (con el que despues confirma). Las mismas validaciones al
+// crear y reasignar (y una vez por serie). Sin condiciones: el ciclo interno no
+// las tiene.
+export async function validarChoferAsignable(id_organizacion, id_conductor) {
   const vinculo = await prisma.vinculoChofer.findFirst({
     where: { id_organizacion, id_conductor, activo: true },
     select: { id_vinculo: true },
   });
   if (!vinculo) throw new ErrorNegocio(400, 'El chofer no esta vinculado a esta PyME');
 
-  const vehiculos = await vehiculosPropios(prisma, id_conductor);
-  if (vehiculos.length === 0) {
+  if ((await contarVehiculosPropios(id_conductor)) === 0) {
     throw new ErrorNegocio(400, 'El chofer no tiene vehiculos propios registrados');
-  }
-  if (!vehiculos.some((v) => vehiculoCumple(v, condiciones))) {
-    throw new ErrorNegocio(
-      400,
-      `El chofer no tiene un vehiculo propio que cumpla las condiciones del viaje${listaCondiciones(condiciones)}`
-    );
   }
 }
 
@@ -296,13 +284,14 @@ function bloqueCierre(viaje) {
 }
 
 function serializarViaje(viaje, vistaParada) {
-  const { condiciones_req, conductor, ...resto } = viaje;
+  // condiciones_req no viene en INCLUDE_VIAJE_INTERNO: el ciclo interno no tiene
+  // condiciones y no se devuelven.
+  const { conductor, ...resto } = viaje;
   const terminado = ESTADOS_TERMINALES.includes(viaje.estado);
   return {
     ...resto,
     paradas: paradasConTiempos(viaje.paradas, { terminado }).map(vistaParada),
     ...bloqueTiempos(viaje),
-    condiciones_requeridas: condiciones_req.map((c) => c.condicion),
     conductor: conductor
       ? {
           id_conductor: conductor.id_conductor,
@@ -336,6 +325,7 @@ export function resumenViaje(viaje) {
     estado: viaje.estado,
     fecha_programada: viaje.fecha_programada,
     precio_estimado: viaje.precio_estimado,
+    motivo: viaje.motivo ?? null,
     descripcion: viaje.descripcion,
     id_serie: viaje.id_serie ?? null,
     paradas: viaje.paradas.map((p) => ({
@@ -345,7 +335,6 @@ export function resumenViaje(viaje) {
       latitud: p.latitud,
       longitud: p.longitud,
     })),
-    condiciones_requeridas: condicionesDe(viaje),
   };
 }
 
@@ -441,7 +430,7 @@ export async function viajeParaCostoAcumulado(id_organizacion, id_viaje) {
 // ─── Crear ───────────────────────────────────────────────────────────────────
 
 export async function crearViajeInterno({ io, id_organizacion, id_usuario, datos }) {
-  const { id_conductor, fecha_programada, condiciones_requeridas, descripcion } = datos;
+  const { id_conductor, fecha_programada, motivo, descripcion } = datos;
 
   await exigirPymeOperativa(id_organizacion);
 
@@ -452,7 +441,7 @@ export async function crearViajeInterno({ io, id_organizacion, id_usuario, datos
   });
   if (!cliente) throw new ErrorNegocio(400, 'El usuario no tiene perfil de cliente');
 
-  await validarChoferAsignable(id_organizacion, id_conductor, condiciones_requeridas);
+  await validarChoferAsignable(id_organizacion, id_conductor);
 
   // Paradas { id_lugar } -> copia de direccion y coordenadas del lugar (400 si
   // no existe, es de otra PyME o esta borrado).
@@ -481,11 +470,11 @@ export async function crearViajeInterno({ io, id_organizacion, id_usuario, datos
         tarifa_hora,
         tarifa_km,
         fecha_programada: new Date(fecha_programada),
-        descripcion: descripcion ?? null,
+        motivo,
+        descripcion,
         precio_estimado: resultado.precio_estimado,
         ...columnasEstimadasViaje(recorrido.totales),
         paradas: { create: conEstimacionPorParada(paradasParaCrear(paradas), recorrido) },
-        condiciones_req: { create: condiciones_requeridas.map((condicion) => ({ condicion })) },
       },
       select: { id_viaje: true },
     });
@@ -520,23 +509,18 @@ export async function crearViajeInterno({ io, id_organizacion, id_usuario, datos
 export async function confirmarViaje({ io, id_usuario, id_viaje, id_vehiculo }) {
   const id_conductor = await conductorDe(id_usuario);
   await vencerSiCorresponde(io, { id_viaje, id_conductor });
-  const viaje = await viajeDeChofer(id_conductor, id_viaje, { condiciones_req: true });
+  const viaje = await viajeDeChofer(id_conductor, id_viaje, {});
 
   if (viaje.estado !== 'ASIGNADO') {
     throw new ErrorNegocio(400, mensajeEstado('confirmar', viaje.estado));
   }
   validarTransicion(viaje.estado, 'CONFIRMADO', { ciclo: 'INTERNO', quien: 'CHOFER' });
 
-  const vehiculo = await prisma.vehiculo.findUnique({
-    where: { id_vehiculo },
-    include: { condiciones: true },
-  });
+  // Cualquier vehiculo PROPIO sirve: el ciclo interno no tiene condiciones (un
+  // viaje viejo con condiciones guardadas se confirma igual).
+  const vehiculo = await prisma.vehiculo.findUnique({ where: { id_vehiculo } });
   if (!vehiculo || vehiculo.id_conductor !== id_conductor) {
     throw new ErrorNegocio(400, 'El vehiculo no es tuyo');
-  }
-  const condiciones = condicionesDe(viaje);
-  if (!vehiculoCumple(vehiculo, condiciones)) {
-    throw new ErrorNegocio(400, `El vehiculo no cumple las condiciones del viaje${listaCondiciones(condiciones)}`);
   }
 
   const ahora = new Date();
@@ -556,15 +540,6 @@ export async function confirmarViaje({ io, id_usuario, id_viaje, id_vehiculo }) 
       data: { estado: 'CONFIRMADO', id_vehiculo, fecha_confirmacion: ahora },
     });
     if (r.count === 0) throw conflicto();
-
-    // Re-validacion con las condiciones FRESCAS: una edicion concurrente pudo
-    // cambiarlas (edit hace su updateMany primero, asi que si commiteo antes, aca
-    // ya se ve lo nuevo).
-    const frescas = await tx.condicionRequerida.findMany({ where: { id_viaje } });
-    const requeridas = frescas.map((c) => c.condicion);
-    if (!vehiculoCumple(vehiculo, requeridas)) {
-      throw conflicto(`El viaje cambio: el vehiculo no cumple las condiciones${listaCondiciones(requeridas)}`);
-    }
   });
 
   await registrarCambioEstado({
@@ -1166,8 +1141,9 @@ export async function finalizarViajeOrganizacion({ io, id_organizacion, id_usuar
 export async function reasignarViaje({ io, id_organizacion, id_usuario, id_viaje, id_conductor }) {
   await exigirPymeOperativa(id_organizacion);
   await vencerSiCorresponde(io, { id_viaje, id_organizacion });
+  // Reasignar es operativo (cambia el chofer), no edita el contenido: un viaje
+  // viejo sin motivo o sin descripcion se reasigna igual.
   const viaje = await viajeDeOrganizacion(id_organizacion, id_viaje, {
-    condiciones_req: true,
     conductor: { select: { id_usuario: true } },
   });
 
@@ -1182,8 +1158,7 @@ export async function reasignarViaje({ io, id_organizacion, id_usuario, id_viaje
   }
   validarTransicion(viaje.estado, 'ASIGNADO', { ciclo: 'INTERNO', quien: 'PYME' });
 
-  const condiciones = condicionesDe(viaje);
-  await validarChoferAsignable(id_organizacion, id_conductor, condiciones);
+  await validarChoferAsignable(id_organizacion, id_conductor);
 
   const id_conductor_anterior = viaje.id_conductor;
 
@@ -1210,16 +1185,6 @@ export async function reasignarViaje({ io, id_organizacion, id_usuario, id_viaje
       },
     });
     if (r.count === 0) throw conflicto();
-
-    // Condiciones frescas (una edicion concurrente) contra los vehiculos del
-    // chofer nuevo.
-    const frescas = (await tx.condicionRequerida.findMany({ where: { id_viaje } })).map((c) => c.condicion);
-    const vehiculos = await vehiculosPropios(tx, id_conductor);
-    if (!vehiculos.some((v) => vehiculoCumple(v, frescas))) {
-      throw conflicto(
-        `El viaje cambio: el chofer no tiene un vehiculo propio que cumpla las condiciones${listaCondiciones(frescas)}`
-      );
-    }
     return estadoReal;
   });
 
@@ -1261,7 +1226,6 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
   await vencerSiCorresponde(io, { id_viaje, id_organizacion });
   const viaje = await viajeDeOrganizacion(id_organizacion, id_viaje, {
     paradas: { orderBy: { orden: 'asc' } },
-    condiciones_req: true,
     conductor: { select: { id_usuario: true } },
   });
 
@@ -1273,6 +1237,12 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
   }
   validarTransicion(viaje.estado, 'ASIGNADO', { ciclo: 'INTERNO', quien: 'PYME' });
 
+  // ESTADO RESULTANTE: el viaje tiene que quedar con motivo y descripcion. Un
+  // viaje viejo sin alguno no se edita sin mandarlo. Alcanza con chequearlo aca,
+  // fuera de la tx: una vez completos ningun endpoint los vuelve a vaciar.
+  const faltan = faltantesContenido(viaje, datos);
+  if (faltan.length > 0) throw new ErrorNegocio(400, mensajeFaltantes(faltan));
+
   // Paradas nuevas: { id_lugar } -> snapshot del lugar. Sin paradas nuevas, las
   // actuales (con su snapshot, aunque el lugar haya cambiado despues).
   const paradasNuevas = datos.paradas ? await resolverParadas(id_organizacion, datos.paradas) : null;
@@ -1282,19 +1252,6 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
   const fecha_programada = datos.fecha_programada
     ? new Date(datos.fecha_programada)
     : viaje.fecha_programada;
-  const condiciones = datos.condiciones_requeridas ?? condicionesDe(viaje);
-
-  // El chofer actual tiene que poder hacer el viaje editado.
-  if (datos.condiciones_requeridas) {
-    try {
-      await validarChoferAsignable(id_organizacion, viaje.id_conductor, condiciones);
-    } catch (err) {
-      if (err instanceof ErrorNegocio && err.status === 400) {
-        throw new ErrorNegocio(400, `${err.message}. Reasigna el viaje a otro chofer`);
-      }
-      throw err;
-    }
-  }
 
   // Precio, zona, duracion (manejo + peon) y ruta se recalculan si cambian las
   // paradas o la fecha (la fecha define la hora pico y el trafico de cada
@@ -1316,8 +1273,8 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
 
   const estado_anterior = await transaccion(async (tx) => {
     const estadoReal = await bloquearViaje(tx, id_viaje);
-    // El updateMany va PRIMERO: toma el lock antes de tocar paradas y
-    // condiciones, asi un confirmar concurrente ve todo lo nuevo o nada.
+    // El updateMany va PRIMERO: toma el lock antes de tocar las paradas, asi un
+    // confirmar concurrente ve todo lo nuevo o nada.
     const r = await tx.viaje.updateMany({
       where: { id_viaje, id_organizacion, estado: { in: ESTADOS_PRE_INICIO_INTERNO } },
       data: {
@@ -1325,6 +1282,7 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
         id_vehiculo: null,
         fecha_confirmacion: null,
         fecha_programada,
+        ...(datos.motivo !== undefined ? { motivo: datos.motivo } : {}),
         ...(datos.descripcion !== undefined ? { descripcion: datos.descripcion } : {}),
         ...costo,
       },
@@ -1351,12 +1309,6 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
           data: columnasEstimadasParada(recorrido.paradas[i]),
         });
       }
-    }
-    if (datos.condiciones_requeridas) {
-      await tx.condicionRequerida.deleteMany({ where: { id_viaje } });
-      await tx.condicionRequerida.createMany({
-        data: datos.condiciones_requeridas.map((condicion) => ({ id_viaje, condicion })),
-      });
     }
     return estadoReal;
   });

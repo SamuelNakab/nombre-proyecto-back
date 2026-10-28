@@ -224,7 +224,7 @@ async function crearOk(u, idOrg, id_conductor, paradas) {
   const r = await api(
     'POST',
     `/api/organizaciones/${idOrg}/viajes`,
-    { id_conductor, fecha_programada: enMin(2), condiciones_requeridas: [], paradas },
+    { id_conductor, fecha_programada: enMin(2), motivo: 'Test cierre de viaje', descripcion: 'Indicaciones de prueba', paradas },
     u.token
   );
   if (r.status !== 201) throw new Error(`crear viaje fallo: ${r2s(r)}`);

@@ -262,6 +262,8 @@ const cuerpoViaje = (id_conductor) => ({
   id_conductor,
   fecha_programada: new Date(Date.now() + 2 * 60_000).toISOString(),
   paradas: [OBELISCO, CONGRESO],
+  motivo: 'Test maps',
+  descripcion: 'Indicaciones de prueba',
 });
 
 async function parteB() {

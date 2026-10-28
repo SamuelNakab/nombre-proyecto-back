@@ -4,8 +4,8 @@ import { z } from 'zod';
 // (POST /api/viajes) y la del ciclo INTERNO (POST/PUT
 // /api/organizaciones/:id/viajes, y la plantilla de las series). Estaban inline
 // en viajes.controller; se extrajeron para que las rutas no se puedan
-// desincronizar (mismo formato de paradas, mismo tope, mismas condiciones, mismo
-// minimo de anticipacion y mismo mensaje).
+// desincronizar (mismo formato de paradas, mismo tope, mismo minimo de
+// anticipacion y mismo mensaje).
 
 export const CONDICIONES = ['FRAGIL', 'REFRIGERADO', 'CARGA_PESADA', 'PELIGROSO', 'VOLUMINOSO'];
 
@@ -73,7 +73,58 @@ const paradaInterna = z
 
 export const schemaParadasInternas = conTopeParadas(paradaInterna);
 
+// Condiciones requeridas: SOLO de la ruta legacy (POST /api/viajes). El ciclo
+// interno y las series ya no las piden ni las validan (pedido del front
+// 20-10-2026); si llegan en el body, el z.object las descarta sin error.
 export const schemaCondiciones = z.array(z.enum(CONDICIONES));
+
+// ─── Motivo y descripcion (viaje interno y series) ───────────────────────────
+
+// Obligatorios al crear (viaje o serie). Al editar se valida el ESTADO
+// RESULTANTE (faltantesContenido): un viaje viejo sin motivo se lee, se cancela
+// y se reasigna, pero no se edita sin completarlo. Se guardan ya sin espacios
+// en los bordes.
+export const MOTIVO_MAX = 120;
+export const DESCRIPCION_MAX = 500;
+
+const textoObligatorio = (campo, { requerido, vacio, max, maximo }) =>
+  z
+    .string({ error: (iss) => (iss.input === undefined ? requerido : `${campo} debe ser texto`) })
+    .trim()
+    .min(1, vacio)
+    .max(max, maximo);
+
+export const schemaMotivo = textoObligatorio('motivo', {
+  requerido: 'motivo es requerido',
+  vacio: 'motivo no puede estar vacio',
+  max: MOTIVO_MAX,
+  maximo: `motivo puede tener como máximo ${MOTIVO_MAX} caracteres`,
+});
+
+export const schemaDescripcion = textoObligatorio('descripcion', {
+  requerido: 'descripcion es requerida',
+  vacio: 'descripcion no puede estar vacia',
+  max: DESCRIPCION_MAX,
+  maximo: `descripcion puede tener como máximo ${DESCRIPCION_MAX} caracteres`,
+});
+
+const vacio = (texto) => texto === null || texto === undefined || String(texto).trim() === '';
+
+// Pura. Que queda vacio en el viaje DESPUES de aplicar `datos` (lo que trae el
+// body de editar). Alcanza con chequearlo antes de la tx: ningun endpoint vuelve
+// a dejar motivo o descripcion vacios (los schemas lo prohiben), asi que una vez
+// completos no se pueden "descompletar" en el medio.
+export function faltantesContenido(viaje, datos = {}) {
+  const faltan = [];
+  if (vacio(datos.motivo ?? viaje.motivo)) faltan.push('motivo');
+  if (vacio(datos.descripcion ?? viaje.descripcion)) faltan.push('descripcion');
+  return faltan;
+}
+
+export function mensajeFaltantes(faltan) {
+  if (faltan.length === 2) return 'El viaje no tiene motivo ni descripcion: completalos para poder editarlo';
+  return `El viaje no tiene ${faltan[0]}: completalo para poder editarlo`;
+}
 
 export const camposBase = {
   // `zona` se acepta SOLO por compatibilidad con el front actual, que la sigue

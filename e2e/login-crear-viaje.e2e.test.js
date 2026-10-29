@@ -6,7 +6,9 @@
 // la lista de choferes), nada de ids como secret.
 //
 // La cuenta e2e, su "PyME E2E" y el chofer vinculado con el vehiculo E2E000
-// (FRAGIL) los deja scripts/seed-cuentas-test.js, de forma idempotente.
+// los deja scripts/seed-cuentas-test.js, de forma idempotente. El viaje lleva
+// motivo y descripcion (obligatorios) y ya no condiciones (pedido del front
+// 20-10-2026).
 //
 // El viaje se CANCELA al final (y en afterAll si un assert fallo en el medio):
 // staging comparte la DB con produccion y no puede quedar un viaje vivo.
@@ -83,8 +85,8 @@ describe('E2E: login y viaje interno de PyME contra staging', () => {
     const crear = await api('POST', `/api/organizaciones/${idOrganizacion}/viajes`, {
       id_conductor: chofer.id_conductor,
       fecha_programada: fechaProgramada,
-      condiciones_requeridas: ['FRAGIL'],
-      descripcion: 'e2e: viaje de prueba',
+      motivo: 'e2e: viaje de prueba',
+      descripcion: 'e2e: indicaciones de prueba',
       paradas: [
         { lat: -34.6037, lng: -58.3816, direccion: 'Plaza de Mayo, CABA' },
         { lat: -34.5895, lng: -58.3974, direccion: 'Recoleta, CABA' },
@@ -95,6 +97,7 @@ describe('E2E: login y viaje interno de PyME contra staging', () => {
     expect(idViaje).toBeTruthy();
     expect(crear.data.estado).toBe('ASIGNADO');
     expect(crear.data.id_organizacion).toBe(idOrganizacion);
+    expect(crear.data.motivo).toBe('e2e: viaje de prueba');
 
     const cancelar = await api('POST', `/api/organizaciones/${idOrganizacion}/viajes/${idViaje}/cancelar`, {
       motivo: 'e2e',

@@ -56,6 +56,13 @@ elegibles) queda DORMIDO detras de MARKETPLACE_HABILITADO. MVP: CABA + GBA.
   cerrados, un solo viaje en curso por chofer y el emisor de ETA sin queries
   cuando no quedan paradas. Ver "Cierre sin Salir y deteccion de salida
   (Tarea 5)".
+- PEDIDO DEL FRONT 20-10-2026 — condiciones especiales FUERA del ciclo interno
+  (no se piden, no se validan, no se devuelven), MOTIVO del viaje (columna
+  nueva) y DESCRIPCION obligatorios al crear (viaje y serie) y en el estado
+  resultante de editar, licencia del chofer opcional en la base (Paso A; el
+  registro la sigue exigiendo hasta LICENCIA_OPCIONAL=true) y el SIMULADOR DEL
+  FRONT en e2e/sim (contrato corregido, casos de la Tarea 5, paso de CI,
+  categoria `sim` de restos.js) COMPLETO. Ver "Pedido del front 20-10-2026".
 
 ## Stack
 - Node.js 22, ES Modules (NUNCA require()). Async/await siempre.
@@ -68,6 +75,12 @@ elegibles) queda DORMIDO detras de MARKETPLACE_HABILITADO. MVP: CABA + GBA.
 - Zod en todos los endpoints REST. Errores como { error: "mensaje" }.
 - Variables en .env con default en codigo si no estan.
 - PrismaClient unico en src/config/prisma.js.
+- CUALQUIER cambio en el ciclo del viaje interno (endpoints, estados, mensajes
+  de error, campos o eventos de crear / confirmar / iniciar / salir /
+  confirmar-parada / finalizar / cancelar) actualiza en el MISMO PR el
+  simulador del front (e2e/sim/sim-finalizar-viaje.mjs) y su contrato
+  (e2e/sim/CONTRATO-FINALIZAR.md). El front y el mobile dependen de ese
+  contrato; el simulador corre en CI contra staging.
 
 ## Reglas de migraciones Prisma
 - Hay drift. Usar npx prisma db push. NUNCA migrate reset/dev sin
@@ -111,6 +124,20 @@ elegibles) queda DORMIDO detras de MARKETPLACE_HABILITADO. MVP: CABA + GBA.
   no_visitada). Sin indices ni FKs. "No visitada" es una columna Boolean y NO un
   valor nuevo de EstadoParada, justamente por el OJO de abajo. Revisado con el
   mismo migrate diff: solo CREATE TYPE + ADD COLUMN.
+- Pedido del front 20-10-2026: 1 columna NULLABLE en viajes (motivo) y 1 en
+  series_viaje (motivo), y DROP NOT NULL en conductores.nro_licencia y
+  conductores.licencia_vencimiento (relajante, metadata-only). Sin enums,
+  indices ni FKs. Revisado con el mismo migrate diff: solo ADD COLUMN + ALTER
+  COLUMN ... DROP NOT NULL. Las condiciones (condicion_requerida,
+  series_viaje.condiciones, el enum TipoCondicion) NO se tocaron: quedan sin uso
+  en el ciclo interno hasta separar las DBs.
+- OJO con relajar un NOT NULL mientras la DB esta compartida: es compatible
+  para ESCRIBIR, pero el Prisma VIEJO (production antes del merge a main) TIRA
+  al LEER una fila con NULL en esa columna (p. ej. GET /api/admin/usuarios, que
+  trae `conductor: true`). Por eso el codigo nuevo NO escribe NULL hasta que se
+  prenda LICENCIA_OPCIONAL, y eso va recien con main desplegado. Antes del merge
+  a main: `SELECT count(*) FROM conductores WHERE nro_licencia IS NULL OR
+  licencia_vencimiento IS NULL` tiene que dar 0.
 - OJO con agregar valores a un enum mientras la DB esta compartida: el Prisma
   de un deploy VIEJO no conoce los valores nuevos y TIRA al leer una fila que
   los tenga (p. ej. el panel admin de produccion antes de que main tenga el
@@ -270,8 +297,9 @@ si `id_organizacion != null` (cicloDe en estado-viaje.service).
 Archivos: src/services/viaje-interno.service.js (acciones y transacciones),
 src/controllers/viajes-internos.controller.js (Zod + HTTP),
 src/services/ventana-inicio.js (ventana pura), src/services/viaje-validacion.js
-(schemas compartidos con la ruta legacy: paradas, condiciones, fecha con
-ANTICIPACION_MINIMA_MINUTOS), src/sockets/salas.js, src/middlewares/flags.middleware.js.
+(schemas compartidos con la ruta legacy: paradas, fecha con
+ANTICIPACION_MINIMA_MINUTOS; las condiciones quedaron SOLO para la legacy, y
+motivo / descripcion son del ciclo interno), src/sockets/salas.js, src/middlewares/flags.middleware.js.
 
 ### Modelo
 - Viaje: id_organizacion, id_creador (el miembro que lo creo), metodo_cobro
@@ -283,9 +311,9 @@ ANTICIPACION_MINIMA_MINUTOS), src/sockets/salas.js, src/middlewares/flags.middle
   viaje interno apunta al Cliente del CREADOR, solo porque el schema lo exige.
   NINGUN permiso nuevo lo usa, y los viejos lo ignoran en viajes internos
   (puedeVerViaje solo aplica "cliente dueño" si id_organizacion es null).
-- Se reusan id_conductor, id_vehiculo (null hasta confirmar), condiciones_req,
-  paradas, tarifas, precios, duracion_estimada_horas, fecha_inicio,
-  fecha_llegada_origen e iniciado_por.
+- Se reusan id_conductor, id_vehiculo (null hasta confirmar), paradas, tarifas, precios, duracion_estimada_horas, fecha_inicio,
+  fecha_llegada_origen e iniciado_por. condiciones_req NO: desde el pedido del
+  front 20-10-2026 el ciclo interno no tiene condiciones (ver esa seccion).
 - "Vehiculo propio activo" = Vehiculo.id_conductor = el chofer. No hay columna
   `activo`: el borrado es fisico y esta bloqueado con viajes no finales. La flota
   de empresas (conductor_vehiculos) NO cuenta.
@@ -319,8 +347,7 @@ Validada fila por fila en estado-viaje.service.test.js.
 1. Lectura previa -> 400 descriptivos del caso secuencial.
 2. $transaction (OPCIONES_TX): updateMany CONDICIONADO (estado esperado, y el
    chofer y la fecha cuando importan) PRIMERO; count === 0 -> 409. Ese update
-   toma el lock de la fila: lo que otra tx pudo cambiar (condiciones del viaje,
-   vinculo) se re-valida DESPUES en la misma tx, y si falla, rollback.
+   toma el lock de la fila: lo que otra tx pudo cambiar (el vinculo) se re-valida DESPUES en la misma tx, y si falla, rollback.
 3. Fuera de la tx: historial, timers, Redis, eventos.
 - El vinculo se bloquea (SELECT ... FOR UPDATE ... activo) en crear y reasignar;
   desvincular toma el mismo lock con su updateMany. Orden de locks siempre
@@ -340,15 +367,17 @@ CASO 17 con SUBCASOS=...): ver la tabla de resultados en el reporte del Paso 2.
 
 ### Crear — POST /api/organizaciones/:id/viajes (cualquier miembro)
 Orden: PyME SUSPENDIDA -> 403; Zod (id_conductor, paradas, fecha con
-ANTICIPACION_MINIMA_MINUTOS, condiciones); vinculo ACTIVO -> si no 400; vehiculo
-propio que cumpla las condiciones -> si no 400 con la lista; precio con
+ANTICIPACION_MINIMA_MINUTOS, motivo, descripcion; condiciones_requeridas se
+descarta); vinculo ACTIVO -> si no 400; al menos un vehiculo propio -> si no
+400; precio con
 estimarCosto SIN cambios (fuera de la tx). Queda ASIGNADO sin vehiculo, ruta
 planeada best-effort, timer de vencimiento, viaje:asignado al chofer y a la PyME.
 
 ### Chofer — /api/choferes/viajes
 - GET (grupo asignados | confirmados | en_curso | historial, o estado=): sus
   viajes internos de TODAS sus PyMEs, cada uno con organizacion.nombre.
-- confirmar { id_vehiculo }: propio y que cumpla -> CONFIRMADO.
+- confirmar { id_vehiculo }: cualquier vehiculo PROPIO -> CONFIRMADO (sin
+  condiciones, aunque el viaje viejo las tenga guardadas).
 - rechazar -> RECHAZADO. Las dos solo desde ASIGNADO.
 - iniciar { lat, lng }: CONFIRMADO, dentro de la ventana Y a <=
   RADIO_CONFIRMACION_METROS de la parada de orden 1, con la MISMA distanciaMetros
@@ -366,11 +395,11 @@ planeada best-effort, timer de vencimiento, viaje:asignado al chofer y a la PyME
 - GET lista (grupo activos | en_curso | historial, o estado=) y GET detalle.
   Scoping SIEMPRE por id_organizacion, nunca por usuario. Viaje de otra PyME ->
   404 (no se filtran ids).
-- PUT editar (paradas / fecha / condiciones / descripcion, al menos uno): solo
-  ASIGNADO o CONFIRMADO. Recalcula precio, zona y duracion si cambian paradas o
-  fecha, y la ruta si cambian paradas. CONFIRMADO -> ASIGNADO con vehiculo null.
-  El chofer actual tiene que seguir cumpliendo las condiciones (si no, 400:
-  reasignar). Reprograma el timer.
+- PUT editar (paradas / fecha / motivo / descripcion, al menos uno): solo
+  ASIGNADO o CONFIRMADO. El viaje tiene que QUEDAR con motivo y descripcion
+  (un viaje viejo sin alguno -> 400 si no lo manda). Recalcula precio, zona y
+  duracion si cambian paradas o fecha, y la ruta si cambian paradas.
+  CONFIRMADO -> ASIGNADO con vehiculo null. Reprograma el timer.
 - POST reasignar { id_conductor }: solo ASIGNADO o CONFIRMADO, mismas
   validaciones que crear, mismo chofer -> 400. Vuelve a ASIGNADO con vehiculo
   null y metodo_cobro del vinculo nuevo.
@@ -712,7 +741,8 @@ serie: 31 viajes x 9 tramos = 279 llamadas Pro.
 - frecuencia DIARIA | DIAS_SEMANA (dias_semana, ISO 1 = lunes ... 7 = domingo) |
   SEMANAL (dia_semana) | MENSUAL (dia_mes 1..31); hora "HH:MM" LOCAL;
   fecha_desde / fecha_hasta @db.Date LOCALES; paradas = plantilla YA RESUELTA
-  (snapshot, con id_lugar); condiciones; descripcion; estado ACTIVA |
+  (snapshot, con id_lugar); motivo y descripcion (se copian a cada viaje);
+  condiciones (SIN USO desde el pedido del front, queda []); estado ACTIVA |
   CANCELADA | BORRADA (+ fecha_baja, baja_por_id_usuario). Viaje.id_serie.
 - ZONA HORARIA: America/Argentina/Buenos_Aires. "Todos los dias a las 9:00" =
   9:00 de Buenos Aires = 12:00Z. localAUtc calcula el offset con Intl en el
@@ -742,8 +772,7 @@ serie: 31 viajes x 9 tramos = 279 llamadas Pro.
 3. UNA transaccion: bloquearVinculoActivo (el MISMO lock que crear: serializa
    contra desvincular; vinculo cortado -> 400 y rollback) -> serieViaje.create ->
    viaje.createManyAndReturn (todos ASIGNADO, con precio, zona, tarifas,
-   estimado e id_serie) -> parada.createMany -> condicionRequerida.createMany.
-   ~5 queries, no un round-trip por viaje. Los ids se emparejan por
+   estimado, id_serie, motivo y descripcion) -> parada.createMany. ~4 queries, no un round-trip por viaje. Los ids se emparejan por
    fecha_programada (unica en la serie), NO por el orden del RETURNING.
 4. Fuera de la tx: historial ASIGNADO en LOTE (registrarCambiosEstado, nunca
    tira), programarVencimientoInterno por viaje, ruta planeada en Redis SOLO de
@@ -941,6 +970,103 @@ GUARDS VERIFICADOS REVIRTIENDOLOS (test-cierre-viaje.js):
   hora prevista, si se quiere.
 - El iniciar LEGACY no bloquea un segundo viaje en curso.
 - Los timers de cierre: misma limitacion de un solo proceso que el resto.
+
+## Pedido del front 20-10-2026
+
+### Condiciones especiales FUERA del ciclo interno
+- El ciclo interno NO tiene condiciones: no se piden (los schemas de crear /
+  editar viaje y de crear serie ya no las tienen; si llegan, z.object las
+  descarta sin error), no se validan (validarChoferAsignable exige vinculo +
+  al menos un vehiculo propio; confirmar acepta cualquier vehiculo PROPIO;
+  reasignar y editar no las miran) y no se devuelven (INCLUDE_VIAJE_INTERNO sin
+  condiciones_req; serializarViaje, resumenViaje y serializarSerie sin
+  condiciones_requeridas; GET /api/viajes/:id omite condiciones_req en un
+  viaje interno).
+- Un viaje viejo con condiciones guardadas se confirma con cualquier vehiculo
+  propio y se reasigna a cualquier chofer vinculado con vehiculo: sus filas de
+  condicion_requerida quedan en la base SIN USO.
+- Las condiciones del VEHICULO son SOLO del marketplace (elegibilidad legacy).
+  Los endpoints de vehiculos (/api/conductores/mis-vehiculos y
+  /condiciones/:condicion) NO cambiaron: las condiciones son opcionales al
+  crear (ya eran .optional().default([])), PUT no las acepta, y se siguen
+  devolviendo (son datos del vehiculo; la lista de choferes de la PyME tambien
+  las muestra). El ciclo interno no las lee en ningun lado.
+- Lo unico compartido con la legacy que se toco: GET /api/viajes/:id (omitir
+  condiciones_req si id_organizacion != null). El admin sigue viendo la fila
+  cruda (no es PyME ni chofer).
+
+### Motivo y descripcion — viaje-validacion.js
+- Viaje.motivo y SerieViaje.motivo (String?, columnas nuevas; null en viajes
+  viejos y legacy). schemaMotivo (trim, 1 a 120) y schemaDescripcion (trim, 1
+  a 500). Mensajes: "motivo es requerido", "motivo debe ser texto", "motivo no
+  puede estar vacio", "motivo puede tener como máximo 120 caracteres" (idem
+  descripcion, "requerida" / "vacia").
+- OBLIGATORIOS al crear un viaje interno y una serie (la serie los copia a cada
+  viaje generado; despues cada viaje se edita por su cuenta).
+- EDITAR valida el ESTADO RESULTANTE (faltantesContenido, pura): en el body son
+  opcionales pero, si llegan, con las mismas reglas (null o vacio -> 400). Un
+  viaje viejo sin motivo / descripcion -> 400 "El viaje no tiene motivo:
+  completalo para poder editarlo" (o descripcion, o "motivo ni descripcion:
+  completalos"), despues del 400 de estado no editable. "Al menos un campo" =
+  paradas / fecha_programada / motivo / descripcion (un body con SOLO
+  condiciones_requeridas -> 400).
+- El chequeo va fuera de la tx y alcanza porque es MONOTONO: ningun endpoint
+  vuelve a dejar motivo o descripcion vacios, asi que una vez completos no se
+  pueden "descompletar" entre el chequeo y la escritura.
+- NUNCA se bloquean por motivo / descripcion faltantes: reasignar (es
+  operativo, no edita el contenido), cancelar, finalizar y todo el ciclo del
+  chofer. Un viaje viejo sin motivo se lee, se reasigna y se cancela.
+- Sale en la fila cruda (listas y detalle de la PyME y del chofer, respuestas
+  de crear / editar / reasignar, GET /api/viajes/:id) y en resumenViaje
+  (viaje:asignado, viaje:editado, serie:asignada). serializarSerie lo suma.
+- La legacy (POST /api/viajes) no cambio: descripcion opcional, sin motivo.
+
+### Licencia opcional — en dos pasos por la DB compartida
+- Paso A (este pedido): nro_licencia y licencia_vencimiento nullable en la base
+  y en Prisma. Sin indices ni unique sobre la licencia y nada la usa para
+  decidir nada (ni elegibilidad, ni remito). Las lecturas toleran null sin
+  codigo extra (spread de la fila; la licencia sale null). El registro la sigue
+  EXIGIENDO: schemaConductor() se arma por request segun licenciaOpcional().
+- Paso B (solo variable): LICENCIA_OPCIONAL=true -> nro_licencia y
+  licencia_vencimiento opcionales en POST /api/auth/registro-conductor; si llega
+  uno, se valida igual que siempre. PUT /api/auth/perfil NO acepta licencia (no
+  la aceptaba antes y no se agrego: la verificacion futura va a ser con foto).
+- Las lecturas con licencia null se prueban con UNITARIOS (prisma mockeado,
+  src/controllers/licencia-null.test.js): admin usuarios lista y detalle, /me,
+  choferes de la PyME, GET /api/viajes/:id. La integracion que ESCRIBE un
+  conductor con licencia NULL (test-identidad CASO 15c/15d) va detras de
+  TEST_LICENCIA_NULL=1 y se saltea por defecto.
+
+### Simulador del front — e2e/sim/
+- Test de caja negra del equipo del front (sim-finalizar-viaje.mjs + coleccion
+  de Postman + CONTRATO-FINALIZAR.md + HALLAZGOS.md). Crea sus cuentas
+  sim+...@fleter.test, recorre el viaje de PyME con GPS por socket y chequea el
+  contrato: Paso 3, motivo / descripcion / sin condiciones, y Tarea 5
+  (finalizar antes de la hora prevista -> 409, segundo viaje en curso -> 409,
+  viaje:finalizado con cerrado_por CHOFER, secuencia exacta de
+  viaje:estado_cambiado: la ultima salida no lo emite).
+- Corre en CI (job e2e-staging, despues del E2E) y a mano:
+  `FLETER_API=http://localhost:3000 node e2e/sim/sim-finalizar-viaje.mjs`. Lee
+  FIREBASE_WEB_API_KEY (o FIREBASE_API_KEY) del entorno, de e2e/sim/.env o del
+  .env de la raiz. La key NO se commitea (el .env.example del zip la traia).
+- Deja datos (no puede borrar usuarios): 2 usuarios, PyME, vehiculo, un viaje
+  FINALIZADO con remito y uno CANCELADO por corrida. Cancela al final todo
+  viaje que haya quedado vivo. El resto: `node scripts/restos.js --solo sim`.
+- NO registra un chofer sin licencia hasta que production tenga el Paso A.
+
+### PENDIENTES
+- Cuando este pedido este en main y DESPLEGADO en production: activar
+  TEST_LICENCIA_NULL=1 en test-regresion.js (o sacar la variable y que el CASO
+  15c/15d corra siempre) y prender LICENCIA_OPCIONAL=true en Railway staging y
+  production (las dos a la vez: la DB es compartida).
+- Limpieza para cuando se separen las DBs (Tarea 3): tabla
+  condicion_requerida (en lo interno), series_viaje.condiciones y, si el
+  marketplace no vuelve, el enum TipoCondicion y condicion_vehiculo.
+- Motivo en el remito PDF, si se quiere.
+- BUG en src (no se toco, vehiculos quedan como estan): conductores.controller
+  hace `parsed.error.errors[0]`, que con Zod 4 es undefined -> un body invalido
+  en POST / PUT /api/conductores/mis-vehiculos da 500 en vez de 400 (mismo
+  archivo que el pendiente de PUT /mis-vehiculos/undefined).
 
 ## Maquina de estados — src/services/estado-viaje.service.js
 Hay DOS ciclos con su tabla cada uno: TRANSICIONES (este, el LEGACY del
@@ -1848,6 +1974,16 @@ CIERRE_BARRIDO_ARRANQUE=1         (SOLO tests: =0 apaga el barrido de arranque
 CIERRE_BARRIDO_ID_ORGANIZACION    (SOLO tests: limita ese barrido a una PyME)
 CIERRE_FIN_DIA_SEGUNDOS_TEST      (SOLO tests: el "fin del dia" pasa a ser el
                                    inicio + N s. En Railway NUNCA)
+LICENCIA_OPCIONAL=false           (pedido del front: 'true' o '1' hacen opcional
+                                   la licencia en el registro del chofer. Se lee
+                                   en cada request. NO prenderla hasta que
+                                   production tenga el Paso A, y en los dos
+                                   environments a la vez)
+TEST_LICENCIA_NULL                (SOLO tests: =1 corre test-identidad CASO
+                                   15c/15d, que escriben un conductor con
+                                   licencia NULL)
+FLETER_API                        (SOLO tests: backend del simulador del front,
+                                   default staging; en CI = TEST_API_URL)
 Todas se leen en CADA request (no se cachean), con guarda: un
 valor basura o <= 0 cae al default.
 
@@ -1882,11 +2018,15 @@ MATCHING_TIMEOUT eliminado POR COMPLETO — no queda ningun rastro:
   y CIERRE_EXTENSION_MINUTOS (los dos procesos cierran solos viajes de la misma
   DB).
   Conviene que MAX_PARADAS_POR_VIAJE tambien valga lo mismo (un viaje creado en
-  un environment se edita desde el otro).
+  un environment se edita desde el otro). LICENCIA_OPCIONAL se prende en los
+  dos a la vez, y solo con el Paso A en production.
+- RADIO_CONFIRMACION_METROS esta en 200 en staging y production (el default de
+  codigo es 50). El contrato del front (e2e/sim/CONTRATO-FINALIZAR.md) lo
+  documenta asi.
 - NO cargar en Railway las [SOLO TESTS] (RESERVA_BARRIDO_ARRANQUE,
   VENCIMIENTO_BARRIDO_ARRANQUE, CIERRE_BARRIDO_ARRANQUE,
   CIERRE_BARRIDO_ID_ORGANIZACION, CIERRE_FIN_DIA_SEGUNDOS_TEST,
-  FIREBASE_WEB_API_KEY, TEST_*). VENTANA_INICIO_MINUTOS
+  FIREBASE_WEB_API_KEY, TEST_*, FLETER_API). VENTANA_INICIO_MINUTOS
   ya no la lee nadie: borrarla. Las que el codigo lee y no estan cargadas
   (ETA_*, RUTA_RECALCULO_COOLDOWN_SEGUNDOS, FEE_PORCENTAJE, TARIFA_*) corren con
   el default de codigo: cargarlas solo para cambiar ese valor.
@@ -1916,6 +2056,13 @@ MATCHING_TIMEOUT eliminado POR COMPLETO — no queda ningun rastro:
   TEST_USER_EMAIL, TEST_USER_PASSWORD) y resuelve solo la PyME y el chofer (via
   /api/auth/me y la lista de choferes). Crea un viaje y lo CANCELA (tambien en
   afterAll): staging comparte la DB con produccion.
+- Paso "Simulador del front" (despues del E2E, `if: !cancelled()`, 10 min):
+  `npm ci --omit=dev && npm run sim` en e2e/sim, con FLETER_API =
+  TEST_API_URL y el secret FIREBASE_WEB_API_KEY. Deja sus cuentas
+  sim+...@fleter.test en la DB compartida (ver "Simulador del front").
+- ORDEN con un cambio de schema: el db push va ANTES del merge a develop (el
+  deploy de staging escribe las columnas nuevas apenas sube; si no estan, el
+  E2E y el simulador fallan).
 
 ## Comandos
 npm run dev / npm run lint / npm run test
@@ -1925,7 +2072,11 @@ npm run test:regresion                     (TODAS las suites de abajo en serie,
                                             --solo a,b / --desde x)
 node scripts/restos.js                     (restos de tests en la DB compartida:
                                             SOLO cuenta; --borrar borra, --solo
-                                            elige categorias)
+                                            elige categorias; `sim` = lo que deja
+                                            el simulador del front)
+node e2e/sim/sim-finalizar-viaje.mjs       (simulador del front, caja negra contra
+                                            FLETER_API (default staging); ver
+                                            "Simulador del front")
 Todas las suites necesitan FIREBASE_WEB_API_KEY en el .env (scripts/_firebase-auth.js).
 Las que pegan a "el server" usan TEST_BASE_URL (default http://localhost:3000).
 node scripts/test-fase5.js
@@ -2169,8 +2320,10 @@ Categorias: un patron por suite (-jer-, -vis-, -acc-, -dur-, -conc-, -conf-,
 -vnc-, -hst-, -tmo-, cond-mvc-, _veh_, -vin-, -idn-, -lys-, maps-; usuarios en DB
 y Firebase, incluidos los HUERFANOS de Firebase), `fijas` (viajes de las cuentas
 del seed; las cuentas no se tocan), `e2e` (viajes de la cuenta del E2E),
-`exploratorias` (vehiculos STR* de las stress viejas) y `seed-test` (Empresa
-Test / TEST001 del seed-test.js borrado). Por defecto SOLO CUENTA; --borrar
+`exploratorias` (vehiculos STR* de las stress viejas), `seed-test` (Empresa
+Test / TEST001 del seed-test.js borrado) y `sim` (usuarios *@fleter.test del
+simulador del front, DB y Firebase, con sus PyMEs, vehiculos, viajes y remitos;
+el guard de protegidos sigue valiendo). Por defecto SOLO CUENTA; --borrar
 borra, --solo elige. El --restos de test-viaje-interno y test-lugares-series
 delega aca y TAMBIEN es solo conteo salvo --borrar (CAMBIO: antes borraba
 directo).

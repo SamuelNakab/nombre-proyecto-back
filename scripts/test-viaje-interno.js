@@ -15,9 +15,10 @@
 // no puede barrer viajes reales.
 //
 // Casos:
-//   1. Crear: chofer no vinculado, sin vehiculo compatible, PyME SUSPENDIDA, OK
-//      (estado, metodo_cobro, historial, viaje:asignado al chofer y a la PyME).
-//   2. Confirmar: vehiculo ajeno, incompatible, OK, doble, otro chofer.
+//   1. Crear: chofer no vinculado, condiciones en el body ignoradas, PyME
+//      SUSPENDIDA, OK (estado, metodo_cobro, historial, viaje:asignado al chofer
+//      y a la PyME).
+//   2. Confirmar: vehiculo ajeno, OK, doble, otro chofer.
 //   3. Rechazar -> RECHAZADO; despues no se puede confirmar.
 //   4. Iniciar fuera: antes de la ventana, lejos del origen, las dos, despues
 //      (queda VENCIDO), sin confirmar.
@@ -26,7 +27,7 @@
 //   7. Chofer cancela CONFIRMADO; no puede cancelar en curso.
 //   8. PyME (otro miembro) cancela en curso; Redis limpio.
 //   9. Reasignar: eventos a los dos choferes, vehiculo null.
-//  10. Editar CONFIRMADO -> ASIGNADO.
+//  10. Editar CONFIRMADO -> ASIGNADO (condiciones en el body ignoradas).
 //  11. Vencimiento por TIMER (server 3602).
 //  12. Vencimiento por chequeo PEREZOSO (lectura de la PyME, del chofer, accion).
 //  13. Desvincular con 2 ASIGNADO + 1 CONFIRMADO + 1 en curso -> todos CANCELADO;
@@ -44,6 +45,14 @@
 //      contra las paradas y contra el historial (±1 s); orden obligatorio;
 //      confirmar la ultima ya no finaliza.
 //  20. Cancelar en curso guarda lo medido (manejando y en una parada).
+//  22. Motivo y descripcion (pedido del front 20-10-2026): obligatorios al crear
+//      (ausente / vacio / > 120 -> 400), trim, en las lecturas de la PyME y del
+//      chofer y en viaje:asignado; un viaje VIEJO sin motivo o sin descripcion
+//      no se edita sin completarlo, pero se reasigna y se cancela.
+//  23. Sin condiciones: un viaje con condiciones guardadas (viaje viejo) se
+//      confirma con un vehiculo que no las cumple y se reasigna a un chofer sin
+//      vehiculos que las cumplan; no se devuelven por ningun canal del chofer ni
+//      de la PyME; las del body (crear / editar) se ignoran.
 //
 // Acepta numeros de caso (el setup corre siempre):
 //   node scripts/test-viaje-interno.js 17
@@ -239,11 +248,14 @@ const enMin = (n) => new Date(Date.now() + n * 60000).toISOString();
 
 // -- Acciones del ciclo -------------------------------------------------------
 
-const crear = async (u, idOrg, { id_conductor, minutos = 2, condiciones = [], paradas = [ORIGEN, DESTINO] }, base = BASE) => {
+// motivo y descripcion son obligatorios desde el pedido del front 20-10-2026.
+const MOTIVO = 'Test viaje interno';
+const DESCRIPCION = 'Indicaciones de prueba: porton azul';
+const crear = async (u, idOrg, { id_conductor, minutos = 2, paradas = [ORIGEN, DESTINO], extra = {} }, base = BASE) => {
   const r = await api(
     'POST',
     `/api/organizaciones/${idOrg}/viajes`,
-    { id_conductor, fecha_programada: enMin(minutos), condiciones_requeridas: condiciones, paradas },
+    { id_conductor, fecha_programada: enMin(minutos), motivo: MOTIVO, descripcion: DESCRIPCION, paradas, ...extra },
     u.token,
     base
   );
@@ -361,7 +373,7 @@ async function limpiar() {
 // -- Casos --------------------------------------------------------------------
 
 async function casosPrincipales(ctx) {
-  const { P1, P2, Q1, K1, K2, K3, K4, K5, A, B, v1a, v1b, v2, sP1, sP2, sQ1, sK1, sK2 } = ctx;
+  const { P1, P2, Q1, K1, K2, K3, K4, K5, A, B, v1a, v2, sP1, sP2, sQ1, sK1, sK2 } = ctx;
 
   // CASO 1 -------------------------------------------------------------------
   if (correr(1)) {
@@ -369,8 +381,16 @@ async function casosPrincipales(ctx) {
     const noVinc = await crear(P1, A, { id_conductor: K3.id_conductor });
     paso('CASO 1a: chofer no vinculado → 400', noVinc.status === 400 && /no esta vinculado/.test(noVinc.data.error), r2s(noVinc));
 
-    const sinVeh = await crear(P1, A, { id_conductor: K4.id_conductor, condiciones: ['REFRIGERADO'] });
-    paso('CASO 1b: sin vehiculo compatible → 400 con las condiciones', sinVeh.status === 400 && /REFRIGERADO/.test(sinVeh.data.error), r2s(sinVeh));
+    // K4 solo tiene un vehiculo SIN condiciones: antes era 400 "sin vehiculo
+    // compatible". El ciclo interno ya no tiene condiciones: se ignoran.
+    const condIgnoradas = await crear(P1, A, { id_conductor: K4.id_conductor, extra: { condiciones_requeridas: ['REFRIGERADO'] } });
+    const filasCond = condIgnoradas.status === 201 ? await prisma.condicionRequerida.count({ where: { id_viaje: condIgnoradas.data.id_viaje } }) : -1;
+    paso(
+      'CASO 1b: condiciones_requeridas en el body → se ignoran (201, sin filas, sin el campo en la respuesta)',
+      condIgnoradas.status === 201 && filasCond === 0 && !('condiciones_requeridas' in condIgnoradas.data),
+      `${condIgnoradas.status} filas=${filasCond}`
+    );
+    if (condIgnoradas.status === 201) await cancelarPyme(P1, A, condIgnoradas.data.id_viaje);
 
     await prisma.organizacion.update({ where: { id_organizacion: A }, data: { estado: 'SUSPENDIDA' } });
     const susp = await crear(P1, A, { id_conductor: K1.id_conductor });
@@ -380,10 +400,9 @@ async function casosPrincipales(ctx) {
     const sinChofer = await api('POST', `/api/organizaciones/${A}/viajes`, { fecha_programada: enMin(5), paradas: [ORIGEN, DESTINO] }, P1.token);
     paso('CASO 1d: sin id_conductor → 400', sinChofer.status === 400, r2s(sinChofer));
 
-    const ok = await crear(P1, A, { id_conductor: K1.id_conductor, condiciones: ['FRAGIL'] });
+    const ok = await crear(P1, A, { id_conductor: K1.id_conductor });
     ejemplo('crear_201', ok);
     ejemplo('crear_400_no_vinculado', noVinc);
-    ejemplo('crear_400_sin_vehiculo', sinVeh);
     ejemplo('crear_403_suspendida', susp);
     const v = ok.data;
     paso(
@@ -430,11 +449,10 @@ async function casosPrincipales(ctx) {
   // CASO 2 -------------------------------------------------------------------
   if (correr(2)) {
     titulo('CASO 2: confirmar');
-    const id = await crearOk(P1, A, { id_conductor: K1.id_conductor, condiciones: ['FRAGIL'] });
+    const id = await crearOk(P1, A, { id_conductor: K1.id_conductor });
     const ajeno = await confirmar(K1, id, v2);
     paso('CASO 2a: vehiculo ajeno → 400', ajeno.status === 400 && /no es tuyo/.test(ajeno.data.error), r2s(ajeno));
-    const incompat = await confirmar(K1, id, v1b);
-    paso('CASO 2b: vehiculo incompatible → 400', incompat.status === 400 && /no cumple/.test(incompat.data.error), r2s(incompat));
+    // (El viejo 2b, "vehiculo incompatible -> 400", ya no existe: ver CASO 23.)
     const otro = await confirmar(K2, id, v2);
     paso('CASO 2c: otro chofer → 404', otro.status === 404, r2s(otro));
     const ok = await confirmar(K1, id, v1a);
@@ -447,7 +465,6 @@ async function casosPrincipales(ctx) {
     paso('CASO 2e: viaje:confirmado a la PyME', await esperarEvento(sP1, 'viaje:confirmado', id), '');
     ejemplo('confirmar_200', ok);
     ejemplo('confirmar_400_ajeno', ajeno);
-    ejemplo('confirmar_400_incompatible', incompat);
     ejemplo('evento_viaje_confirmado', eventoDe(sP1, 'viaje:confirmado', id));
     const doble = await confirmar(K1, id, v1a);
     paso('CASO 2f: confirmar de nuevo → 400', doble.status === 400, r2s(doble));
@@ -664,7 +681,7 @@ async function casosPrincipales(ctx) {
   // CASO 9 -------------------------------------------------------------------
   if (correr(9)) {
     titulo('CASO 9: reasignar');
-    const id = await crearOk(P1, A, { id_conductor: K1.id_conductor, condiciones: ['FRAGIL'] });
+    const id = await crearOk(P1, A, { id_conductor: K1.id_conductor });
     await okOFalla(confirmar(K1, id, v1a), 'confirmar');
     const r = await reasignar(P1, A, id, K2.id_conductor);
     const db = await viajeDb(id);
@@ -691,27 +708,31 @@ async function casosPrincipales(ctx) {
   // CASO 10 ------------------------------------------------------------------
   if (correr(10)) {
     titulo('CASO 10: editar');
-    const id = await crearOk(P1, A, { id_conductor: K1.id_conductor, condiciones: ['FRAGIL'] });
+    const id = await crearOk(P1, A, { id_conductor: K1.id_conductor });
     await okOFalla(confirmar(K1, id, v1a), 'confirmar');
     const r = await editar(P1, A, id, {
       paradas: [ORIGEN, INTERMEDIA, DESTINO],
+      // Un cliente viejo todavia las manda: se ignoran.
       condiciones_requeridas: ['FRAGIL', 'REFRIGERADO'],
+      motivo: 'Motivo editado',
       descripcion: 'editado',
       fecha_programada: enMin(30),
     });
     const db = await viajeDb(id);
     const paradas = await prisma.parada.count({ where: { id_viaje: id } });
-    const conds = (await prisma.condicionRequerida.findMany({ where: { id_viaje: id } })).map((c) => c.condicion).sort();
+    const conds = await prisma.condicionRequerida.count({ where: { id_viaje: id } });
     paso(
-      'CASO 10a: editar CONFIRMADO → ASIGNADO, sin vehiculo, paradas y condiciones nuevas',
-      r.status === 200 && db.estado === 'ASIGNADO' && db.id_vehiculo === null && paradas === 3 && conds.join() === 'FRAGIL,REFRIGERADO' && db.descripcion === 'editado',
-      `${r.status} estado=${db.estado} paradas=${paradas} conds=${conds}`
+      'CASO 10a: editar CONFIRMADO → ASIGNADO, sin vehiculo, paradas, motivo y descripcion nuevos; condiciones ignoradas',
+      r.status === 200 && db.estado === 'ASIGNADO' && db.id_vehiculo === null && paradas === 3 && conds === 0 &&
+        db.motivo === 'Motivo editado' && db.descripcion === 'editado' && r.data.motivo === 'Motivo editado' &&
+        !('condiciones_requeridas' in r.data),
+      `${r.status} estado=${db.estado} paradas=${paradas} conds=${conds} motivo=${db.motivo}`
     );
     ejemplo('editar_200', r);
     ejemplo('evento_viaje_editado', eventoDe(sK1, 'viaje:editado', id));
     paso('CASO 10b: viaje:editado al chofer con confirmacion_anulada', await esperarEvento(sK1, 'viaje:editado', id, 4000, (d) => d.confirmacion_anulada === true), '');
-    const incompat = await editar(P1, A, id, { condiciones_requeridas: ['CARGA_PESADA'] });
-    paso('CASO 10c: condiciones que el chofer no cumple → 400', incompat.status === 400 && /Reasigna/.test(incompat.data.error), r2s(incompat));
+    const soloCond = await editar(P1, A, id, { condiciones_requeridas: ['CARGA_PESADA'] });
+    paso('CASO 10c: un body con SOLO condiciones_requeridas → 400 "al menos un campo" (no hay nada que editar)', soloCond.status === 400 && /al menos un campo/.test(soloCond.data.error), r2s(soloCond));
     const vacio = await editar(P1, A, id, {});
     paso('CASO 10d: body vacio → 400', vacio.status === 400, r2s(vacio));
 
@@ -734,7 +755,7 @@ async function casosPrincipales(ctx) {
       r2s(soloFecha).slice(0, 80)
     );
     const reconf = await confirmar(K1, id, v1a);
-    paso('CASO 10e: el chofer vuelve a confirmar con un vehiculo que cumple las condiciones nuevas', reconf.status === 200, r2s(reconf));
+    paso('CASO 10e: el chofer vuelve a confirmar', reconf.status === 200, r2s(reconf));
     await okOFalla(iniciar(K1, id), 'iniciar');
     const enCurso = await editar(P1, A, id, { descripcion: 'x' });
     paso('CASO 10f: editar en curso → 400', enCurso.status === 400, r2s(enCurso));
@@ -935,6 +956,8 @@ async function casosPrincipales(ctx) {
 
   if (correr(19)) await casoCicloPorParada(ctx);
   if (correr(20)) await casoCancelarEnCurso(ctx);
+  if (correr(22)) await casoMotivoDescripcion(ctx);
+  if (correr(23)) await casoSinCondiciones(ctx);
 }
 
 // CASO 19: viaje de 4 paradas de punta a punta, con esperas controladas.
@@ -1041,6 +1064,118 @@ async function casoCicloPorParada(ctx) {
   paso('CASO 19k: la PyME recibio estado_cambiado por cada llegada y salida', sP1.eventos.filter((e) => e.ev === 'viaje:estado_cambiado' && e.d?.id_viaje === id).length >= 7, '');
 }
 
+// CASO 22: motivo y descripcion (pedido del front 20-10-2026).
+async function casoMotivoDescripcion(ctx) {
+  const { P1, K1, K2, A, sK1 } = ctx;
+  titulo('CASO 22: motivo y descripcion');
+
+  // a. Validaciones de crear: Zod, antes de Google (no gastan llamadas).
+  const cuerpo = (extra) => ({ id_conductor: K1.id_conductor, fecha_programada: enMin(5), paradas: [ORIGEN, DESTINO], motivo: MOTIVO, descripcion: DESCRIPCION, ...extra });
+  const post = (body) => api('POST', `/api/organizaciones/${A}/viajes`, body, P1.token);
+  const sin = (clave) => Object.fromEntries(Object.entries(cuerpo()).filter(([k]) => k !== clave));
+  const casos = [
+    ['sin motivo', sin('motivo'), /^motivo es requerido$/],
+    ['motivo vacio', cuerpo({ motivo: '' }), /^motivo no puede estar vacio$/],
+    ['motivo con solo espacios', cuerpo({ motivo: '   ' }), /^motivo no puede estar vacio$/],
+    ['motivo de 121', cuerpo({ motivo: 'x'.repeat(121) }), /como máximo 120 caracteres/],
+    ['sin descripcion', sin('descripcion'), /^descripcion es requerida$/],
+    ['descripcion vacia', cuerpo({ descripcion: '  ' }), /^descripcion no puede estar vacia$/],
+    ['descripcion de 501', cuerpo({ descripcion: 'x'.repeat(501) }), /como máximo 500 caracteres/],
+  ];
+  const malos = [];
+  for (const [nombre, body, re] of casos) {
+    const r = await post(body);
+    if (r.status === 201) viajesCreados.add(r.data.id_viaje);
+    if (!(r.status === 400 && re.test(r.data?.error ?? ''))) malos.push(`${nombre}: ${r2s(r)}`);
+  }
+  paso('CASO 22a: motivo ausente / vacio / > 120 y descripcion ausente / vacia / > 500 → 400 con su mensaje', malos.length === 0, malos.join(' | '));
+
+  // b. Crear OK (trim) y lecturas.
+  const ok = await crear(P1, A, { id_conductor: K1.id_conductor, extra: { motivo: '  Reposicion sucursal Pilar  ', descripcion: ' Porton azul ' } });
+  if (ok.status !== 201) throw new Error(`crear (22b) fallo: ${r2s(ok)}`);
+  const id = ok.data.id_viaje;
+  const db = await viajeDb(id);
+  paso('CASO 22b: se guarda sin espacios en los bordes y vuelve en la respuesta', db.motivo === 'Reposicion sucursal Pilar' && db.descripcion === 'Porton azul' && ok.data.motivo === db.motivo, `motivo="${db.motivo}" desc="${db.descripcion}"`);
+  const enLista = (r) => r.status === 200 && r.data.find((v) => v.id_viaje === id)?.motivo === db.motivo;
+  const lp = await listaPyme(P1, A);
+  const dp = await detallePyme(P1, A, id);
+  const lc = await listaChofer(K1);
+  const dc = await detalleChofer(K1, id);
+  paso(
+    'CASO 22c: motivo en la lista y el detalle de la PyME y en la lista y el detalle del chofer',
+    enLista(lp) && dp.data?.motivo === db.motivo && enLista(lc) && dc.data?.motivo === db.motivo && dc.data?.descripcion === 'Porton azul',
+    `listaPyme=${enLista(lp)} detPyme=${dp.data?.motivo} listaChofer=${enLista(lc)} detChofer=${dc.data?.motivo}`
+  );
+  paso('CASO 22d: viaje:asignado al chofer trae motivo (y no condiciones_requeridas)', await esperarEvento(sK1, 'viaje:asignado', id, 4000, (d) => d.motivo === db.motivo && !('condiciones_requeridas' in d)), JSON.stringify(eventoDe(sK1, 'viaje:asignado', id) ?? {}).slice(0, 120));
+
+  // c. Viaje VIEJO sin motivo (se simula vaciando la columna).
+  await prisma.viaje.update({ where: { id_viaje: id }, data: { motivo: null } });
+  const sinM = await editar(P1, A, id, { fecha_programada: enMin(20) });
+  paso('CASO 22e: PUT de un viaje viejo sin motivo, sin mandarlo → 400', sinM.status === 400 && sinM.data.error === 'El viaje no tiene motivo: completalo para poder editarlo', r2s(sinM));
+  const conM = await editar(P1, A, id, { motivo: 'Completado' });
+  paso('CASO 22f: mandandolo → 200 y queda guardado', conM.status === 200 && (await viajeDb(id)).motivo === 'Completado' && conM.data.motivo === 'Completado', r2s(conM).slice(0, 100));
+
+  // d. Sin descripcion, y sin los dos.
+  await prisma.viaje.update({ where: { id_viaje: id }, data: { descripcion: null } });
+  const sinD = await editar(P1, A, id, { motivo: 'Otro' });
+  await prisma.viaje.update({ where: { id_viaje: id }, data: { motivo: null } });
+  const sinNada = await editar(P1, A, id, { fecha_programada: enMin(25) });
+  const descNull = await editar(P1, A, id, { descripcion: null });
+  const dosOk = await editar(P1, A, id, { motivo: 'Motivo nuevo', descripcion: 'Descripcion nueva' });
+  paso(
+    'CASO 22g: sin descripcion → 400; sin los dos → 400; descripcion null → 400; mandando los dos → 200',
+    sinD.status === 400 && /no tiene descripcion/.test(sinD.data.error) &&
+      sinNada.status === 400 && /motivo ni descripcion/.test(sinNada.data.error) &&
+      descNull.status === 400 && /descripcion debe ser texto/.test(descNull.data.error) &&
+      dosOk.status === 200,
+    `${r2s(sinD)} | ${r2s(sinNada)} | ${r2s(descNull)} | ${dosOk.status}`
+  );
+
+  // e. Reasignar y cancelar NUNCA se bloquean por motivo / descripcion.
+  await prisma.viaje.update({ where: { id_viaje: id }, data: { motivo: null, descripcion: null } });
+  const reas = await reasignar(P1, A, id, K2.id_conductor);
+  paso('CASO 22h: reasignar un viaje viejo sin motivo ni descripcion → 200', reas.status === 200 && (await viajeDb(id)).id_conductor === K2.id_conductor, r2s(reas).slice(0, 100));
+  const canc = await cancelarPyme(P1, A, id);
+  paso('CASO 22i: cancelar un viaje viejo sin motivo → 200', canc.status === 200, r2s(canc));
+}
+
+// CASO 23: el ciclo interno no tiene condiciones (pedido del front 20-10-2026).
+async function casoSinCondiciones(ctx) {
+  const { P1, K2, K4, A, v2 } = ctx;
+  titulo('CASO 23: sin condiciones');
+  // K2 solo tiene un vehiculo FRAGIL; K4 uno sin condiciones.
+  const r = await crear(P1, A, { id_conductor: K2.id_conductor, extra: { condiciones_requeridas: ['REFRIGERADO', 'CARGA_PESADA'] } });
+  if (r.status !== 201) throw new Error(`crear (23) fallo: ${r2s(r)}`);
+  const id = r.data.id_viaje;
+  paso('CASO 23a: condiciones_requeridas en el body de crear → ignoradas (sin filas)', (await prisma.condicionRequerida.count({ where: { id_viaje: id } })) === 0 && !('condiciones_requeridas' in r.data), '');
+
+  // Un viaje VIEJO con condiciones guardadas (se insertan a mano).
+  await prisma.condicionRequerida.createMany({
+    data: ['REFRIGERADO', 'CARGA_PESADA'].map((condicion) => ({ id_viaje: id, condicion })),
+  });
+  const dp = await detallePyme(P1, A, id);
+  const lp = await listaPyme(P1, A);
+  const dc = await detalleChofer(K2, id);
+  const lc = await listaChofer(K2);
+  const legacy = await api('GET', `/api/viajes/${id}`, null, K2.token);
+  const sinCampo = (o) => o && !('condiciones_requeridas' in o) && !('condiciones_req' in o);
+  paso(
+    'CASO 23b: no se devuelven en la PyME (lista y detalle), el chofer (lista y detalle) ni GET /api/viajes/:id',
+    dp.status === 200 && sinCampo(dp.data) && sinCampo(lp.data?.find((v) => v.id_viaje === id)) &&
+      dc.status === 200 && sinCampo(dc.data) && sinCampo(lc.data?.find((v) => v.id_viaje === id)) &&
+      legacy.status === 200 && sinCampo(legacy.data),
+    `${dp.status} ${dc.status} ${legacy.status}`
+  );
+  const conf = await confirmar(K2, id, v2);
+  paso('CASO 23c: se confirma con un vehiculo que NO cumple las condiciones guardadas → 200', conf.status === 200 && (await viajeDb(id)).estado === 'CONFIRMADO', r2s(conf));
+  const ed = await editar(P1, A, id, { descripcion: 'Editado con condiciones viejas', condiciones_requeridas: ['PELIGROSO'] });
+  const filas = (await prisma.condicionRequerida.findMany({ where: { id_viaje: id } })).map((c) => c.condicion).sort().join();
+  paso('CASO 23d: editar ignora condiciones_requeridas (las viejas quedan como estaban, sin uso)', ed.status === 200 && filas === 'CARGA_PESADA,REFRIGERADO', `${ed.status} filas=${filas}`);
+  const reas = await reasignar(P1, A, id, K4.id_conductor);
+  paso('CASO 23e: se reasigna a un chofer sin vehiculos que las cumplan → 200', reas.status === 200 && (await viajeDb(id)).id_conductor === K4.id_conductor, r2s(reas).slice(0, 100));
+  await cancelarPyme(P1, A, id);
+}
+
 // CASO 20: cancelar en curso guarda lo medido.
 async function casoCancelarEnCurso(ctx) {
   const { P1, K1, A, v1a } = ctx;
@@ -1105,7 +1240,7 @@ async function casoTimer(ctx) {
     await esperar(1000);
     const fecha = new Date(Date.now() + 8000).toISOString();
     const mk = async () => {
-      const r = await api('POST', `/api/organizaciones/${A}/viajes`, { id_conductor: K1.id_conductor, fecha_programada: fecha, paradas: [ORIGEN, DESTINO] }, P1.token, base);
+      const r = await api('POST', `/api/organizaciones/${A}/viajes`, { id_conductor: K1.id_conductor, fecha_programada: fecha, motivo: MOTIVO, descripcion: DESCRIPCION, paradas: [ORIGEN, DESTINO] }, P1.token, base);
       if (r.status !== 201) throw new Error(`crear (timer) fallo: ${r2s(r)}`);
       viajesCreados.add(r.data.id_viaje);
       return r.data.id_viaje;

@@ -18,6 +18,10 @@
 //   - exploratorias: vehiculos STR* que dejaron las stress de scripts/legacy/.
 //   - seed-test: la "Empresa Test" (CUIT 20-99999999-9) y el vehiculo TEST001 del
 //     seed-test.js que se borro.
+//   - sim: lo que deja el simulador del front (e2e/sim): los usuarios
+//     sim+...@fleter.test (DB y Firebase, huerfanos incluidos) con sus PyMEs,
+//     vehiculos, viajes y remitos. Corre en CI en cada push a develop y no puede
+//     borrar lo suyo (es caja negra): se limpia desde aca.
 //
 // El --restos de cada suite delega aca con su patron (y tambien es solo conteo
 // salvo --borrar). La guarda de protegidos de _limpieza.js vale igual.
@@ -44,6 +48,9 @@ export const PATRONES = [
   '-cie-', // test-cierre-viaje
   'maps-', // test-maps
 ];
+// Dominio de las cuentas del simulador del front (e2e/sim). Sirve de patron para
+// contar lo que quede despues de borrar.
+const DOMINIO_SIM = '@fleter.test';
 const FIJAS = EMAILS_PROTEGIDOS.filter((e) => e !== 'chofer-e2e@test.com' && e !== 'admin-test@fleter.com');
 const ESTADOS_FINALES = ['FINALIZADO', 'CANCELADO', 'RECHAZADO', 'VENCIDO'];
 
@@ -100,6 +107,9 @@ async function categorias(fb) {
     entrada: { empresas: empTest.map((e) => e.id_empresa), vehiculos: test001.map((v) => v.id_vehiculo) },
     emails: [],
   });
+  const sim = await prisma.usuario.findMany({ where: { email: { endsWith: DOMINIO_SIM } }, select: { email: true } });
+  const emailsSim = [...new Set([...sim.map((u) => u.email.toLowerCase()), ...fb])].filter((e) => e.endsWith(DOMINIO_SIM));
+  out.push({ nombre: 'sim', entrada: { emails: emailsSim }, emails: emailsSim, patron: DOMINIO_SIM });
   return out;
 }
 
@@ -143,7 +153,7 @@ export async function restos({ solo = null, borrarTodo = false } = {}) {
   for (const { c, r, f } of filas) {
     if (vacia(f)) continue;
     const b = await borrar(r);
-    const v = await contar(r, PATRONES.includes(c.nombre) ? c.nombre : null);
+    const v = await contar(r, c.patron ?? (PATRONES.includes(c.nombre) ? c.nombre : null));
     const fbQuedan = c.emails.length > 0 ? (await emailsFirebase()).filter((e) => c.emails.includes(e)).length : 0;
     ok &&= v.ok && fbQuedan === 0;
     console.log(`  ${c.nombre}: borrados ${JSON.stringify(b)} | quedan ${JSON.stringify({ ...v.conteos, firebase: fbQuedan })}`);

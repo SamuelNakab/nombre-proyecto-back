@@ -219,8 +219,11 @@ model Cliente {
 model Conductor {
   id_conductor          Int      @id @default(autoincrement())
   id_usuario            Int      @unique
-  nro_licencia          String
-  licencia_vencimiento  DateTime
+  // Opcionales desde el pedido del front 20-10-2026 (Paso A): la base acepta
+  // NULL, pero el registro las sigue exigiendo mientras LICENCIA_OPCIONAL no
+  // sea true (Paso B). Ver "Licencia opcional" en CLAUDE.md.
+  nro_licencia          String?
+  licencia_vencimiento  DateTime?
   calificacion_promedio Float    @default(0)
 
   usuario               Usuario             @relation(fields: [id_usuario], references: [id_usuario])
@@ -322,8 +325,12 @@ model SerieViaje {
   fecha_desde         DateTime        @db.Date
   fecha_hasta         DateTime        @db.Date
   paradas             Json
+  // SIN USO desde el pedido del front 20-10-2026: el ciclo interno ya no tiene
+  // condiciones. Queda en su default [] hasta que se separen las DBs.
   condiciones         TipoCondicion[] @default([])
   descripcion         String?
+  // Para que es cada viaje (1 a 120 caracteres). Se copia a cada viaje generado.
+  motivo              String?
   estado              EstadoSerie     @default(ACTIVA)
   fecha_baja          DateTime?
   // Sin FK, mismo criterio que miembros_organizacion.baja_por_id_usuario.
@@ -550,6 +557,9 @@ model CondicionVehiculo {
 // CONDICION REQUERIDA POR EL VIAJE
 // Qué capacidades necesita el viaje.
 // El sistema cruza esta tabla con CondicionVehiculo para filtrar conductores elegibles.
+// SOLO del marketplace (legacy): desde el pedido del front 20-10-2026 el ciclo
+// interno no escribe ni lee filas aca. Las de viajes internos viejos quedan sin
+// uso hasta que se separen las DBs.
 // ─────────────────────────────────────────────
 
 model CondicionRequerida {
@@ -586,6 +596,10 @@ model Viaje {
   duracion_estimada_horas Float?
   fecha_programada        DateTime
   descripcion             String?
+  // Para que es el viaje (trazabilidad de la PyME), 1 a 120 caracteres.
+  // Obligatorio al crear un viaje interno; null en los viajes viejos y en los
+  // legacy del marketplace.
+  motivo                  String?
   estado                  EstadoViaje @default(BUSCANDO_CONDUCTOR)
   fecha_inicio            DateTime?
   // COLUMNA MUERTA. Nadie la escribe ni la lee desde que la puntualidad pasa a

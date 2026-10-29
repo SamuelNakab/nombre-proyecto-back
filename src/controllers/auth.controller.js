@@ -22,10 +22,31 @@ const schemaCliente = schemaBase.extend({
   direccion_principal: z.string().optional(),
 });
 
-const schemaConductor = schemaBase.extend({
+// LICENCIA (pedido del front 20-10-2026). La base ya acepta NULL (Paso A), pero
+// el registro la sigue EXIGIENDO mientras LICENCIA_OPCIONAL no sea 'true' o '1'
+// (Paso B, solo variable). Con la variable prendida cada campo es opcional, y si
+// llega se valida igual que siempre. Se lee en CADA request.
+//
+// OJO: no prender LICENCIA_OPCIONAL en ningun environment mientras production
+// tenga el Prisma viejo (nro_licencia NOT NULL): la DB es compartida y ese
+// Prisma TIRA al leer un conductor sin licencia (p. ej. GET /api/admin/usuarios).
+export function licenciaOpcional(env = process.env) {
+  return env.LICENCIA_OPCIONAL === 'true' || env.LICENCIA_OPCIONAL === '1';
+}
+
+const camposLicencia = {
   nro_licencia: z.string().min(1),
   licencia_vencimiento: z.string().datetime(),
+};
+
+const schemaConductorObligatoria = schemaBase.extend(camposLicencia);
+const schemaConductorOpcional = schemaBase.extend({
+  nro_licencia: camposLicencia.nro_licencia.optional(),
+  licencia_vencimiento: camposLicencia.licencia_vencimiento.optional(),
 });
+
+export const schemaConductor = (opcional = licenciaOpcional()) =>
+  opcional ? schemaConductorOpcional : schemaConductorObligatoria;
 
 const schemaGerente = schemaBase.extend({
   cuit_empresa: z.string().min(11).max(13),
@@ -104,7 +125,7 @@ export async function registrarCliente(req, res) {
 }
 
 export async function registrarConductor(req, res) {
-  const parsed = schemaConductor.safeParse(req.body);
+  const parsed = schemaConductor().safeParse(req.body);
   if (!parsed.success) {
     return res.status(400).json({ error: parsed.error.issues[0].message });
   }
@@ -128,8 +149,8 @@ export async function registrarConductor(req, res) {
         rol: 'CONDUCTOR',
         conductor: {
           create: {
-            nro_licencia,
-            licencia_vencimiento: new Date(licencia_vencimiento),
+            nro_licencia: nro_licencia ?? null,
+            licencia_vencimiento: licencia_vencimiento ? new Date(licencia_vencimiento) : null,
           },
         },
       },

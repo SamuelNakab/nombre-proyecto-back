@@ -4,6 +4,7 @@ import prisma from '../config/prisma.js';
 import { generarCodigoUnico } from '../services/afiliacion.service.js';
 import { organizacionActivaDe } from '../services/organizacion.service.js';
 import { organizacionesDeChofer } from '../services/vinculo-chofer.service.js';
+import { responder400 } from '../services/errores-validacion.js';
 
 // ─── Schemas de validacion ───────────────────────────────────────────────────
 
@@ -88,13 +89,12 @@ export async function registrarCliente(req, res) {
   const parsed = schemaCliente.safeParse(req.body);
   
   if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.issues[0].message });
+    return responder400(res, parsed);
   }
 
   const { nombre, apellido, dni, email, contrasena, telefono, cuit, nombre_empresa, direccion_principal } = parsed.data;
 
   const firebaseUser = await crearEnFirebase(email, contrasena);
-  console.log('Firebase user creation result:', firebaseUser);
   if (firebaseUser.conflicto === 'email') {
     return res.status(409).json({ error: 'El email ya esta registrado' });
   }
@@ -127,7 +127,7 @@ export async function registrarCliente(req, res) {
 export async function registrarConductor(req, res) {
   const parsed = schemaConductor().safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.issues[0].message });
+    return responder400(res, parsed);
   }
 
   const { nombre, apellido, dni, email, contrasena, telefono, nro_licencia, licencia_vencimiento } = parsed.data;
@@ -168,7 +168,7 @@ export async function registrarConductor(req, res) {
 export async function registrarGerente(req, res) {
   const parsed = schemaGerente.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.issues[0].message });
+    return responder400(res, parsed);
   }
 
   const { nombre, apellido, dni, email, contrasena, telefono, cuit_empresa, nombre_empresa } = parsed.data;
@@ -236,7 +236,7 @@ export async function getMe(req, res) {
 export async function actualizarPerfil(req, res) {
   const parsed = schemaActualizarPerfil.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.issues[0].message });
+    return responder400(res, parsed);
   }
 
   const campos = Object.fromEntries(

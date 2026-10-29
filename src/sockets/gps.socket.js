@@ -19,6 +19,7 @@ import {
 } from '../services/estado-viaje.service.js';
 import { salasDeViaje } from './salas.js';
 import { relimpiarSiCerrado } from '../services/cancelacion.service.js';
+import { reportarError } from '../config/sentry.js';
 
 export function registrarHandlersGPS(socket, io) {
   socket.on('conductor:ubicacion', async (data) => {
@@ -246,6 +247,7 @@ export function registrarHandlersGPS(socket, io) {
       await relimpiarSiCerrado(id_viaje, inicioPing);
     } catch (err) {
       console.error('[gps.socket] Error en conductor:ubicacion:', err);
+      reportarError(err, { contexto: 'socket:conductor:ubicacion', usuario: socket.data.usuario });
       socket.emit('error', { error: 'Error interno al procesar ubicacion' });
     }
   });

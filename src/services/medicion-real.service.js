@@ -19,6 +19,7 @@ import prisma from '../config/prisma.js';
 import { obtenerAcumulado } from './gps.service.js';
 import { INCLUDE_HISTORIAL } from './historial-estado.service.js';
 import { tiemposRealesDesdeParadas, tiemposRealesDesdeHistorial } from './tiempos-reales.js';
+import { reportarError } from '../config/sentry.js';
 
 export { tiemposRealesDesdeParadas, tiemposRealesDesdeHistorial } from './tiempos-reales.js';
 
@@ -85,6 +86,7 @@ export async function guardarMedicionParcial(id_viaje, fin) {
     return true;
   } catch (err) {
     console.error(`[medicion-real] no se pudo guardar lo medido del viaje ${id_viaje}: ${err.message}`);
+    reportarError(err, { contexto: 'medicion-real', nivel: 'warning', extra: { id_viaje } });
     return false;
   }
 }

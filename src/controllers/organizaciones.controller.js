@@ -20,6 +20,8 @@ import {
 } from '../services/vinculo-chofer.service.js';
 import { sincronizarSalaOrganizacion } from '../sockets/salas.js';
 import { io } from '../sockets/index.js';
+import { responder400 } from '../services/errores-validacion.js';
+import { idParam } from '../services/id-param.js';
 
 // ─── Schemas ─────────────────────────────────────────────────────────────────
 
@@ -53,11 +55,6 @@ const schemaInvitacion = z.object({
   tipo: z.enum(['MIEMBRO', 'CHOFER'], { error: 'tipo debe ser MIEMBRO o CHOFER' }),
 });
 
-function idParam(valor) {
-  const n = Number(valor);
-  return Number.isInteger(n) && n > 0 ? n : null;
-}
-
 const esResponsable = (req) => req.membresia.rol === 'RESPONSABLE';
 
 // ─── PyME ────────────────────────────────────────────────────────────────────
@@ -65,7 +62,7 @@ const esResponsable = (req) => req.membresia.rol === 'RESPONSABLE';
 // POST /api/organizaciones
 export async function crearOrganizacion(req, res) {
   const parsed = schemaCrear.safeParse(req.body ?? {});
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
+  if (!parsed.success) return responder400(res, parsed);
   try {
     const org = await crearOrganizacionSrv({ id_usuario: req.usuario.id_usuario, ...parsed.data });
     // El creador entra a la sala de la PyME (organizacion:{id}).
@@ -88,7 +85,7 @@ export async function obtenerOrganizacion(req, res) {
 // PUT /api/organizaciones/:id
 export async function editarOrganizacion(req, res) {
   const parsed = schemaEditar.safeParse(req.body ?? {});
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
+  if (!parsed.success) return responder400(res, parsed);
   try {
     const org = await editarOrganizacionSrv({
       id_organizacion: req.id_organizacion,
@@ -113,7 +110,7 @@ export async function cambiarRol(req, res) {
   const id_usuario = idParam(req.params.idUsuario);
   if (!id_usuario) return res.status(400).json({ error: 'id de usuario invalido' });
   const parsed = schemaRol.safeParse(req.body ?? {});
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
+  if (!parsed.success) return responder400(res, parsed);
   try {
     const r = await cambiarRolSrv({
       id_organizacion: req.id_organizacion,
@@ -158,7 +155,7 @@ export async function salir(req, res) {
 // MIEMBRO: solo un responsable. CHOFER: cualquier miembro.
 export async function crearInvitacion(req, res) {
   const parsed = schemaInvitacion.safeParse(req.body ?? {});
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
+  if (!parsed.success) return responder400(res, parsed);
   if (parsed.data.tipo === 'MIEMBRO' && !esResponsable(req)) {
     return res.status(403).json({ error: 'Solo un responsable puede invitar miembros' });
   }

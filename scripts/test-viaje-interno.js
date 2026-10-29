@@ -72,7 +72,7 @@ import redis from '../src/config/redis.js';
 import { conServer } from './_server-efimero.js';
 import { crearRegistro } from './_limpieza.js';
 import { restos } from './restos.js';
-import { getToken as loginFirebase } from './_firebase-auth.js';
+import { getToken as loginFirebase, exigirAdminTest } from './_firebase-auth.js';
 
 const PUERTO = 3601;
 const PUERTO_TIMER = 3602;
@@ -134,6 +134,8 @@ const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
 const titulo = (t) => console.log(`\n-- ${t} ${'-'.repeat(Math.max(0, 60 - t.length))}\n`);
 
 const getToken = (email, password = PASS) => loginFirebase(email, password);
+// Cuenta ADMIN de los tests (TEST_ADMIN_PASSWORD): sin ella la suite no arranca.
+const ADMIN_TEST = exigirAdminTest();
 
 let BASE = `http://localhost:${PUERTO}`;
 
@@ -921,7 +923,7 @@ async function casosPrincipales(ctx) {
     titulo('CASO 18: admin ve la organizacion del viaje');
     let tokenAdmin = null;
     try {
-      tokenAdmin = await getToken('admin-test@fleter.com', 'admintest123');
+      tokenAdmin = await getToken(ADMIN_TEST.email, ADMIN_TEST.password);
     } catch (e) {
       paso('CASO 18: login admin (correr seed-cuentas-test.js)', false, e.message);
     }

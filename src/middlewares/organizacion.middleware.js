@@ -1,10 +1,6 @@
 import prisma from '../config/prisma.js';
 import { secretoInvitaciones } from '../services/invitacion.service.js';
-
-function idParam(valor) {
-  const n = Number(valor);
-  return Number.isInteger(n) && n > 0 ? n : null;
-}
+import { idParam } from '../services/id-param.js';
 
 // Exige una membresia ACTIVA en la PyME de :id. Es lo que deja afuera al CLIENTE
 // huerfano de todo lo que no sea crear una PyME o canjear un codigo.

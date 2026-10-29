@@ -25,6 +25,7 @@ import {
 import { programarTimerCierre } from './timers-cierre.js';
 import { ESTADOS_CURSO_INTERNO } from './estado-viaje.service.js';
 import { emitirViajeInterno } from '../sockets/salas.js';
+import { reportarError } from '../config/sentry.js';
 
 // Lo que hace falta para decidir el cierre de un viaje.
 const SELECT_CIERRE = {
@@ -59,18 +60,20 @@ const leer = (id_viaje) => prisma.viaje.findUnique({ where: { id_viaje }, select
 // barrido de arranque NO lo pide (esos viajes ya se avisaron antes del deploy).
 export function programarCierres(io, viaje, cfg = configCierre(), { avisarSiYaPaso = false } = {}) {
   programarTimerCierre('AUTOMATICO', viaje.id_viaje, momentoCierreAutomatico(viaje, cfg), () =>
-    cerrarAutomaticoSiCorresponde(io, viaje.id_viaje, { rearmar: true }).catch((e) =>
-      console.error(`[cierre-automatico] viaje ${viaje.id_viaje}:`, e.message)
-    )
+    cerrarAutomaticoSiCorresponde(io, viaje.id_viaje, { rearmar: true }).catch((e) => {
+      console.error(`[cierre-automatico] viaje ${viaje.id_viaje}:`, e.message);
+      reportarError(e, { contexto: 'timer:cierre-automatico', extra: { id_viaje: viaje.id_viaje } });
+    })
   );
 
   if (!llegoALaUltima(viaje.paradas)) return;
   const cierre = cierreManualDesde(viaje.paradas, cfg);
   if (cierre.motivo !== 'TIEMPO') return;
   const avisar = () =>
-    avisarCierreHabilitado(io, viaje.id_viaje).catch((e) =>
-      console.error(`[cierre-automatico] aviso de habilitacion del viaje ${viaje.id_viaje}:`, e.message)
-    );
+    avisarCierreHabilitado(io, viaje.id_viaje).catch((e) => {
+      console.error(`[cierre-automatico] aviso de habilitacion del viaje ${viaje.id_viaje}:`, e.message);
+      reportarError(e, { contexto: 'timer:cierre-habilitado', extra: { id_viaje: viaje.id_viaje } });
+    });
   if (cierre.desde.getTime() > Date.now()) programarTimerCierre('HABILITADO', viaje.id_viaje, cierre.desde, avisar);
   else if (avisarSiYaPaso) avisar();
 }

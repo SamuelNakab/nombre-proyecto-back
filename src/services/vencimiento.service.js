@@ -32,6 +32,7 @@ import {
   fechaProgramadaLimiteVencimiento,
 } from './ventana-inicio.js';
 import { emitirViajeInterno } from '../sockets/salas.js';
+import { reportarError } from '../config/sentry.js';
 
 // Estados en los que un viaje que ya paso su hora cuenta como VENCIDO. Es el
 // criterio del flag Y el del evento: los dos salen de esta lista, asi no se
@@ -114,9 +115,10 @@ export function programarAvisoVencimiento(io, id_viaje, fechaProgramada) {
 
   const handle = setTimeout(() => {
     timers.delete(id_viaje);
-    avisarVencimiento(io, id_viaje).catch((e) =>
-      console.error(`[viaje-vencido] viaje ${id_viaje}:`, e.message)
-    );
+    avisarVencimiento(io, id_viaje).catch((e) => {
+      console.error(`[viaje-vencido] viaje ${id_viaje}:`, e.message);
+      reportarError(e, { contexto: 'timer:vencimiento', extra: { id_viaje } });
+    });
   }, ms);
 
   timers.set(id_viaje, handle);
@@ -274,9 +276,10 @@ export function programarVencimientoInterno(io, id_viaje, fechaProgramada) {
 
   const handle = setTimeout(() => {
     timers.delete(id_viaje);
-    vencerViajeInterno(io, id_viaje, { rearmar: true }).catch((e) =>
-      console.error(`[viaje-vencido] viaje interno ${id_viaje}:`, e.message)
-    );
+    vencerViajeInterno(io, id_viaje, { rearmar: true }).catch((e) => {
+      console.error(`[viaje-vencido] viaje interno ${id_viaje}:`, e.message);
+      reportarError(e, { contexto: 'timer:vencimiento-interno', extra: { id_viaje } });
+    });
   }, ms);
 
   timers.set(id_viaje, handle);

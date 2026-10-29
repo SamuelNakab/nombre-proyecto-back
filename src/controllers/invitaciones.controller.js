@@ -4,6 +4,7 @@ import { canjearCodigo } from '../services/invitacion.service.js';
 import { consumirIntentoCanje, ipDelRequest } from '../services/rate-limit-canje.service.js';
 import { sincronizarSalaOrganizacion } from '../sockets/salas.js';
 import { io } from '../sockets/index.js';
+import { responder400 } from '../services/errores-validacion.js';
 
 const schemaCanje = z.object({
   codigo: z.string({ error: 'codigo es requerido' }).min(1, 'codigo es requerido'),
@@ -14,16 +15,17 @@ const schemaCanje = z.object({
 // errores explicitos del estado del usuario -> "Codigo invalido" uniforme.
 // El rate limit va ANTES de validar el body: un intento con basura cuenta igual.
 export async function canjear(req, res) {
-  const { permitido } = await consumirIntentoCanje({
+  const { permitido, retryAfter } = await consumirIntentoCanje({
     id_usuario: req.usuario.id_usuario,
     ip: ipDelRequest(req),
   });
   if (!permitido) {
+    if (retryAfter) res.setHeader('Retry-After', String(retryAfter));
     return res.status(429).json({ error: 'Demasiados intentos. Proba de nuevo en unos minutos' });
   }
 
   const parsed = schemaCanje.safeParse(req.body ?? {});
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
+  if (!parsed.success) return responder400(res, parsed);
 
   try {
     const resultado = await canjearCodigo({ usuario: req.usuario, codigo: parsed.data.codigo });

@@ -20,7 +20,10 @@ const RAIZ = fileURLToPath(new URL('..', import.meta.url));
 const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // env: variables extra para el proceso hijo (pisan al .env local, porque dotenv
-//      no sobrescribe lo que ya esta en process.env).
+//      no sobrescribe lo que ya esta en process.env). RATE_LIMIT_HABILITADO va en
+//      '0' por defecto (las suites hacen rafagas de requests desde localhost);
+//      la suite que prueba el limiter lo pisa con '1'. SENTRY_DSN va vacio: un
+//      server de test no manda eventos aunque el .env local tenga un DSN.
 // fn(base, leerLog): recibe la URL base y un getter del stdout+stderr acumulado.
 export async function conServer(env, puerto, fn) {
   const base = `http://localhost:${puerto}`;
@@ -31,7 +34,7 @@ export async function conServer(env, puerto, fn) {
 
   const hijo = spawn(process.execPath, ['src/app.js'], {
     cwd: RAIZ,
-    env: { ...process.env, PORT: String(puerto), ...env },
+    env: { ...process.env, PORT: String(puerto), RATE_LIMIT_HABILITADO: '0', SENTRY_DSN: '', ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 

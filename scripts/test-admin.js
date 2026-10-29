@@ -2,7 +2,7 @@ import { io } from 'socket.io-client';
 import { execFileSync } from 'child_process';
 import redis from '../src/config/redis.js';
 import prisma from '../src/config/prisma.js';
-import { getToken } from './_firebase-auth.js';
+import { getToken, exigirAdminTest } from './_firebase-auth.js';
 import { crearRegistro, terminar } from './_limpieza.js';
 
 // Cuentas FIJAS del seed: al final se borra SOLO lo que esta corrida creo,
@@ -13,10 +13,12 @@ const BASE = process.env.TEST_BASE_URL ?? 'http://localhost:3000';
 const PARADA_1 = { lat: -34.6037, lng: -58.3816, direccion: 'Plaza de Mayo, CABA' };
 const PARADA_2 = { lat: -34.5895, lng: -58.3974, direccion: 'Recoleta, CABA' };
 
-// Credenciales del admin de prueba (se crea via crear-admin.js si no existe).
+// Credenciales del admin de prueba (se crea via crear-admin.js si no existe). La
+// password sale de TEST_ADMIN_PASSWORD: sin ella la suite no arranca.
+const ADMIN_TEST = exigirAdminTest();
 const ADMIN = {
-  ADMIN_EMAIL: 'admin-test@fleter.com',
-  ADMIN_PASSWORD: 'admintest123',
+  ADMIN_EMAIL: ADMIN_TEST.email,
+  ADMIN_PASSWORD: ADMIN_TEST.password,
   ADMIN_NOMBRE: 'Admin',
   ADMIN_APELLIDO: 'Test',
   ADMIN_DNI: '90000001',

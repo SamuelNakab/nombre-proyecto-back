@@ -32,6 +32,7 @@ import {
 } from '../controllers/viajes-internos.controller.js';
 import * as lugares from '../controllers/lugares.controller.js';
 import * as series from '../controllers/series.controller.js';
+import { limitarMaps, limitarSeries, limitarInvitaciones } from '../middlewares/rate-limit.middleware.js';
 
 const router = Router();
 
@@ -51,7 +52,7 @@ router.post('/:id/salir', requireMiembro, salir);
 
 // El permiso por TIPO (MIEMBRO -> responsable, CHOFER -> cualquiera) lo decide
 // el controller, porque depende del body / de la invitacion.
-router.post('/:id/invitaciones', requireMiembro, requireInvitacionesConfiguradas, crearInvitacion);
+router.post('/:id/invitaciones', requireMiembro, requireInvitacionesConfiguradas, limitarInvitaciones, crearInvitacion);
 router.get('/:id/invitaciones', requireMiembro, requireInvitacionesConfiguradas, listarInvitaciones);
 router.delete('/:id/invitaciones/:idInv', requireMiembro, requireInvitacionesConfiguradas, revocarInvitacion);
 
@@ -60,10 +61,10 @@ router.delete('/:id/choferes/:idConductor', requireMiembro, desvincularChofer);
 
 // Viajes INTERNOS de la PyME (Paso 2). Cualquier miembro activo. Scoping por
 // req.id_organizacion: un viaje de otra PyME da 404.
-router.post('/:id/viajes', requireMiembro, crearViaje);
+router.post('/:id/viajes', requireMiembro, limitarMaps, crearViaje);
 router.get('/:id/viajes', requireMiembro, listarViajes);
 router.get('/:id/viajes/:idViaje', requireMiembro, obtenerViaje);
-router.put('/:id/viajes/:idViaje', requireMiembro, editarViaje);
+router.put('/:id/viajes/:idViaje', requireMiembro, limitarMaps, editarViaje);
 router.post('/:id/viajes/:idViaje/reasignar', requireMiembro, reasignarViaje);
 router.post('/:id/viajes/:idViaje/cancelar', requireMiembro, cancelarViajePyme);
 // Tarea 5: finalizar a mano un viaje cuyo chofer no toco "Salir" en la ultima
@@ -81,7 +82,7 @@ router.delete('/:id/lugares/:idLugar', requireMiembro, lugares.borrar);
 
 // Series de viajes (Paso 4). Cualquier miembro activo. Crear genera TODOS los
 // viajes de la ventana (todo o nada); cancelar no toca los viajes creados.
-router.post('/:id/series', requireMiembro, series.crear);
+router.post('/:id/series', requireMiembro, limitarSeries, series.crear);
 router.get('/:id/series', requireMiembro, series.listar);
 router.get('/:id/series/:idSerie', requireMiembro, series.obtener);
 router.post('/:id/series/:idSerie/cancelar', requireMiembro, series.cancelar);

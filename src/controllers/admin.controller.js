@@ -17,6 +17,8 @@ import {
 import { ESTADOS_TERMINALES, ESTADOS_EN_CURSO } from '../services/estado-viaje.service.js';
 import { emitirViajeInterno } from '../sockets/salas.js';
 import { io } from '../sockets/index.js';
+import { responder400 } from '../services/errores-validacion.js';
+import { idParam } from '../services/id-param.js';
 
 // ─── Constantes ──────────────────────────────────────────────────────────────
 
@@ -111,7 +113,7 @@ const conVencido = (viajes) =>
 export async function listarUsuarios(req, res) {
   const parsed = schemaUsuarios.safeParse(req.query);
   if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.issues[0].message });
+    return responder400(res, parsed);
   }
 
   const { rol, page, limit } = parsed.data;
@@ -140,8 +142,8 @@ export async function listarUsuarios(req, res) {
 // ─── 2. GET /api/admin/usuarios/:id ──────────────────────────────────────────
 
 export async function obtenerUsuario(req, res) {
-  const id_usuario = Number(req.params.id);
-  if (!Number.isInteger(id_usuario)) {
+  const id_usuario = idParam(req.params.id);
+  if (!id_usuario) {
     return res.status(400).json({ error: 'id de usuario invalido' });
   }
 
@@ -220,7 +222,7 @@ const INCLUDE_VIAJE_LISTA = {
 export async function listarViajes(req, res) {
   const parsed = schemaViajes.safeParse(req.query);
   if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.issues[0].message });
+    return responder400(res, parsed);
   }
 
   const { estado, cantidad_paradas, zona, desde, hasta, page, limit } = parsed.data;
@@ -276,8 +278,8 @@ export async function listarViajes(req, res) {
 // ─── 4. GET /api/admin/viajes/:id ────────────────────────────────────────────
 
 export async function obtenerViaje(req, res) {
-  const id_viaje = Number(req.params.id);
-  if (!Number.isInteger(id_viaje)) {
+  const id_viaje = idParam(req.params.id);
+  if (!id_viaje) {
     return res.status(400).json({ error: 'id de viaje invalido' });
   }
 
@@ -449,11 +451,14 @@ export async function obtenerEstadisticas(_req, res) {
 export async function cancelarViaje(req, res) {
   const parsed = schemaCancelar.safeParse(req.body ?? {});
   if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.issues[0].message });
+    return responder400(res, parsed);
   }
   const motivo = parsed.data.motivo ?? null;
 
-  const id_viaje = Number(req.params.id);
+  const id_viaje = idParam(req.params.id);
+  if (!id_viaje) {
+    return res.status(400).json({ error: 'id de viaje invalido' });
+  }
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },
     include: {

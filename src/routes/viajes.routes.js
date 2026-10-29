@@ -24,6 +24,7 @@ import {
   reasignarViaje,
   cancelarReserva,
 } from '../controllers/reserva.controller.js';
+import { limitarMaps } from '../middlewares/rate-limit.middleware.js';
 
 const router = Router();
 
@@ -32,10 +33,10 @@ const router = Router();
 // los viajes legacy que sigan vivos (listar, cancelar, iniciar, avanzar,
 // confirmar paradas, costo, remito, detalle) o es compartido con el ciclo
 // interno (PATCH /estado, confirmar-parada, estimar-costo).
-router.post('/estimar-costo', verificarToken, requireRol('CLIENTE'), estimarCosto);
+router.post('/estimar-costo', verificarToken, requireRol('CLIENTE'), limitarMaps, estimarCosto);
 // Crear por la ruta vieja del cliente: el viaje nuevo se crea en
 // POST /api/organizaciones/:id/viajes.
-router.post('/', requireMarketplace, verificarToken, requireRol('CLIENTE'), crearViaje);
+router.post('/', requireMarketplace, verificarToken, requireRol('CLIENTE'), limitarMaps, crearViaje);
 router.get('/disponibles', requireMarketplace, verificarToken, requireRol('CONDUCTOR'), listarViajesDisponibles);
 router.get('/mis-viajes', verificarToken, requireRol('CLIENTE'), listarMisViajes);
 router.get('/mis-viajes-conductor', verificarToken, requireRol('CONDUCTOR'), listarMisViajesConductor);

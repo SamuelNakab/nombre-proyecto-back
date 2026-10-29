@@ -40,11 +40,18 @@ import {
   editarViaje as editarViajeSrv,
 } from '../services/viaje-interno.service.js';
 import { io } from '../sockets/index.js';
+import { responder400 } from '../services/errores-validacion.js';
+import { idParam } from '../services/id-param.js';
+import { ID_MAX } from '../services/id-param.js';
 
 // ─── Schemas ─────────────────────────────────────────────────────────────────
 
 const idPositivo = (campo) =>
-  z.number({ error: `${campo} es requerido` }).int(`${campo} invalido`).positive(`${campo} invalido`);
+  z
+    .number({ error: `${campo} es requerido` })
+    .int(`${campo} invalido`)
+    .positive(`${campo} invalido`)
+    .max(ID_MAX, `${campo} invalido`);
 
 // Sin condiciones_requeridas (pedido del front 20-10-2026): el ciclo interno no
 // las pide ni las valida. Si un cliente viejo las manda, z.object las descarta
@@ -97,15 +104,8 @@ const schemaFiltros = (grupos) =>
 const schemaFiltrosPyme = schemaFiltros(GRUPOS_PYME);
 const schemaFiltrosChofer = schemaFiltros(GRUPOS_CHOFER);
 
-function idParam(valor) {
-  const n = Number(valor);
-  return Number.isInteger(n) && n > 0 ? n : null;
-}
-
-const error400 = (res, parsed) => res.status(400).json({ error: parsed.error.issues[0].message });
-
 // Envuelve un handler: los ErrorNegocio salen como { error } con su status; el
-// resto lo maneja Express como un 500.
+// resto lo toma el manejador global (errores.middleware.js).
 const manejar = (fn) => async (req, res) => {
   try {
     return await fn(req, res);
@@ -125,7 +125,7 @@ function idViajeDe(req, res, param) {
 // POST /api/organizaciones/:id/viajes
 export const crearViaje = manejar(async (req, res) => {
   const parsed = schemaCrear.safeParse(req.body ?? {});
-  if (!parsed.success) return error400(res, parsed);
+  if (!parsed.success) return responder400(res, parsed);
   const viaje = await crearViajeInterno({
     io,
     id_organizacion: req.id_organizacion,
@@ -138,7 +138,7 @@ export const crearViaje = manejar(async (req, res) => {
 // GET /api/organizaciones/:id/viajes?estado=&grupo=
 export const listarViajes = manejar(async (req, res) => {
   const parsed = schemaFiltrosPyme.safeParse(req.query ?? {});
-  if (!parsed.success) return error400(res, parsed);
+  if (!parsed.success) return responder400(res, parsed);
   return res.status(200).json(await listarViajesOrganizacion(io, req.id_organizacion, parsed.data));
 });
 
@@ -154,7 +154,7 @@ export const editarViaje = manejar(async (req, res) => {
   const id_viaje = idViajeDe(req, res, 'idViaje');
   if (!id_viaje) return;
   const parsed = schemaEditar.safeParse(req.body ?? {});
-  if (!parsed.success) return error400(res, parsed);
+  if (!parsed.success) return responder400(res, parsed);
   const viaje = await editarViajeSrv({
     io,
     id_organizacion: req.id_organizacion,
@@ -170,7 +170,7 @@ export const reasignarViaje = manejar(async (req, res) => {
   const id_viaje = idViajeDe(req, res, 'idViaje');
   if (!id_viaje) return;
   const parsed = schemaReasignar.safeParse(req.body ?? {});
-  if (!parsed.success) return error400(res, parsed);
+  if (!parsed.success) return responder400(res, parsed);
   const viaje = await reasignarViajeSrv({
     io,
     id_organizacion: req.id_organizacion,
@@ -186,7 +186,7 @@ export const cancelarViajePyme = manejar(async (req, res) => {
   const id_viaje = idViajeDe(req, res, 'idViaje');
   if (!id_viaje) return;
   const parsed = schemaCancelar.safeParse(req.body ?? {});
-  if (!parsed.success) return error400(res, parsed);
+  if (!parsed.success) return responder400(res, parsed);
   const r = await cancelarViajeOrganizacion({
     io,
     id_organizacion: req.id_organizacion,
@@ -230,7 +230,7 @@ export const remito = manejar(async (req, res) => {
 // GET /api/choferes/viajes?grupo=&estado=
 export const listarViajesChoferHttp = manejar(async (req, res) => {
   const parsed = schemaFiltrosChofer.safeParse(req.query ?? {});
-  if (!parsed.success) return error400(res, parsed);
+  if (!parsed.success) return responder400(res, parsed);
   return res.status(200).json(await listarViajesChofer(io, req.usuario.id_usuario, parsed.data));
 });
 
@@ -246,7 +246,7 @@ export const confirmarViaje = manejar(async (req, res) => {
   const id_viaje = idViajeDe(req, res, 'id');
   if (!id_viaje) return;
   const parsed = schemaConfirmar.safeParse(req.body ?? {});
-  if (!parsed.success) return error400(res, parsed);
+  if (!parsed.success) return responder400(res, parsed);
   const r = await confirmarViajeSrv({
     io,
     id_usuario: req.usuario.id_usuario,
@@ -268,7 +268,7 @@ export const iniciarViaje = manejar(async (req, res) => {
   const id_viaje = idViajeDe(req, res, 'id');
   if (!id_viaje) return;
   const parsed = schemaIniciar.safeParse(req.body ?? {});
-  if (!parsed.success) return error400(res, parsed);
+  if (!parsed.success) return responder400(res, parsed);
   const r = await iniciarViajeInterno({
     io,
     id_usuario: req.usuario.id_usuario,

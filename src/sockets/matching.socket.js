@@ -2,6 +2,7 @@ import prisma from '../config/prisma.js';
 import { obtenerRutaPlaneada } from '../services/ruta.service.js';
 import { registrarCambioEstado } from '../services/historial-estado.service.js';
 import { marketplaceHabilitado } from '../middlewares/flags.middleware.js';
+import { reportarError } from '../config/sentry.js';
 
 export function manejarAceptarViaje(socket, io) {
   socket.on('viaje:aceptar', async (payload) => {
@@ -141,6 +142,7 @@ export function manejarAceptarViaje(socket, io) {
         });
       } catch (txError) {
         console.error('[viaje:aceptar] Error en asignacion atomica:', txError);
+        reportarError(txError, { contexto: 'socket:viaje:aceptar', usuario: socket.data.usuario });
         socket.emit('error', { mensaje: 'Error al procesar la asignacion' });
         return;
       }
@@ -209,6 +211,7 @@ export function manejarAceptarViaje(socket, io) {
       console.log(`[viaje:aceptar] Resultado: conductor asignado — viaje ${id_viaje} → conductor ${conductor.id_conductor}`);
     } catch (error) {
       console.error('[viaje:aceptar] Error:', error);
+      reportarError(error, { contexto: 'socket:viaje:aceptar', usuario: socket.data.usuario });
       socket.emit('error', { mensaje: 'Error interno al procesar el viaje' });
     }
   });

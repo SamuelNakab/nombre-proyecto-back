@@ -1,4 +1,5 @@
 import prisma from '../config/prisma.js';
+import { reportarError } from '../config/sentry.js';
 
 // Historial de estados del viaje: una fila por CADA cambio de estado.
 //
@@ -73,6 +74,7 @@ export async function registrarCambioEstado({ id_viaje, estado, id_usuario, orig
     console.error(
       `[historial-estado] no se pudo registrar ${estado} del viaje ${id_viaje}: ${err.message}`
     );
+    reportarError(err, { contexto: 'historial-estado', nivel: 'warning', extra: { id_viaje, estado } });
     return false;
   }
 }
@@ -97,6 +99,7 @@ export async function registrarCambiosEstado(filas) {
   } catch (err) {
     const ids = filas.map((f) => f.id_viaje).join(', ');
     console.error(`[historial-estado] no se pudo registrar el lote de los viajes ${ids}: ${err.message}`);
+    reportarError(err, { contexto: 'historial-estado', nivel: 'warning', extra: { viajes: filas.length } });
     return 0;
   }
 }

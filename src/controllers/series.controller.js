@@ -9,6 +9,8 @@ import { schemaParadasInternas, schemaMotivo, schemaDescripcion } from '../servi
 import { esHoraValida } from '../services/serie-fechas.js';
 import { crearSerie, listarSeries, obtenerSerie, cancelarSerie } from '../services/serie.service.js';
 import { io } from '../sockets/index.js';
+import { responder400 } from '../services/errores-validacion.js';
+import { idParam } from '../services/id-param.js';
 
 const ESTADOS_SERIE = ['ACTIVA', 'CANCELADA', 'BORRADA'];
 
@@ -66,8 +68,6 @@ const schemaFiltros = z.object({
   estado: z.enum(ESTADOS_SERIE, { error: `estado debe ser ${ESTADOS_SERIE.join(', ')}` }).optional(),
 });
 
-const error400 = (res, parsed) => res.status(400).json({ error: parsed.error.issues[0].message });
-
 const manejar = (fn) => async (req, res) => {
   try {
     return await fn(req, res);
@@ -77,8 +77,8 @@ const manejar = (fn) => async (req, res) => {
 };
 
 function idSerieDe(req, res) {
-  const n = Number(req.params.idSerie);
-  if (Number.isInteger(n) && n > 0) return n;
+  const n = idParam(req.params.idSerie);
+  if (n) return n;
   res.status(400).json({ error: 'id de serie invalido' });
   return null;
 }
@@ -86,7 +86,7 @@ function idSerieDe(req, res) {
 // POST /api/organizaciones/:id/series
 export const crear = manejar(async (req, res) => {
   const parsed = schemaCrear.safeParse(req.body ?? {});
-  if (!parsed.success) return error400(res, parsed);
+  if (!parsed.success) return responder400(res, parsed);
   const r = await crearSerie({
     io,
     id_organizacion: req.id_organizacion,
@@ -99,7 +99,7 @@ export const crear = manejar(async (req, res) => {
 // GET /api/organizaciones/:id/series?estado=
 export const listar = manejar(async (req, res) => {
   const parsed = schemaFiltros.safeParse(req.query ?? {});
-  if (!parsed.success) return error400(res, parsed);
+  if (!parsed.success) return responder400(res, parsed);
   return res.status(200).json(await listarSeries(io, req.id_organizacion, parsed.data));
 });
 

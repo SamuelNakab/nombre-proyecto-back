@@ -5,6 +5,8 @@
 import { z } from 'zod';
 import { responderErrorNegocio } from '../services/error-negocio.js';
 import { listarLugares, crearLugar, editarLugar, borrarLugar } from '../services/lugar.service.js';
+import { responder400 } from '../services/errores-validacion.js';
+import { idParam } from '../services/id-param.js';
 
 const nombre = z
   .string({ error: 'nombre es requerido' })
@@ -26,8 +28,6 @@ const schemaEditar = z
     message: 'Mandá al menos un campo para editar (nombre, direccion, lat o lng)',
   });
 
-const error400 = (res, parsed) => res.status(400).json({ error: parsed.error.issues[0].message });
-
 const manejar = (fn) => async (req, res) => {
   try {
     return await fn(req, res);
@@ -37,8 +37,8 @@ const manejar = (fn) => async (req, res) => {
 };
 
 function idLugarDe(req, res) {
-  const n = Number(req.params.idLugar);
-  if (Number.isInteger(n) && n > 0) return n;
+  const n = idParam(req.params.idLugar);
+  if (n) return n;
   res.status(400).json({ error: 'id de lugar invalido' });
   return null;
 }
@@ -49,7 +49,7 @@ export const listar = manejar(async (req, res) => res.status(200).json(await lis
 // POST /api/organizaciones/:id/lugares
 export const crear = manejar(async (req, res) => {
   const parsed = schemaCrear.safeParse(req.body ?? {});
-  if (!parsed.success) return error400(res, parsed);
+  if (!parsed.success) return responder400(res, parsed);
   const lugar = await crearLugar({
     id_organizacion: req.id_organizacion,
     id_usuario: req.usuario.id_usuario,
@@ -63,7 +63,7 @@ export const editar = manejar(async (req, res) => {
   const id_lugar = idLugarDe(req, res);
   if (!id_lugar) return;
   const parsed = schemaEditar.safeParse(req.body ?? {});
-  if (!parsed.success) return error400(res, parsed);
+  if (!parsed.success) return responder400(res, parsed);
   return res
     .status(200)
     .json(await editarLugar({ id_organizacion: req.id_organizacion, id_lugar, datos: parsed.data }));

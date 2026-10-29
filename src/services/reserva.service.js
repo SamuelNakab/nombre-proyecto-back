@@ -3,6 +3,7 @@ import { validarTransicion } from './estado-viaje.service.js';
 import { limpiarViajeActivo } from './cancelacion.service.js';
 import { publicarViajeAConductoresElegibles } from './matching.service.js';
 import { registrarCambioEstado } from './historial-estado.service.js';
+import { reportarError } from '../config/sentry.js';
 
 // Minutos que una reserva puede quedar sin conductor asignado antes de volver
 // sola al mercado. Default 10 si no esta en .env (mismo patron que el resto).
@@ -184,7 +185,10 @@ export function programarTimeoutReserva(io, id_viaje, msRestantes = null) {
           console.log(`[reserva-timeout] viaje ${id_viaje} liberado por timeout`);
         }
       })
-      .catch((e) => console.error(`[reserva-timeout] viaje ${id_viaje}:`, e.message));
+      .catch((e) => {
+        console.error(`[reserva-timeout] viaje ${id_viaje}:`, e.message);
+        reportarError(e, { contexto: 'timer:reserva', extra: { id_viaje } });
+      });
   }, ms);
 
   timers.set(id_viaje, handle);

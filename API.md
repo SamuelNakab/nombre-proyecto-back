@@ -42,18 +42,92 @@ El campo `idToken` de la respuesta es el Bearer token.
 
 ## GET /health
 
-Verificación de estado del servidor. No requiere autenticación.
+Verificación de estado del servidor. No requiere autenticación, **no toca la base**
+(UptimeRobot lo consulta cada 5 minutos y Neon tiene que poder dormirse) y queda
+**fuera del rate limit**.
 
 **Respuesta exitosa — 200:**
 ```json
 {
   "status": "ok",
   "timestamp": "2026-05-09T12:00:00.000Z",
-  "capacidades": ["viaje-interno"]
+  "capacidades": ["viaje-interno"],
+  "version": "a4a9593",
+  "uptime_segundos": 5231
 }
 ```
 - `capacidades`: lo que sabe hacer este deploy. `viaje-interno` = el ciclo del viaje de PyME (Paso 2).
   El job `e2e-staging` de CI lo usa para esperar a que staging tenga el deploy nuevo.
+- `version`: commit corto del deploy (`RAILWAY_GIT_COMMIT_SHA`, lo inyecta Railway). `null` en local.
+- `uptime_segundos`: segundos desde que arrancó el proceso (un valor chico = hubo un reinicio).
+
+---
+
+## Errores, límites y CORS
+
+### Formato de los errores
+Todo error es JSON `{ "error": "mensaje" }` (algunos suman campos, p. ej. `salteadas` en
+las series). Nunca un HTML, y un input inválido **nunca** da 500.
+
+| Status | Cuándo | Mensaje |
+|---|---|---|
+| 400 | Validación del body / query (Zod) | En español y con el campo. Los mensajes propios de cada endpoint no cambiaron (`motivo es requerido`, `Codigo invalido`, ...); los genéricos ahora son `El campo nombre es obligatorio`, `El campo anio debe ser un número`, `El campo dni debe tener al menos 7 caracteres`, `El campo email debe ser un email válido`, `El campo tipo debe ser uno de: A, B`, `El campo paradas[1].lat debe ser un número`... (antes salían en inglés: `Invalid input: expected string, received undefined`). Sale el **primer** problema. |
+| 400 | `:id` no numérico o fuera de rango (`/api/viajes/abc`, `/mis-vehiculos/undefined`, `99999999999`) | `id de viaje invalido`, `id de vehiculo invalido`, `id de PyME invalido`... (antes algunos daban 500) |
+| 400 | JSON mal formado | `El cuerpo de la solicitud no es un JSON válido` |
+| 400 | Un dato que llegó a la base sin validar | `Algún dato de la solicitud es inválido` |
+| 404 | Ruta inexistente | `No encontrado` (antes un HTML de Express) |
+| 409 | Conflicto en la base (p. ej. dos altas simultáneas con la misma patente) | `Ya existe un registro con ese valor (patente)` |
+| 413 | Body de más de 100 KB | `El cuerpo de la solicitud es demasiado grande` |
+| 429 | Rate limit (ver abajo) | `Demasiadas solicitudes. Probá de nuevo en 40 segundos.` + header `Retry-After` |
+| 500 | Error nuestro | `Error interno del servidor` (va a Sentry) |
+| 503 | Base o Google caídos | `El servicio no esta disponible en este momento...` / `No se pudo calcular la ruta...` |
+
+### Rate limit — 429
+Contadores en Redis. Cada 429 trae `Retry-After` (segundos) y los headers estándar
+`RateLimit` / `RateLimit-Policy` (expuestos por CORS, el front web los puede leer). Si
+Redis no responde, **se deja pasar** (nunca tumba la API).
+
+| Límite | Clave | Default | Endpoints | Mensaje |
+|---|---|---|---|---|
+| General | IP | 600 / min | todo `/api` (no `/health`) | `Demasiadas solicitudes. Probá de nuevo en N segundos.` |
+| Registro | IP | 20 / hora | `POST /api/auth/registro-cliente`, `-conductor`, `-gerente` (comparten el cupo; va **antes** de validar el body) | `Demasiadas cuentas creadas desde esta conexión. Probá de nuevo en N minutos.` |
+| Rutas (Google) | usuario | 60 / 10 min | crear y editar viaje de PyME, `POST /api/viajes/estimar-costo`, `POST /api/viajes` (legacy) | `Demasiadas solicitudes que calculan rutas. ...` |
+| Series | usuario | 10 / hora | `POST /api/organizaciones/:id/series` | `Demasiadas series creadas. ...` |
+| Invitaciones | usuario | 30 / hora | `POST /api/organizaciones/:id/invitaciones` | `Demasiadas invitaciones creadas. ...` |
+| Canje | usuario **y** IP | 5 / 15 min | `POST /api/invitaciones/canjear` (sin cambios: `Demasiados intentos. Proba de nuevo en unos minutos`; ahora **también** trae `Retry-After`) | |
+
+Los límites por usuario van después de la autenticación y de la membresía: un no-miembro
+sigue recibiendo su 403. Los valores se ajustan por variable (`RATE_LIMIT_<X>_MAX` /
+`_VENTANA_SEGUNDOS`).
+
+### Socket.io — handshake
+El handshake tiene su propio límite: **300 por minuto por IP** (umbral pensado para el
+CGNAT de las telefónicas) y **30 por minuto por usuario**. Si se pasa, el cliente recibe
+`connect_error` con:
+```js
+socket.on('connect_error', (err) => {
+  // err.message === 'RATE_LIMIT'
+  // err.data === { retryAfter: 42, error: 'Demasiadas conexiones. Probá de nuevo en 42 segundos.' }
+});
+```
+**OJO mobile:** un rechazo del middleware de socket.io **NO reconecta solo**. Ante
+`connect_error` hay que reintentar a mano:
+- `RATE_LIMIT` → esperar `err.data.retryAfter` segundos (+ un poco de azar) y `socket.connect()`.
+- `Token invalido` / `Token no proporcionado` → refrescar el ID token
+  (`getIdToken(true)`), ponerlo en `socket.auth` y reintentar con backoff.
+- `Error interno` → backoff exponencial (1 s, 2 s, 4 s... hasta ~30 s).
+- `Usuario no registrado` → no reintentar.
+
+### CORS
+- Orígenes permitidos por la variable `CORS_ORIGINS` (lista separada por coma; `*` = una
+  etiqueta del host, para previews: `https://*.vercel.app`). Mientras no esté cargada se
+  acepta cualquier origen (como antes).
+- Un request **sin** header `Origin` (app mobile, curl, server-to-server) pasa siempre.
+- Un origen no permitido no recibe headers CORS (el navegador bloquea la respuesta). En
+  socket.io el handshake con un `Origin` no permitido se rechaza.
+- Preflight cacheable 10 minutos (`Access-Control-Max-Age: 600`).
+- Antes de cerrar CORS en production se prueba en staging que la app mobile se conecte
+  por socket (si el cliente de React Native mandara un `Origin`, se rechazaría).
 
 ---
 
@@ -745,7 +819,7 @@ Las tarifas se calculan automáticamente según la zona y si la `fecha_programad
 | Status | Body | Causa |
 |--------|------|-------|
 | 400 | `{ "error": "mensaje de validación" }` | Campo faltante o inválido |
-| 400 | `{ "error": "fecha_programada debe ser una fecha ISO futura (al menos 60 minutos desde ahora)" }` | `fecha_programada` no es ISO válida, o no supera el mínimo de `ANTICIPACION_MINIMA_MINUTOS` (default 60) desde el request. El número del mensaje es el valor configurado. Si el campo viene **ausente** el error es el genérico de tipo (`Invalid input: expected string, received undefined`) |
+| 400 | `{ "error": "fecha_programada debe ser una fecha ISO futura (al menos 60 minutos desde ahora)" }` | `fecha_programada` no es ISO válida, o no supera el mínimo de `ANTICIPACION_MINIMA_MINUTOS` (default 60) desde el request. El número del mensaje es el valor configurado. Si el campo viene **ausente** el error es `El campo fecha_programada es obligatorio` |
 | 400 | `{ "error": "El usuario no tiene perfil de cliente" }` | El usuario no tiene registro de cliente |
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
 | 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CLIENTE |
@@ -2166,6 +2240,7 @@ Authorization: Bearer <firebase-id-token>
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
 | 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
 | 403 | `{ "error": "Este vehiculo no te pertenece" }` | El vehículo pertenece a otro conductor |
+| 400 | `{ "error": "id de vehiculo invalido" }` | `:id` no numérico o fuera de rango (antes daba 500, p. ej. `/mis-vehiculos/undefined`) |
 | 404 | `{ "error": "Vehiculo no encontrado" }` | No existe vehículo con ese id |
 
 ---
@@ -2196,6 +2271,7 @@ Authorization: Bearer <firebase-id-token>
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
 | 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
 | 403 | `{ "error": "Este vehiculo no te pertenece" }` | El vehículo pertenece a otro conductor |
+| 400 | `{ "error": "id de vehiculo invalido" }` | `:id` no numérico o fuera de rango (antes daba 500, p. ej. `/mis-vehiculos/undefined`) |
 | 404 | `{ "error": "Vehiculo no encontrado" }` | No existe vehículo con ese id |
 
 ---
@@ -2239,6 +2315,7 @@ Authorization: Bearer <firebase-id-token>
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
 | 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
 | 403 | `{ "error": "Este vehiculo no te pertenece" }` | El vehículo pertenece a otro conductor |
+| 400 | `{ "error": "id de vehiculo invalido" }` | `:id` no numérico o fuera de rango (antes daba 500, p. ej. `/mis-vehiculos/undefined`) |
 | 404 | `{ "error": "Vehiculo no encontrado" }` | No existe vehículo con ese id |
 | 409 | `{ "error": "El vehiculo ya tiene esa condicion" }` | Condición duplicada |
 
@@ -2281,6 +2358,7 @@ Authorization: Bearer <firebase-id-token>
 | 401 | `{ "error": "Token no proporcionado" }` | Sin header Authorization |
 | 403 | `{ "error": "Acceso denegado" }` | El usuario no tiene rol CONDUCTOR |
 | 403 | `{ "error": "Este vehiculo no te pertenece" }` | El vehículo pertenece a otro conductor |
+| 400 | `{ "error": "id de vehiculo invalido" }` | `:id` no numérico o fuera de rango (antes daba 500, p. ej. `/mis-vehiculos/undefined`) |
 | 404 | `{ "error": "Vehiculo no encontrado" }` | No existe vehículo con ese id |
 
 ---

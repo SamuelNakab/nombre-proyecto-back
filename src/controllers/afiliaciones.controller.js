@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import prisma from '../config/prisma.js';
 import { ejecutarDesafiliacion } from '../services/afiliacion.service.js';
+import { responder400 } from '../services/errores-validacion.js';
+import { idParam } from '../services/id-param.js';
 
 const schemaUnirse = z.object({
   codigo_afiliacion: z.string().min(1),
@@ -15,7 +17,7 @@ async function getConductor(id_usuario) {
 export async function unirseAEmpresa(req, res) {
   const parsed = schemaUnirse.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.issues[0].message });
+    return responder400(res, parsed);
   }
 
   const conductor = await getConductor(req.usuario.id_usuario);
@@ -91,8 +93,8 @@ export async function listarMisAfiliaciones(req, res) {
 // DELETE /api/afiliaciones/:id — el conductor se va de una empresa. :id es el
 // id_conductor_empresa de la afiliacion. Aplica las reglas de desafiliacion.
 export async function salirDeEmpresa(req, res) {
-  const id_afiliacion = Number(req.params.id);
-  if (!Number.isInteger(id_afiliacion) || id_afiliacion <= 0) {
+  const id_afiliacion = idParam(req.params.id);
+  if (!id_afiliacion) {
     return res.status(400).json({ error: 'id de afiliacion invalido' });
   }
 

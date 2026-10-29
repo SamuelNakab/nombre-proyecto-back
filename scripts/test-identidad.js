@@ -48,7 +48,7 @@ import prisma from '../src/config/prisma.js';
 import redis from '../src/config/redis.js';
 import { conServer } from './_server-efimero.js';
 import { crearRegistro } from './_limpieza.js';
-import { getToken as loginFirebase } from './_firebase-auth.js';
+import { getToken as loginFirebase, exigirAdminTest } from './_firebase-auth.js';
 
 const PUERTO = 3501;
 const PUERTO_LICENCIA = 3505;
@@ -85,6 +85,8 @@ const esperar = (ms) => new Promise((r) => setTimeout(r, ms));
 const titulo = (t) => console.log(`\n-- ${t} ${'-'.repeat(Math.max(0, 60 - t.length))}\n`);
 
 const getToken = (email, password = PASS) => loginFirebase(email, password);
+// Cuenta ADMIN de los tests (TEST_ADMIN_PASSWORD): sin ella la suite no arranca.
+const ADMIN_TEST = exigirAdminTest();
 
 let BASE = `http://localhost:${PUERTO}`;
 
@@ -823,7 +825,7 @@ async function casoLicencia() {
       const me = await api('GET', '/api/auth/me', null, K.token, base);
       const choferes = await api('GET', `/api/organizaciones/${org.id_organizacion}/choferes`, null, P.token, base);
       const viajes = await api('GET', '/api/choferes/viajes', null, K.token, base);
-      const admin = await api('GET', `/api/admin/usuarios/${K.id_usuario}`, null, await getToken('admin-test@fleter.com', 'admintest123'), base);
+      const admin = await api('GET', `/api/admin/usuarios/${K.id_usuario}`, null, await getToken(ADMIN_TEST.email, ADMIN_TEST.password), base);
       paso(
         'CASO 15d: las lecturas reales toleran la licencia null (/me, choferes de la PyME, viajes del chofer, admin detalle)',
         vinc.status === 200 && me.status === 200 && choferes.status === 200 && choferes.data.some((c) => c.id_conductor === K.id_conductor) &&

@@ -33,3 +33,27 @@ export async function getToken(email, password) {
   if (!data.idToken) throw new Error(`Firebase login fallido para ${email}: ${data.error?.message}`);
   return data.idToken;
 }
+
+// Cuenta ADMIN de los tests. La password NO esta en el codigo (antes estaba
+// commiteada, y la DB compartida la hacia un ADMIN real de production): sale de
+// TEST_ADMIN_PASSWORD. Las suites la piden AL ARRANCAR, antes de crear nada.
+export const EMAIL_ADMIN_TEST = 'admin-test@fleter.com';
+
+export function credencialesAdminTest() {
+  const password = process.env.TEST_ADMIN_PASSWORD;
+  if (!password) {
+    throw new Error(`Falta TEST_ADMIN_PASSWORD en el .env (password de ${EMAIL_ADMIN_TEST})`);
+  }
+  return { email: EMAIL_ADMIN_TEST, password };
+}
+
+// Para el arranque de una suite: sin la variable, lo dice claro y sale con 1 sin
+// haber creado nada.
+export function exigirAdminTest() {
+  try {
+    return credencialesAdminTest();
+  } catch (e) {
+    console.error(`\n💥 ${e.message}. La suite no arranca.`);
+    process.exit(1);
+  }
+}

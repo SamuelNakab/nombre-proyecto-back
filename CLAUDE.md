@@ -63,16 +63,27 @@ elegibles) queda DORMIDO detras de MARKETPLACE_HABILITADO. MVP: CABA + GBA.
   registro la sigue exigiendo hasta LICENCIA_OPCIONAL=true) y el SIMULADOR DEL
   FRONT en e2e/sim (contrato corregido, casos de la Tarea 5, paso de CI,
   categoria `sim` de restos.js) COMPLETO. Ver "Pedido del front 20-10-2026".
+- TAREA 6 — SEGURIDAD Y MONITOREO: manejador global de errores (un input
+  invalido nunca es un 500), mensajes de Zod en español con el campo, idParam
+  unico con tope INT4, CORS por CORS_ORIGINS (Express y socket.io), rate limit en
+  Redis (express-rate-limit + handshake de sockets, falla abierta), helmet para
+  API JSON, Sentry solo errores (no-op sin DSN), /health con version y uptime, y
+  la password de admin-test fuera del codigo (TEST_ADMIN_PASSWORD) COMPLETO. Ver
+  "Seguridad y monitoreo (Tarea 6)".
 
 ## Stack
 - Node.js 22, ES Modules (NUNCA require()). Async/await siempre.
 - Express, PostgreSQL en Neon (Prisma 6), Firebase Admin SDK,
   Socket.io v4, Redis (ioredis), Turf.js, Zod, pdfkit,
-  @aws-sdk/client-s3 (R2), Google Maps Directions API, Vitest.
+  @aws-sdk/client-s3 (R2), Google Maps Directions API, Vitest,
+  helmet, cors, express-rate-limit, @sentry/node.
 
 ## Reglas de codigo
 - ES Modules siempre. Named exports. kebab-case en archivos.
-- Zod en todos los endpoints REST. Errores como { error: "mensaje" }.
+- Zod en todos los endpoints REST. Errores como { error: "mensaje" }. El 400 de
+  validacion sale con responder400(res, parsed) (errores-validacion.js) y los
+  :id con idParam (id-param.js); lo que se escape lo toma el manejador global
+  (errores.middleware.js). Ver "Seguridad y monitoreo (Tarea 6)".
 - Variables en .env con default en codigo si no estan.
 - PrismaClient unico en src/config/prisma.js.
 - CUALQUIER cambio en el ciclo del viaje interno (endpoints, estados, mensajes
@@ -255,9 +266,10 @@ interactiva (OPCIONES_TX: maxWait 10s, timeout 20s):
 - Rate limit (rate-limit-canje.service.js): INVITACION_INTENTOS_MAX (5) cada
   INVITACION_VENTANA_MINUTOS (15), por usuario Y por IP, contando cada intento.
   MULTI de SET NX EX + INCR (la clave nunca queda sin TTL; no depende de EXPIRE
-  NX de Redis 7). IP = ultimo valor de X-Forwarded-For (el que agrega el proxy
-  de Railway) o el socket; NO se activo `trust proxy` para no cambiar req.ip en
-  toda la app. Si Redis no esta `ready` o no responde en 1s -> se deja pasar y
+  NX de Redis 7). IP = req.ip: desde la Tarea 6 la app corre con `trust proxy`
+  = TRUST_PROXY (1), que es el ultimo valor de X-Forwarded-For (el que agrega el
+  proxy de Railway), el mismo que se tomaba a mano antes. El 429 ahora trae
+  Retry-After (PTTL en el mismo MULTI). Si Redis no esta `ready` o no responde en 1s -> se deja pasar y
   se loguea "[invitaciones] rate limit sin Redis". Ese chequeo de status existe
   porque ioredis ENCOLA comandos mientras reconecta: sin el, con Redis caido el
   request quedaria colgado.
@@ -823,8 +835,8 @@ id_lugar.
 
 ### PENDIENTES (Paso 5 o despues)
 - "Repetir serie" (propuesta arriba), si se aprueba.
-- Rate limit / cupo de creacion de series por PyME: hoy un miembro puede crear
-  series sin limite y cada una cuesta hasta 279 llamadas Pro.
+- HECHO en la Tarea 6: limite de creacion de series POR USUARIO
+  (RATE_LIMIT_SERIES, 10 por hora). Un cupo por PyME sigue pendiente si hace falta.
 - estimar-costo con { id_lugar } (hoy el front manda las coordenadas del lugar).
 - Los 31 timers por serie suman al Map en memoria: misma limitacion de un solo
   proceso que el resto (cola persistente el dia que haya mas de una instancia).
@@ -1063,10 +1075,198 @@ GUARDS VERIFICADOS REVIRTIENDOLOS (test-cierre-viaje.js):
   condicion_requerida (en lo interno), series_viaje.condiciones y, si el
   marketplace no vuelve, el enum TipoCondicion y condicion_vehiculo.
 - Motivo en el remito PDF, si se quiere.
-- BUG en src (no se toco, vehiculos quedan como estan): conductores.controller
-  hace `parsed.error.errors[0]`, que con Zod 4 es undefined -> un body invalido
-  en POST / PUT /api/conductores/mis-vehiculos da 500 en vez de 400 (mismo
-  archivo que el pendiente de PUT /mis-vehiculos/undefined).
+- HECHO en la Tarea 6: el `parsed.error.errors[0]` de conductores.controller
+  (500 con un body invalido) y PUT /mis-vehiculos/undefined (500).
+
+## Seguridad y monitoreo (Tarea 6)
+
+Sin cambios de schema. Archivos: src/middlewares/errores.middleware.js
+(manejador global + 404), src/services/errores-validacion.js (Zod en español),
+src/services/id-param.js, src/config/cors.js, src/config/sentry.js,
+src/services/redis-seguro.js (contadores en Redis, falla abierta),
+src/middlewares/rate-limit.middleware.js, src/sockets/limite-handshake.js y la
+cache de src/sockets/auth.socket.js.
+
+### Errores — un input invalido nunca es un 500
+- Antes NO habia manejador de errores: lo que no era ErrorNegocio terminaba en
+  el handler por defecto de Express (500 en HTML). Express 5 manda los rechazos
+  de los handlers async a next(err); ahora los toma manejarErrores (al final de
+  app.js), que usa mapearError (PURA, testeada):
+  | Error | Respuesta |
+  |---|---|
+  | ErrorNegocio | su status (5xx -> Sentry) |
+  | body-parser entity.parse.failed / entity.too.large / charset | 400 / 413 / 415 |
+  | PrismaClientValidationError | 400 "Algún dato de la solicitud es inválido" + Sentry WARNING con un mensaje propio (el de Prisma trae los argumentos de la query: ni al log ni a Sentry). Unica excepcion acordada a "los 4xx no van a Sentry": casi siempre es un input sin validar en el borde |
+  | P2000 / P2002 / P2003 / P2025 / P2034 | 400 / 409 (con el campo) / 409 / 404 / 409 |
+  | P2006-P2033 de input | 400 |
+  | P1001 / P1002 / P1008 / P1017 / P2024 / InitializationError | 503 + Sentry |
+  | otro 4xx con status | ese status |
+  | el resto | 500 "Error interno del servidor" + log + Sentry |
+- Ruta inexistente -> 404 { error: 'No encontrado' } (el mismo cuerpo que los flags).
+- express.json con limit 100kb.
+- Lo que daba 500 por input invalido (todo arreglado en el borde; el manejador
+  es la red): parseInt / Number(req.params.id) sin validar en conductores (4
+  handlers, incluido PUT /mis-vehiculos/undefined), viajes.controller (9) y el
+  cancelar del admin; ids > 2147483647 en TODOS los idParam (no tenian tope
+  INT4); ids del body sin tope (id_conductor, id_vehiculo, id_lugar); el
+  `.error.errors[0]` de Zod 4 en conductores; JSON mal formado (400 en HTML); el
+  P2002 de dos altas de la misma patente a la vez.
+- idParam UNICO (id-param.js, 1..ID_MAX, solo digitos) reemplaza las 5 copias.
+  ID_MAX tambien en idPositivo (viajes-internos) e id_lugar (viaje-validacion).
+- verificarToken / autenticarSocket: el catch del token ya no envuelve la query
+  del usuario. Antes una caida de la DB salia como 401 "Token invalido o
+  expirado" (un 5xx disfrazado que Sentry nunca veria) y, en Express, tambien
+  cualquier excepcion sincronica de un handler posterior (el next() estaba
+  dentro del try).
+- sockets/index.js: unirseARoomsDisponibles / unirseARoomsCliente no tenian
+  .catch: un error de la DB al conectarse era un unhandledRejection y Node 22
+  TUMBABA EL PROCESO.
+- Se saco el console.log del registro de cliente que imprimia el email.
+
+### Validacion — mensajes en español
+- errores-validacion.js instala un customError GLOBAL de Zod 4. Zod lo consulta
+  SOLO si el schema no trae mensaje propio (finalizeIssue: schema > ctx >
+  customError > locale) y le pasa el path completo, asi que NINGUN mensaje en
+  español existente cambio. Los defaults salen neutros de genero y con el campo:
+  "El campo nombre es obligatorio", "El campo anio debe ser un número", "El campo
+  dni debe tener al menos 7 caracteres", "El campo paradas[1].lat ...", y un body
+  que no es objeto -> "El cuerpo de la solicitud debe ser un objeto JSON".
+- responder400(res, parsed) reemplaza los ~37 `parsed.error.issues[0].message`
+  (y los 3 error400 locales). Sale el PRIMER issue, como antes.
+- Unico texto documentado que cambio: fecha_programada AUSENTE (API.md decia
+  "Invalid input: expected string, received undefined").
+
+### CORS
+- configurarCors() (al arrancar). Sin CORS_ORIGINS: `origin: '*'` literal (el
+  header de antes) + warning "[cors] CORS_ORIGINS no configurado". Con la lista:
+  eco del origen permitido, nada para el resto (sin 403), Max-Age 600, y expone
+  Retry-After / RateLimit / RateLimit-Policy (sin eso el front web no los lee).
+- Sin header Origin pasa SIEMPRE (mobile, curl, server-to-server, simulador).
+- `*` = exactamente UNA etiqueta del host (https://*.vercel.app no cubre
+  a.b.vercel.app ni http://).
+- socket.io: `cors.origin` con la misma funcion (solo aplica a polling) +
+  `allowRequest`, que es lo que cubre el upgrade a WebSocket.
+- OJO antes de cargar CORS_ORIGINS en production: probar en staging que la app
+  mobile se conecte por socket (si el cliente de React Native manda Origin,
+  allowRequest lo rechaza).
+
+### Rate limit
+- express-rate-limit 8 con un store PROPIO (StoreRedis sobre consumirCupo:
+  MULTI SET NX PX + INCR + PTTL, el mismo patron del canje) en vez de
+  rate-limit-redis: asi el chequeo de `redis.status` y el timeout (500 ms) son
+  los mismos que en el canje. Si Redis no responde el store tira y
+  passOnStoreError deja pasar; el log "[rate-limit] sin Redis" sale a lo sumo 1
+  vez por minuto (el logger propio silencia el de express-rate-limit, que seria
+  uno por request).
+- `trust proxy` = TRUST_PROXY (1). Claves rl:<limiter>:ip:<ip> (IPv6 agrupado por
+  /56, el default de express-rate-limit) o rl:<limiter>:u:<id_usuario>.
+- Limites (MAX por request, ventana al arrancar):
+  | Limiter | Clave | Default | Donde |
+  |---|---|---|---|
+  | GENERAL | IP | 600 / 60 s | app.use despues de /health |
+  | REGISTRO | IP | 20 / 1 h | registro-cliente / -conductor / -gerente (un cupo para las 3; antes de validar el body) |
+  | MAPS | usuario | 60 / 10 min | crear y editar viaje interno, estimar-costo, POST /api/viajes |
+  | SERIES | usuario | 10 / 1 h | crear serie |
+  | INVITACIONES | usuario | 30 / 1 h | crear codigo (el canje sigue con el suyo, 5 / 15 min, que ahora manda Retry-After) |
+  | SOCKET_IP | IP | 300 / 60 s | handshake, antes de autenticar |
+  | SOCKET_USUARIO | uid | 30 / 60 s | handshake, despues de verifyIdToken y antes de la DB |
+  Los por usuario van despues de verificarToken y de requireMiembro.
+- 429 { error: "Demasiadas <que>. Probá de nuevo en N segundos|minutos." } +
+  Retry-After + RateLimit / RateLimit-Policy (draft-7).
+- Handshake: SOCKET_IP esta pensado para CGNAT (un celular que reconecta con el
+  backoff de socket.io hace ~12/min como mucho; 300 = 25 en loop detras de una
+  IP, o un deploy que reconecta 300 juntos). La IP sale de X-Forwarded-For con
+  los mismos saltos que trust proxy (ipDeHandshake). Rechazo: err.message
+  'RATE_LIMIT' + err.data { retryAfter, error }. Un rechazo del middleware NO
+  reconecta solo en el cliente: API.md le dice a mobile como reintentar.
+- Cache de la auth del handshake: sha256(token) -> { uid, usuario } hasta
+  min(exp del token, SOCKET_AUTH_CACHE_SEGUNDOS). Hit = ni Firebase ni DB (el
+  limite por uid se aplica igual). Solo positivos; tope 5000, se barre al
+  insertar (sin pollers). No empeora la revocacion (verifyIdToken sin
+  checkRevoked ya acepta un token revocado hasta que vence).
+- OJO al arrancar: con la Redis de Railway el server tarda unos segundos en
+  tenerla `ready`; esos primeros requests pasan sin limite (falla abierta).
+  test-seguridad tiene una SONDA por eso (espera a ver la clave del limiter).
+- El simulador del front, con el limiter PRENDIDO contra un server local, paso
+  entero sin un solo 429.
+
+### Headers — helmet
+CSP `default-src 'none'; frame-ancestors 'none'`, X-Frame-Options DENY,
+Referrer-Policy no-referrer, HSTS por defecto, sin X-Powered-By. CORP queda en
+same-origin (no afecta a fetch con CORS; los remitos van por la URL publica de R2).
+
+### Sentry — solo errores
+- @sentry/node 10 (version exacta). config/sentry.js es el 2do import de app.js
+  (despues de dotenv). NO hace falta `--import`: eso es la auto-instrumentacion
+  de OpenTelemetry (tracing), que no se usa; registerEsmLoaderHooks false. Los
+  errores se capturan A MANO.
+- Sin SENTRY_DSN no se llama a init y reportarError no hace nada.
+  vitest.config.js y conServer (y la copia de test-anticipacion) fuerzan
+  SENTRY_DSN vacio: tests y servers de test no mandan nada aunque el .env local
+  tenga un DSN (el de Samuel lo tiene: npm run dev SI manda, con environment
+  development).
+- init: environment = RAILWAY_ENVIRONMENT_NAME || NODE_ENV || 'local', release =
+  RAILWAY_GIT_COMMIT_SHA, tracesSampleRate 0, sendDefaultPii false. Integraciones
+  fuera: OnUncaughtException / OnUnhandledRejection (los maneja
+  instalarManejadoresProceso, igual haya DSN o no) y Console (breadcrumbs con
+  datos de viajes).
+- limpiarEvento (beforeSend, PURA): request queda solo { method, url sin query };
+  user solo { id, rol }; emails, Bearer, JWTs, postgres:// / redis:// y keys AIza
+  -> "[filtrado]" en todo el evento y en los breadcrumbs.
+- reportarError(err, { contexto, nivel, usuario, tags, extra }) con scope LOCAL
+  (nunca Sentry.setUser global: sin instrumentacion no hay aislamiento por
+  request y se mezclarian usuarios). Nunca tira.
+- Donde se captura: manejador global (5xx + warning de Prisma),
+  responderErrorNegocio con status >= 500, sockets (conductor:ubicacion, los 2 de
+  viaje:aceptar, unirse a salas, handshake con la DB caida), timers (reserva,
+  vencimiento legacy e interno, cierre automatico y aviso, tick del ETA,
+  deteccion de salida), los 4 barridos de arranque, historial-estado y
+  medicion-real (warning), y process. El "ciclo salteado" del ETA por ErrorMaps
+  NO va (es esperado y con Google caido inundaria). Los console.error de siempre
+  quedan con el mismo texto.
+- unhandledRejection -> log + Sentry y el proceso SIGUE (antes Node 22 lo mataba
+  y se perdian los timers en memoria). uncaughtException -> log + Sentry +
+  flush(2000) + exit(1).
+
+### /health
+Sin DB (UptimeRobot + Neon dormido) y fuera del rate limit. Suma `version`
+(RAILWAY_GIT_COMMIT_SHA corto, null en local) y `uptime_segundos`. capacidades
+igual. test-seguridad verifica que 5 GET /health no generan ni una prisma:query.
+
+### Cuentas de admin
+- Relevamiento (2026-10-29): hay UN solo ADMIN en la DB, admin-test@fleter.com
+  (id_usuario 6), la cuenta de las suites. Con la DB compartida es el admin REAL
+  de production, y su password estuvo commiteada (sigue en el historial de git).
+  No hay endpoint de alta: scripts/crear-admin.js (Firebase + DB). Autenticacion
+  = verificarToken (sin checkRevoked) + requireRol('ADMIN'); sin MFA. Puede: ver
+  usuarios (con email, DNI, telefono) y viajes, estadisticas, y cancelar
+  cualquier viaje no final, incluso en curso.
+- HECHO: la password salio del codigo -> TEST_ADMIN_PASSWORD
+  (credencialesAdminTest / exigirAdminTest en scripts/_firebase-auth.js). Sin ella
+  test-admin, test-historial-estados, test-identidad, test-viaje-interno y el
+  runner no arrancan; el seed saltea la cuenta. Rotar: poner la nueva en el .env y
+  `node scripts/rotar-password-admin-test.js`. El CI no usa admin-test (no hace
+  falta secret). `grep -r admintest123` en el repo da vacio.
+- PENDIENTE (propuesta, no implementada):
+  1. Cuentas individuales: una por persona con crear-admin.js; el panel de
+     production deja de usar admin-test.
+  2. ADMIN_PERMITIDOS (emails o id_usuario) chequeado en admin.routes.js: en
+     production solo los admins reales; sin la variable (local / tests) cualquier
+     ADMIN. Asi admin-test no sirve contra production aunque la DB siga
+     compartida.
+  3. verifyIdToken(token, true) (checkRevoked) en las rutas de admin, para que
+     deshabilitar a alguien en Firebase corte en el acto, y MFA (TOTP de
+     Identity Platform) para los admins.
+  4. Auditoria de lecturas del admin (quien vio que usuario) cuando se separen
+     las DBs.
+
+### PENDIENTES
+- Ver "Cuentas de admin".
+- Cargar SENTRY_DSN y, cuando se quiera cerrar, CORS_ORIGINS en Railway
+  (probando antes mobile en staging).
+- Cupo de series POR PyME (hoy es por usuario).
+- La cache de auth del handshake podria servir tambien para verificarToken de
+  HTTP (hoy cada request hace verifyIdToken + 1 query).
 
 ## Maquina de estados — src/services/estado-viaje.service.js
 Hay DOS ciclos con su tabla cada uno: TRANSICIONES (este, el LEGACY del
@@ -1984,6 +2184,24 @@ TEST_LICENCIA_NULL                (SOLO tests: =1 corre test-identidad CASO
                                    licencia NULL)
 FLETER_API                        (SOLO tests: backend del simulador del front,
                                    default staging; en CI = TEST_API_URL)
+CORS_ORIGINS                      (Tarea 6: origenes web permitidos, por coma,
+                                   sin barra final; `*` = UNA etiqueta del host.
+                                   Sin la variable: todo abierto como antes +
+                                   warning al arrancar. Se lee AL ARRANCAR)
+TRUST_PROXY=1                     (saltos de proxy: `trust proxy` y la IP del
+                                   handshake. Al arrancar)
+RATE_LIMIT_HABILITADO=1           ('0' / 'false' apagan TODOS los limiters.
+                                   SOLO tests / local: conServer y el runner lo
+                                   ponen en 0 solos)
+RATE_LIMIT_<X>_MAX / _VENTANA_SEGUNDOS (X = GENERAL 600/60, REGISTRO 20/3600,
+                                   MAPS 60/600, SERIES 10/3600, INVITACIONES
+                                   30/3600, SOCKET_IP 300/60, SOCKET_USUARIO
+                                   30/60. El MAX por request; la ventana de los
+                                   de Express, al arrancar)
+SOCKET_AUTH_CACHE_SEGUNDOS=120    (cache de la auth del handshake)
+SENTRY_DSN                        (sin default: sin DSN, Sentry no hace nada.
+                                   vitest.config.js y conServer lo fuerzan vacio)
+TEST_ADMIN_PASSWORD               (SOLO tests: password de admin-test@fleter.com)
 Todas se leen en CADA request (no se cachean), con guarda: un
 valor basura o <= 0 cae al default.
 
@@ -2030,6 +2248,15 @@ MATCHING_TIMEOUT eliminado POR COMPLETO — no queda ningun rastro:
   ya no la lee nadie: borrarla. Las que el codigo lee y no estan cargadas
   (ETA_*, RUTA_RECALCULO_COOLDOWN_SEGUNDOS, FEE_PORCENTAJE, TARIFA_*) corren con
   el default de codigo: cargarlas solo para cambiar ese valor.
+- Tarea 6, cargar en staging y production: SENTRY_DSN (el mismo; el environment
+  sale de RAILWAY_ENVIRONMENT_NAME y el release de RAILWAY_GIT_COMMIT_SHA, que
+  inyecta Railway). CORS_ORIGINS cuando se quiera cerrar CORS (puede valer
+  distinto en cada environment), PROBANDO ANTES EN STAGING que la app mobile se
+  conecte por socket: si el cliente de React Native manda un header Origin,
+  allowRequest lo rechaza. NO cargar RATE_LIMIT_HABILITADO ni los RATE_LIMIT_*
+  (los defaults alcanzan). Despues del primer deploy, `redis-cli --scan --pattern
+  'rl:general:*'` en el Redis de staging tiene que mostrar IPs publicas (si
+  muestra las del proxy, TRUST_PROXY esta mal).
 - Log de desconexion de socket: "[Socket] desconectado: ROL uid:N id:X
   motivo:<reason de socket.io> duracion:Ns" (sin email, token ni IP), para
   diagnosticar cortes del mobile.
@@ -2153,7 +2380,9 @@ node scripts/seed-cuentas-test.js          (recrea las cuentas FIJAS de las suit
                                             de regresion — cliente@, cliente2@,
                                             conductor@, conductor2@,
                                             stress-conductor2@test.com y
-                                            admin-test@fleter.com — en Firebase y
+                                            admin-test@fleter.com (password de
+                                            TEST_ADMIN_PASSWORD; sin ella se
+                                            saltea) — en Firebase y
                                             en la DB. Idempotente. CORRERLO
                                             despues de cualquier reset de la DB:
                                             si no, el registro de las suites da
@@ -2222,6 +2451,21 @@ node scripts/test-lugares-series.js        (Paso 4: lugares (CRUD, nombre unico,
                                             Pro por corrida, las imprime al
                                             final junto con la tabla de series
                                             (viajes, llamadas y tiempos))
+node scripts/test-seguridad.js             (Tarea 6: ids invalidos / bodies
+                                            invalidos / JSON mal formado / body
+                                            enorme -> 400 / 413 en español, 404
+                                            JSON, CORS de Express y socket.io con
+                                            CORS_ORIGINS, helmet, /health con
+                                            version y SIN queries (3991); rate
+                                            limit con limites bajos: general,
+                                            registro, MAPS por usuario, canje con
+                                            Retry-After, handshake por uid (3992);
+                                            falla abierta sin Redis (3993). No
+                                            crea datos; borra sus claves rl:* de
+                                            Redis)
+node scripts/rotar-password-admin-test.js  (rota la password de admin-test en
+                                            Firebase a TEST_ADMIN_PASSWORD y
+                                            verifica el login. Solo Firebase)
 node scripts/test-cierre-viaje.js          (Tarea 5: finalizar de la PyME (antes
                                             de tiempo 409, pasada la prevista,
                                             con salida detectada), deteccion de
@@ -2278,8 +2522,10 @@ corta requests en vuelo. Sintoma tipico: "fetch failed" a mitad de un script.
   proposito; las legacy con servers efimeros — timeout-reserva, viajes-vencidos,
   historial-estados, jerarquia CASO 8, anticipacion — prenden el marketplace en
   SU env, porque el .env local lo tiene en false).
-- Requisitos: FIREBASE_WEB_API_KEY, INVITACION_SECRETO, Redis y las cuentas de
-  seed-cuentas-test.js. Usa Google REAL (las suites del Paso 3/4 imprimen sus
+- Requisitos: FIREBASE_WEB_API_KEY, INVITACION_SECRETO, TEST_ADMIN_PASSWORD (el
+  runner corta al arrancar si falta alguna), Redis y las cuentas de
+  seed-cuentas-test.js. El server del runner y TODOS los servers efimeros
+  (conServer) corren con RATE_LIMIT_HABILITADO=0 y SENTRY_DSN vacio. Usa Google REAL (las suites del Paso 3/4 imprimen sus
   llamadas Pro).
 
 ### Login — scripts/_firebase-auth.js
@@ -2393,7 +2639,7 @@ referenciaba) se BORRARON: quedan en el historial de git.
   restos.js). Si se vuelven a correr: despues, `node scripts/restos.js --solo
   fijas,exploratorias` y borrar con --borrar. Darles crearRegistro + terminar
   si alguna se porta a suite oficial (ver el punto anterior).
-- BUG en src: PUT /api/conductores/mis-vehiculos/:id con un id no numerico da 500
-  en vez de 400 (lo destapo vehiculos-exhaustivo: PUT /mis-vehiculos/undefined).
+- HECHO en la Tarea 6: PUT /api/conductores/mis-vehiculos/:id con un id no
+  numerico daba 500 (ahora 400 "id de vehiculo invalido").
 - Lint: scripts/ no entra en npm run lint; varias suites legacy tienen errores
   de eslint previos (no-empty, no-useless-assignment) que no se tocaron.

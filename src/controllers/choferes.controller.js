@@ -2,11 +2,7 @@ import prisma from '../config/prisma.js';
 import { responderErrorNegocio } from '../services/error-negocio.js';
 import { organizacionesDeChofer, desvincularChofer } from '../services/vinculo-chofer.service.js';
 import { io } from '../sockets/index.js';
-
-function idParam(valor) {
-  const n = Number(valor);
-  return Number.isInteger(n) && n > 0 ? n : null;
-}
+import { idParam } from '../services/id-param.js';
 
 const conductorDe = (id_usuario) =>
   prisma.conductor.findUnique({ where: { id_usuario }, select: { id_conductor: true } });

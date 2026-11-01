@@ -1,6 +1,7 @@
 import redis from '../config/redis.js';
 import { obtenerUltimaCoordenada } from './gps.service.js';
 import { calcularEtaConApi, obtenerEtaActual, leerEstadoEta } from './eta.service.js';
+import { reportarError } from '../config/sentry.js';
 
 // Emisor periodico de ETA. Mantiene un setInterval por viaje activo que emite
 // eta:actualizar al room cada ETA_EMISION_SEGUNDOS. Entre recalculos con la API
@@ -108,9 +109,10 @@ export function iniciarEmisorEta(io, id_viaje, salas = null) {
       detenerEmisorEta(id_viaje);
       return;
     }
-    emitirEta(io, id_viaje).catch((e) =>
-      console.error(`[eta-emisor] viaje ${id_viaje}:`, e.message)
-    );
+    emitirEta(io, id_viaje).catch((e) => {
+      console.error(`[eta-emisor] viaje ${id_viaje}:`, e.message);
+      reportarError(e, { contexto: 'timer:eta', extra: { id_viaje } });
+    });
   }, emisionSeg() * 1000);
 
   timers.set(id_viaje, handle);

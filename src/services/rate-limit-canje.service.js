@@ -1,5 +1,6 @@
 import redis from '../config/redis.js';
 import { intentosMaxCanje, ventanaCanjeMinutos } from './invitacion.service.js';
+import { conTimeout, redisListo } from './redis-seguro.js';
 
 // Rate limit del canje de codigos: INVITACION_INTENTOS_MAX intentos cada
 // INVITACION_VENTANA_MINUTOS, por usuario Y por IP. Cuenta CADA intento (bueno o
@@ -11,38 +12,24 @@ import { intentosMaxCanje, ventanaCanjeMinutos } from './invitacion.service.js';
 
 const TIMEOUT_REDIS_MS = 1000;
 
-// La IP real del cliente. En Railway el request llega por un proxy que AGREGA la
-// IP que vio al final de X-Forwarded-For; lo de adelante lo puede mandar el
-// cliente, asi que se toma el ultimo valor. Sin header (local), el socket.
-// No se usa `trust proxy` para no cambiar req.ip en toda la app.
+// La IP real del cliente. Desde la Tarea 6 la app corre con `trust proxy` (1
+// salto: el proxy de Railway AGREGA la IP que vio al final de X-Forwarded-For, y
+// lo de adelante lo puede mandar el cliente), asi que req.ip ya es ese ultimo
+// valor. Sin header (local), el socket.
 export function ipDelRequest(req) {
-  const xff = req.headers['x-forwarded-for'];
-  if (xff) {
-    const partes = String(xff)
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
-    if (partes.length > 0) return partes[partes.length - 1];
-  }
-  return req.socket?.remoteAddress ?? 'desconocida';
+  return req.ip ?? req.socket?.remoteAddress ?? 'desconocida';
 }
 
 export const claveUsuario = (id_usuario) => `invitacion:canje:usuario:${id_usuario}`;
 export const claveIp = (ip) => `invitacion:canje:ip:${ip}`;
 
-function conTimeout(promesa, ms) {
-  let timer;
-  const limite = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`sin respuesta en ${ms}ms`)), ms);
-  });
-  return Promise.race([promesa, limite]).finally(() => clearTimeout(timer));
-}
-
-// -> { permitido: boolean }. Suma un intento a las dos claves.
+// -> { permitido: boolean, retryAfter?: segundos }. Suma un intento a las dos
+// claves. retryAfter (para el header Retry-After) = lo que le falta a la clave que
+// se paso del maximo.
 export async function consumirIntentoCanje({ id_usuario, ip }) {
   // ioredis encola los comandos mientras reconecta: sin este chequeo, con Redis
   // caido el request quedaria colgado esperando una respuesta que no llega.
-  if (redis.status !== 'ready') {
+  if (!redisListo(redis)) {
     console.error(`[invitaciones] rate limit sin Redis (status=${redis.status}): se deja pasar el canje`);
     return { permitido: true };
   }
@@ -63,12 +50,17 @@ export async function consumirIntentoCanje({ id_usuario, ip }) {
         .incr(kU)
         .set(kI, 0, 'EX', segundos, 'NX')
         .incr(kI)
+        .pttl(kU)
+        .pttl(kI)
         .exec(),
       TIMEOUT_REDIS_MS
     );
     const intentosUsuario = res[1][1];
     const intentosIp = res[3][1];
-    return { permitido: intentosUsuario <= max && intentosIp <= max };
+    const permitido = intentosUsuario <= max && intentosIp <= max;
+    if (permitido) return { permitido };
+    const ms = Math.max(intentosUsuario > max ? res[4][1] : 0, intentosIp > max ? res[5][1] : 0);
+    return { permitido, retryAfter: Math.max(1, Math.ceil((ms > 0 ? ms : segundos * 1000) / 1000)) };
   } catch (e) {
     console.error(`[invitaciones] rate limit sin Redis (${e.message}): se deja pasar el canje`);
     return { permitido: true };

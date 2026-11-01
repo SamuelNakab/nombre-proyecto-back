@@ -7,6 +7,8 @@ import { esViajeVencido } from '../services/vencimiento.service.js';
 import { calcularPuntualidadInicio } from '../services/puntualidad.service.js';
 import { calcularMetricasViaje } from '../services/duracion.service.js';
 import { INCLUDE_HISTORIAL } from '../services/historial-estado.service.js';
+import { responder400 } from '../services/errores-validacion.js';
+import { idParam } from '../services/id-param.js';
 
 const TIPOS_CONDICION = ['FRAGIL', 'REFRIGERADO', 'CARGA_PESADA', 'PELIGROSO', 'VOLUMINOSO'];
 
@@ -31,12 +33,6 @@ const schemaVehiculoFlota = z.object({
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-// Parsea un :param numerico. Devuelve el entero positivo o null si es invalido.
-function idParam(valor) {
-  const n = Number(valor);
-  return Number.isInteger(n) && n > 0 ? n : null;
-}
-
 // Trae la empresa y verifica que el usuario autenticado sea su gerente.
 // Devuelve { empresa } en exito, o { status, error } para cortar la request.
 async function empresaDelGerente(id_empresa, id_usuario) {
@@ -53,7 +49,7 @@ async function empresaDelGerente(id_empresa, id_usuario) {
 export async function crearEmpresa(req, res) {
   const parsed = schemaCrearEmpresa.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.issues[0].message });
+    return responder400(res, parsed);
   }
 
   const { nombre, cuit } = parsed.data;
@@ -247,7 +243,7 @@ export async function registrarVehiculoFlota(req, res) {
 
   const parsed = schemaVehiculoFlota.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.issues[0].message });
+    return responder400(res, parsed);
   }
 
   const { patente, marca, modelo, anio, color, tipo_vehiculo, condiciones } = parsed.data;

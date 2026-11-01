@@ -1,3 +1,5 @@
+import { reportarError } from '../config/sentry.js';
+
 // Error de regla de negocio con su status HTTP. Lo tiran los servicios de
 // identidad (organizaciones, invitaciones, vinculos) desde ADENTRO de una
 // $transaction: tirar es lo que hace rollback, y el status viaja con el error
@@ -14,9 +16,13 @@ export class ErrorNegocio extends Error {
 }
 
 // Para los controllers: responde { error } si es un ErrorNegocio y relanza
-// cualquier otra cosa (que la maneje Express como un 500).
+// cualquier otra cosa (la toma el manejador global, errores.middleware.js).
+// Un ErrorNegocio 5xx (Google caido, invitaciones sin secreto) va a Sentry.
 export function responderErrorNegocio(res, err) {
   if (err instanceof ErrorNegocio) {
+    if (err.status >= 500) {
+      reportarError(err, { contexto: 'negocio', usuario: res.req?.usuario, tags: { metodo: res.req?.method, status: err.status } });
+    }
     return res.status(err.status).json({ error: err.message, ...(err.extra ?? {}) });
   }
   throw err;

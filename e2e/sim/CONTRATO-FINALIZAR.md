@@ -70,6 +70,25 @@ Los viajes del marketplace (legacy) no cambian.
    `viaje:asignado` por cada uno). Los viajes de una serie se listan, confirman y rechazan **uno por
    uno** como cualquier otro, y traen `id_serie` (null en un viaje suelto).
 
+### Tarea 6 — límites y errores (aditivo; ningún mensaje del ciclo cambió)
+
+- **429 nuevos.** Crear y editar viaje de PyME (y `estimar-costo`) comparten un límite por
+  usuario de 60 cada 10 minutos (calculan rutas con Google); crear serie, 10 por hora. El
+  registro de cuentas, 20 por hora por IP; y todo `/api`, 600 por minuto por IP. Un 429 trae
+  `{ "error": "Demasiadas ... Probá de nuevo en N segundos|minutos." }` y el header
+  `Retry-After` (segundos). El ciclo del chofer (iniciar / salir / confirmar-parada /
+  finalizar) solo cuenta para el límite general. El simulador corre con margen de sobra
+  (~40 requests, 2 registros y ~4 rutas por corrida).
+- **Socket:** el handshake puede rechazarse con `connect_error` `err.message === 'RATE_LIMIT'` y
+  `err.data.retryAfter`; un rechazo del middleware **no reconecta solo**: reintentar a mano
+  (ver API.md, "Socket.io — handshake").
+- **400 genéricos en español:** los mensajes de validación que no tenían texto propio ahora salen
+  como `El campo X es obligatorio` / `El campo X debe ser un número`... (antes en inglés). Los de
+  esta página (motivo, descripción, fecha_programada, paradas, ciclo) son los mismos.
+- **Ids inválidos** en la URL (`/api/viajes/abc/confirmar-parada`, `/api/choferes/viajes/abc/salir`)
+  → 400 `id de viaje invalido` (algunos daban 500). **JSON mal formado** → 400
+  `El cuerpo de la solicitud no es un JSON válido` (antes un HTML).
+
 ---
 
 ## Viaje interno — la PyME asigna, el chofer confirma (Paso 2)

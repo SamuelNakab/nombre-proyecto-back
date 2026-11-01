@@ -18,6 +18,7 @@ import { distanciaMetros } from './parada.service.js';
 import { evaluarPingSalida, configDeteccion } from './salida-deteccion.js';
 import { configCierre, ultimaParada, cierreManualDesde } from './cierre-fechas.js';
 import { emitirViajeInterno } from '../sockets/salas.js';
+import { reportarError } from '../config/sentry.js';
 
 const keySalida = (id_viaje) => `gps:${id_viaje}:salida`;
 
@@ -66,6 +67,7 @@ export async function procesarPingSalida(io, viaje, parada, { lat, lng, timestam
     return detectada;
   } catch (err) {
     console.error(`[salida-deteccion] viaje ${viaje.id_viaje}: ${err.message}`);
+    reportarError(err, { contexto: 'salida-deteccion', extra: { id_viaje: viaje.id_viaje } });
     return null;
   }
 }

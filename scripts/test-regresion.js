@@ -14,6 +14,7 @@
 // Cada suite limpia lo que crea (ver _limpieza.js). Log completo de cada una en
 // scripts/.regresion/<suite>.log (gitignored); en vivo se ve con prefijo y sin
 // las lineas prisma:query.
+import 'dotenv/config';
 import { spawn, spawnSync } from 'node:child_process';
 import { createWriteStream, mkdirSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -23,6 +24,7 @@ import { conServer } from './_server-efimero.js';
 // Orden: primero las del modelo nuevo (con servers propios), despues las del
 // marketplace legacy contra el server del runner. timeoutMin = tope por suite.
 const SUITES = [
+  { archivo: 'test-seguridad.js', timeoutMin: 8 },
   { archivo: 'test-identidad.js', timeoutMin: 10 },
   { archivo: 'test-viaje-interno.js', timeoutMin: 30 },
   { archivo: 'test-maps.js', timeoutMin: 10 },
@@ -58,6 +60,9 @@ const ENV_SERVER = {
   RESERVA_BARRIDO_ARRANQUE: '0',
   VENCIMIENTO_BARRIDO_ARRANQUE: '0',
   CIERRE_BARRIDO_ARRANQUE: '0',
+  // Las suites legacy registran usuarios y hacen rafagas contra este server desde
+  // localhost. test-seguridad prueba el limiter con servers propios.
+  RATE_LIMIT_HABILITADO: '0',
 };
 
 const DIR_SCRIPTS = path.dirname(fileURLToPath(import.meta.url));
@@ -139,7 +144,15 @@ function correrSuite(suite, base) {
   });
 }
 
+// Requisitos que, si faltan, hacen fallar a varias suites a la mitad: mejor
+// cortar antes de levantar nada.
+function chequearRequisitos() {
+  const faltan = ['FIREBASE_WEB_API_KEY', 'INVITACION_SECRETO', 'TEST_ADMIN_PASSWORD'].filter((k) => !process.env[k]);
+  if (faltan.length > 0) throw new Error(`Faltan en el .env: ${faltan.join(', ')}`);
+}
+
 async function main() {
+  chequearRequisitos();
   const lista = elegirSuites();
   mkdirSync(DIR_LOGS, { recursive: true });
   console.log(`\n  Regresion: ${lista.length} suites, logs en scripts/.regresion/\n`);

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ID_MAX } from './id-param.js';
 
 // Piezas de validacion de un viaje compartidas por la ruta LEGACY
 // (POST /api/viajes) y la del ciclo INTERNO (POST/PUT
@@ -53,7 +54,7 @@ export const schemaParadas = conTopeParadas(paradaCoordenadas);
 // cosas (no hay forma razonable de decidir cual gana).
 const paradaInterna = z
   .object({
-    id_lugar: z.number().int('id_lugar invalido').positive('id_lugar invalido').optional(),
+    id_lugar: z.number().int('id_lugar invalido').positive('id_lugar invalido').max(ID_MAX, 'id_lugar invalido').optional(),
     lat: z.number().optional(),
     lng: z.number().optional(),
     direccion: z.string().min(1).optional(),

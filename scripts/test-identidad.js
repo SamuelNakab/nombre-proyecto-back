@@ -30,6 +30,12 @@
 //  12. Rate limit (server propio, max 3): por usuario y por IP -> 429.
 //  13. Sin INVITACION_SECRETO (server propio): 503, el resto anda.
 //  14. Redis caido (server propio): el canje pasa y no se cuelga.
+//  15. Licencia (pedido del front 20-10-2026): sin licencia con
+//      LICENCIA_OPCIONAL=false -> 400; con true (server propio 3505) un
+//      vencimiento basura -> 400. Lo que ESCRIBE un conductor con licencia NULL
+//      (registro 201 y lecturas reales) solo corre con TEST_LICENCIA_NULL=1: la
+//      DB es compartida y el Prisma viejo de production tira al leer esa fila.
+//      Activarlo cuando main tenga el Paso A desplegado.
 //
 // Acepta numeros de caso para correr solo esos (el setup corre siempre):
 //   node scripts/test-identidad.js 9 10 11
@@ -45,11 +51,16 @@ import { crearRegistro } from './_limpieza.js';
 import { getToken as loginFirebase } from './_firebase-auth.js';
 
 const PUERTO = 3501;
+const PUERTO_LICENCIA = 3505;
+// [SOLO TESTS] Los casos que escriben un conductor con licencia NULL en la DB
+// compartida. Ver CASO 15.
+const LICENCIA_NULL_EN_DB = process.env.TEST_LICENCIA_NULL === '1';
 const RONDAS = 5;
 
 // RESERVA_BARRIDO_ARRANQUE=0: el server efimero no tiene por que barrer
 // reservas reales de la DB compartida.
-const ENV_BASE = { RESERVA_BARRIDO_ARRANQUE: '0', INVITACION_INTENTOS_MAX: '1000' };
+// LICENCIA_OPCIONAL fijo en false: el CASO 15a no puede depender del .env local.
+const ENV_BASE = { RESERVA_BARRIDO_ARRANQUE: '0', INVITACION_INTENTOS_MAX: '1000', LICENCIA_OPCIONAL: 'false' };
 
 const SOLO = process.argv.slice(2).map(Number).filter(Number.isFinite);
 const correr = (n) => SOLO.length === 0 || SOLO.includes(n);
@@ -752,6 +763,81 @@ async function casoSinRedis(ctx) {
   });
 }
 
+// CASO 15: licencia opcional (Paso A en la base, Paso B por LICENCIA_OPCIONAL).
+const conteoLicenciaNull = () =>
+  prisma.conductor.count({ where: { OR: [{ nro_licencia: null }, { licencia_vencimiento: null }] } });
+
+async function casoLicencia() {
+  titulo('CASO 15: licencia opcional');
+  const datosConductor = (etiqueta, extra = {}) => {
+    nUsuario++;
+    return {
+      nombre: etiqueta,
+      apellido: 'Idn',
+      dni: S.slice(-7) + String(nUsuario).padStart(2, '0'),
+      email: `${etiqueta}-idn-${S}-${nUsuario}@test.com`.toLowerCase(),
+      contrasena: PASS,
+      ...extra,
+    };
+  };
+  const registrar = (body, base = BASE) => api('POST', '/api/auth/registro-conductor', body, null, base);
+
+  // 15a: con la variable apagada (ENV_BASE), igual que siempre. No escribe nada:
+  // Zod corta antes de Firebase y de la DB.
+  const sinLic = await registrar(datosConductor('Lic'));
+  const soloNro = await registrar(datosConductor('Lic', { nro_licencia: 'LIC1' }));
+  paso('CASO 15a: LICENCIA_OPCIONAL=false → registro sin licencia (o con una sola) 400', sinLic.status === 400 && soloNro.status === 400, `${r2s(sinLic)} | ${r2s(soloNro)}`);
+
+  await conServer({ ...ENV_BASE, LICENCIA_OPCIONAL: 'true' }, PUERTO_LICENCIA, async (base) => {
+    // 15b: prendida, si llega se valida igual. Tampoco escribe nada.
+    const basura = await registrar(datosConductor('Lic', { licencia_vencimiento: 'mañana' }), base);
+    paso('CASO 15b: LICENCIA_OPCIONAL=true + licencia_vencimiento basura → 400', basura.status === 400, r2s(basura));
+
+    if (!LICENCIA_NULL_EN_DB) {
+      console.log('  ⏭️  CASO 15c/15d SALTEADO: requiere que main tenga el Paso A (TEST_LICENCIA_NULL=1)');
+      return;
+    }
+    // 15c / 15d: escriben un conductor con licencia NULL. Se borra apenas
+    // termina (con _limpieza.js) y se verifica que no quede ninguna fila NULL.
+    const body = datosConductor('Lic');
+    emailsCreados.push(body.email);
+    // Registro SIN patron: solo lo de este caso (el resto de la corrida lo
+    // borra la limpieza final).
+    const reg = crearRegistro();
+    reg.email(body.email);
+    try {
+      const r = await registrar(body, base);
+      const fila = await prisma.usuario.findUnique({ where: { email: body.email }, include: { conductor: true } });
+      paso(
+        'CASO 15c: LICENCIA_OPCIONAL=true → registro sin licencia 201, licencia null en la base',
+        r.status === 201 && fila?.conductor?.nro_licencia === null && fila.conductor.licencia_vencimiento === null,
+        r2s(r)
+      );
+      if (r.status !== 201) return;
+      const K = { email: body.email, token: await getToken(body.email), id_usuario: fila.id_usuario, id_conductor: fila.conductor.id_conductor };
+      const [P] = await nuevosUsuarios('cliente', 'LicP', 1);
+      const org = await crearOrgOk(P, `PyME Licencia ${S}`, cuitValido(90));
+      reg.email(P.email);
+      reg.org(org.id_organizacion);
+      const vinc = await canjear(K, (await invitarOk(P, org.id_organizacion, 'CHOFER')).codigo, base);
+      const me = await api('GET', '/api/auth/me', null, K.token, base);
+      const choferes = await api('GET', `/api/organizaciones/${org.id_organizacion}/choferes`, null, P.token, base);
+      const viajes = await api('GET', '/api/choferes/viajes', null, K.token, base);
+      const admin = await api('GET', `/api/admin/usuarios/${K.id_usuario}`, null, await getToken('admin-test@fleter.com', 'admintest123'), base);
+      paso(
+        'CASO 15d: las lecturas reales toleran la licencia null (/me, choferes de la PyME, viajes del chofer, admin detalle)',
+        vinc.status === 200 && me.status === 200 && choferes.status === 200 && choferes.data.some((c) => c.id_conductor === K.id_conductor) &&
+          viajes.status === 200 && admin.status === 200 && admin.data.conductor?.nro_licencia === null,
+        `${vinc.status} ${me.status} ${choferes.status} ${viajes.status} ${admin.status}`
+      );
+    } finally {
+      await reg.limpiar();
+      const quedan = await conteoLicenciaNull();
+      paso('CASO 15e: borrado al toque; no queda ningun conductor con licencia NULL', quedan === 0, `quedan=${quedan}`);
+    }
+  });
+}
+
 // -- Main ---------------------------------------------------------------------
 
 async function main() {
@@ -777,6 +863,7 @@ async function main() {
       if (correr(12)) await casoRateLimit(ctx);
       if (correr(13)) await casoSinSecreto(ctx);
       if (correr(14)) await casoSinRedis(ctx);
+      if (correr(15)) await casoLicencia();
     });
   } finally {
     try {

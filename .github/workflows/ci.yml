@@ -66,6 +66,20 @@ jobs:
           FIREBASE_WEB_API_KEY: ${{ secrets.FIREBASE_WEB_API_KEY }}
           TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
           TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+      # Caja negra del ciclo del viaje de PyME (e2e/sim, del equipo del front).
+      # Corre aunque el E2E falle: mas diagnostico. Deja sus cuentas
+      # sim+...@fleter.test en la DB compartida (cancela los viajes que queden
+      # vivos); se borran con `node scripts/restos.js --solo sim --borrar`.
+      - name: Simulador del front (contra staging)
+        if: ${{ !cancelled() }}
+        working-directory: e2e/sim
+        timeout-minutes: 10
+        run: |
+          npm ci --omit=dev
+          npm run sim
+        env:
+          FLETER_API: ${{ secrets.TEST_API_URL }}
+          FIREBASE_WEB_API_KEY: ${{ secrets.FIREBASE_WEB_API_KEY }}
 
   deploy-production:
     needs: quality

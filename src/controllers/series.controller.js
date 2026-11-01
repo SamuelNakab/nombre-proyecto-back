@@ -5,7 +5,7 @@
 // viajes normales (con id_serie) en /api/choferes/viajes.
 import { z } from 'zod';
 import { responderErrorNegocio } from '../services/error-negocio.js';
-import { schemaParadasInternas, schemaCondiciones } from '../services/viaje-validacion.js';
+import { schemaParadasInternas, schemaMotivo, schemaDescripcion } from '../services/viaje-validacion.js';
 import { esHoraValida } from '../services/serie-fechas.js';
 import { crearSerie, listarSeries, obtenerSerie, cancelarSerie } from '../services/serie.service.js';
 import { io } from '../sockets/index.js';
@@ -30,8 +30,10 @@ const base = {
   fecha_desde: z.string({ error: 'fecha_desde es requerida' }),
   fecha_hasta: z.string().optional(),
   paradas: schemaParadasInternas,
-  condiciones_requeridas: schemaCondiciones.optional().default([]),
-  descripcion: z.string().max(500).optional(),
+  // Obligatorios, se copian a cada viaje generado. condiciones_requeridas ya no
+  // existe en las series: si llega, z.object la descarta sin error.
+  motivo: schemaMotivo,
+  descripcion: schemaDescripcion,
 };
 
 const schemaCrear = z.discriminatedUnion(

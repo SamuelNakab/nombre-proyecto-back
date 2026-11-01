@@ -14,8 +14,9 @@ import { responderErrorNegocio } from '../services/error-negocio.js';
 import { calcularCostoAcumulado } from '../services/costo.service.js';
 import {
   schemaParadasInternas,
-  schemaCondiciones,
   schemaFechaProgramada,
+  schemaMotivo,
+  schemaDescripcion,
 } from '../services/viaje-validacion.js';
 import {
   ESTADOS_INTERNOS,
@@ -45,31 +46,37 @@ import { io } from '../sockets/index.js';
 const idPositivo = (campo) =>
   z.number({ error: `${campo} es requerido` }).int(`${campo} invalido`).positive(`${campo} invalido`);
 
+// Sin condiciones_requeridas (pedido del front 20-10-2026): el ciclo interno no
+// las pide ni las valida. Si un cliente viejo las manda, z.object las descarta
+// sin error (y lo mismo `zona`, que se acepta y se ignora como en la legacy).
 const schemaCrear = z.object({
   id_conductor: idPositivo('id_conductor'),
-  // `zona` se acepta y se ignora, igual que en la ruta legacy.
   zona: z.enum(['CABA', 'PROVINCIA', 'MIXTO']).optional(),
   paradas: schemaParadasInternas,
   fecha_programada: schemaFechaProgramada,
-  condiciones_requeridas: schemaCondiciones.optional().default([]),
-  descripcion: z.string().max(500).optional(),
+  motivo: schemaMotivo,
+  descripcion: schemaDescripcion,
 });
 
+// motivo y descripcion opcionales en el body, pero si llegan, con las mismas
+// reglas (null o vacio -> 400). Que el viaje QUEDE con los dos lo chequea el
+// service (faltantesContenido): un viaje viejo sin motivo no se edita sin
+// mandarlo.
 const schemaEditar = z
   .object({
     zona: z.enum(['CABA', 'PROVINCIA', 'MIXTO']).optional(),
     paradas: schemaParadasInternas.optional(),
     fecha_programada: schemaFechaProgramada.optional(),
-    condiciones_requeridas: schemaCondiciones.optional(),
-    descripcion: z.string().max(500).nullable().optional(),
+    motivo: schemaMotivo.optional(),
+    descripcion: schemaDescripcion.optional(),
   })
   .refine(
     (d) =>
       d.paradas !== undefined ||
       d.fecha_programada !== undefined ||
-      d.condiciones_requeridas !== undefined ||
+      d.motivo !== undefined ||
       d.descripcion !== undefined,
-    { message: 'Mandá al menos un campo para editar (paradas, fecha_programada, condiciones_requeridas o descripcion)' }
+    { message: 'Mandá al menos un campo para editar (paradas, fecha_programada, motivo o descripcion)' }
   );
 
 const schemaReasignar = z.object({ id_conductor: idPositivo('id_conductor') });

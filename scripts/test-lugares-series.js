@@ -30,6 +30,7 @@
 //      cancelar serie siguen permitidos.
 //  11. Tope de paradas (MAX_PARADAS_POR_VIAJE=10): 11 -> 400 en viaje y serie.
 //  12. Serie DIARIA de 30 viajes: fechas exactas en hora AR, ASIGNADO, id_serie,
+//      motivo y descripcion copiados a los 30 (condiciones del body ignoradas),
 //      historial, UN serie:asignada al chofer y a la PyME (y ningun
 //      viaje:asignado), tiempo de creacion.
 //  13. DIAS_SEMANA, SEMANAL y MENSUAL (dia 31 ajustado a fin de mes).
@@ -271,7 +272,12 @@ const editarLugar = (u, idOrg, id, body) => api('PUT', `/api/organizaciones/${id
 const borrarLugar = (u, idOrg, id) => api('DELETE', `/api/organizaciones/${idOrg}/lugares/${id}`, null, u.token);
 const listarLugares = (u, idOrg) => api('GET', `/api/organizaciones/${idOrg}/lugares`, null, u.token);
 
-const crearViaje = (u, idOrg, body) => api('POST', `/api/organizaciones/${idOrg}/viajes`, body, u.token);
+// motivo y descripcion obligatorios (pedido del front 20-10-2026): por defecto
+// van los de prueba; un caso que quiere probar su ausencia arma el body a mano.
+const MOTIVO = 'Test lugares y series';
+const DESCRIPCION = 'Indicaciones de prueba';
+const crearViaje = (u, idOrg, body) =>
+  api('POST', `/api/organizaciones/${idOrg}/viajes`, { motivo: MOTIVO, descripcion: DESCRIPCION, ...body }, u.token);
 const detallePyme = (u, idOrg, id) => api('GET', `/api/organizaciones/${idOrg}/viajes/${id}`, null, u.token);
 const editarViaje = (u, idOrg, id, body) => api('PUT', `/api/organizaciones/${idOrg}/viajes/${id}`, body, u.token);
 const reasignar = (u, idOrg, id, id_conductor) =>
@@ -289,6 +295,8 @@ const cuerpoSerie = (k, extra) => ({
   id_conductor: k.id_conductor,
   hora: '09:00',
   paradas: [ORIGEN, DESTINO],
+  motivo: MOTIVO,
+  descripcion: DESCRIPCION,
   ...extra,
 });
 const crearSerie = (u, idOrg, body, base = BASE) => api('POST', `/api/organizaciones/${idOrg}/series`, body, u.token, base);
@@ -665,7 +673,7 @@ async function casosSeries(ctx, leerLog) {
     const r = await crearSerieOk(
       P1,
       A,
-      cuerpoSerie(K1, { frecuencia: 'DIARIA', fecha_desde: manana, fecha_hasta: hasta, paradas: [ORIGEN, { id_lugar: L.id_lugar }], condiciones_requeridas: ['FRAGIL'], descripcion: 'Reparto diario' })
+      cuerpoSerie(K1, { frecuencia: 'DIARIA', fecha_desde: manana, fecha_hasta: hasta, paradas: [ORIGEN, { id_lugar: L.id_lugar }], condiciones_requeridas: ['FRAGIL'], motivo: '  Reparto diario Pilar ', descripcion: 'Reparto diario' })
     );
     registrarMetricaSerie(leerLog, r.data.serie.id_serie, 'DIARIA x30 (2 paradas)', r.ms);
     const { serie, viajes } = r.data;
@@ -689,12 +697,23 @@ async function casosSeries(ctx, leerLog) {
     );
     const hist = await prisma.historialEstadoViaje.findMany({ where: { id_viaje: { in: db.map((v) => v.id_viaje) } } });
     paso('CASO 12d: una fila de historial ASIGNADO (CLIENTE) por viaje', hist.length === 30 && hist.every((h) => h.estado === 'ASIGNADO' && h.origen === 'CLIENTE' && h.id_usuario === P1.id_usuario), `${hist.length} filas`);
+    // condiciones_requeridas viene en el body (cliente viejo) y se ignora: el
+    // ciclo interno no tiene condiciones (pedido del front 20-10-2026).
     const cond = await prisma.condicionRequerida.count({ where: { id_viaje: { in: db.map((v) => v.id_viaje) } } });
     const paradas = await prisma.parada.findMany({ where: { id_viaje: { in: db.map((v) => v.id_viaje) } } });
     paso(
-      'CASO 12e: 60 paradas (snapshot del lugar en la 2) con estimado, 30 condiciones',
-      paradas.length === 60 && paradas.filter((p) => p.orden === 2).every((p) => p.id_lugar === L.id_lugar && p.direccion === L.direccion && p.llegada_estimada) && cond === 30,
+      'CASO 12e: 60 paradas (snapshot del lugar en la 2) con estimado, 0 condiciones (las del body se ignoran)',
+      paradas.length === 60 && paradas.filter((p) => p.orden === 2).every((p) => p.id_lugar === L.id_lugar && p.direccion === L.direccion && p.llegada_estimada) && cond === 0,
       `paradas=${paradas.length} condiciones=${cond}`
+    );
+    const serieDb = await prisma.serieViaje.findUnique({ where: { id_serie: serie.id_serie } });
+    paso(
+      'CASO 12j: la serie copia motivo (con trim) y descripcion a sus 30 viajes; la serie los devuelve y no trae condiciones',
+      db.every((v) => v.motivo === 'Reparto diario Pilar' && v.descripcion === 'Reparto diario') &&
+        serieDb.motivo === 'Reparto diario Pilar' && serie.motivo === 'Reparto diario Pilar' &&
+        !('condiciones_requeridas' in serie) && serieDb.condiciones.length === 0 &&
+        viajes.every((v) => v.motivo === 'Reparto diario Pilar'),
+      `serie.motivo=${serie.motivo} viajes=${db.filter((v) => v.motivo === 'Reparto diario Pilar').length}/30`
     );
     const ev = await esperarEvento(sK1, 'serie:asignada', (d) => d.id_serie === serie.id_serie);
     await esperar(500);
@@ -706,6 +725,7 @@ async function casosSeries(ctx, leerLog) {
       `chofer=${ev?.viajes?.length} pyme=${evPyme.length} viaje:asignado=${asignadosSerie.length}`
     );
     paso('CASO 12g: serie:asignada sin el nombre del lugar (direccion si)', ev && !JSON.stringify(ev).includes(MARCA) && ev.viajes[0].paradas[1].direccion === L.direccion, '');
+    paso('CASO 12k: serie:asignada trae el motivo en cada viaje y no condiciones_requeridas', ev && ev.viajes.every((v) => v.motivo === 'Reparto diario Pilar' && !('condiciones_requeridas' in v)), JSON.stringify(ev?.viajes?.[0] ?? {}).slice(0, 120));
     const listaChofer = await apiChofer('GET', '/api/choferes/viajes?grupo=asignados', null, K1);
     const deLaSerie = listaChofer.data.filter?.((v) => v.id_serie === serie.id_serie) ?? [];
     paso('CASO 12h: el chofer ve los 30 como viajes normales con id_serie', deLaSerie.length === 30, `${deLaSerie.length}`);
@@ -762,6 +782,19 @@ async function casosSeries(ctx, leerLog) {
       'CASO 13e: dias repetidos, MENSUAL sin dia_mes, ventana de 32 dias, hora 24:00 → 400',
       [malo, sinDia, ventanaLarga, hora].every((r) => r.status === 400),
       [malo, sinDia, ventanaLarga, hora].map((r) => `${r.status} ${r.data.error}`).join(' | ')
+    );
+    // Motivo y descripcion obligatorios (Zod, antes de Google: no gastan llamadas).
+    const sinMotivo = { ...cuerpoSerie(K2, { frecuencia: 'DIARIA', fecha_desde: manana }) };
+    delete sinMotivo.motivo;
+    const sinM = await crearSerie(P1, A, sinMotivo);
+    const largo = await crearSerie(P1, A, cuerpoSerie(K2, { frecuencia: 'DIARIA', fecha_desde: manana, motivo: 'x'.repeat(121) }));
+    const descVacia = await crearSerie(P1, A, cuerpoSerie(K2, { frecuencia: 'DIARIA', fecha_desde: manana, descripcion: '   ' }));
+    paso(
+      'CASO 13f: serie sin motivo, motivo de 121 o descripcion vacia → 400 con su mensaje',
+      sinM.status === 400 && sinM.data.error === 'motivo es requerido' &&
+        largo.status === 400 && /como máximo 120/.test(largo.data.error) &&
+        descVacia.status === 400 && descVacia.data.error === 'descripcion no puede estar vacia',
+      [sinM, largo, descVacia].map((r) => `${r.status} ${r.data.error}`).join(' | ')
     );
   }
 

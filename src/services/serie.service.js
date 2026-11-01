@@ -13,7 +13,7 @@
 //      tope total de SERIE_TIMEOUT_MS. Si cualquiera falla -> el error (503 si
 //      Google no responde, 400 si no hay ruta) y no se escribio NADA.
 //   3. UNA transaccion: lock del vinculo (el mismo de crear, serializa contra
-//      desvincular) -> la serie -> todos los viajes, paradas y condiciones con
+//      desvincular) -> la serie -> todos los viajes y paradas con
 //      createMany (un puñado de queries, no un round-trip por viaje).
 //   4. Fuera de la tx: historial, timers, rutas, y UN evento serie:asignada.
 //
@@ -123,7 +123,9 @@ export function serializarSerie(serie, lugares = new Map()) {
       ...p,
       lugar: p.id_lugar != null && lugares.has(p.id_lugar) ? lugares.get(p.id_lugar) : null,
     })),
-    condiciones_requeridas: serie.condiciones,
+    // Sin condiciones_requeridas: el ciclo interno ya no las tiene (la columna
+    // series_viaje.condiciones queda en su default [] sin uso).
+    motivo: serie.motivo ?? null,
     descripcion: serie.descripcion,
     estado: serie.estado,
     fecha_baja: serie.fecha_baja,
@@ -138,8 +140,7 @@ const ocurrenciaPublica = ({ fecha, fecha_programada, motivo }) => ({ fecha, fec
 
 export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
   const t0 = Date.now();
-  const { id_conductor, frecuencia, hora, descripcion } = datos;
-  const condiciones = datos.condiciones_requeridas;
+  const { id_conductor, frecuencia, hora, motivo, descripcion } = datos;
 
   await exigirPymeOperativa(id_organizacion);
 
@@ -153,7 +154,7 @@ export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
   const ventana = resolverVentana({ fecha_desde: datos.fecha_desde, fecha_hasta: datos.fecha_hasta, ahora });
   if (ventana.error) throw new ErrorNegocio(400, ventana.error);
 
-  await validarChoferAsignable(id_organizacion, id_conductor, condiciones);
+  await validarChoferAsignable(id_organizacion, id_conductor);
 
   // Plantilla: { id_lugar } -> snapshot de direccion y coordenadas.
   const paradas = await resolverParadas(id_organizacion, datos.paradas);
@@ -219,8 +220,8 @@ export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
         fecha_desde: fechaColumna(ventana.fecha_desde),
         fecha_hasta: fechaColumna(ventana.fecha_hasta),
         paradas: plantilla,
-        condiciones,
-        descripcion: descripcion ?? null,
+        motivo,
+        descripcion,
       },
       select: { id_serie: true },
     });
@@ -240,7 +241,9 @@ export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
           tarifa_hora: e.desglose.tarifa_hora,
           tarifa_km: e.desglose.tarifa_km,
           fecha_programada: o.fecha_programada,
-          descripcion: descripcion ?? null,
+          // Copia de la serie: despues cada viaje se edita por su cuenta.
+          motivo,
+          descripcion,
           precio_estimado: e.precio_estimado,
           ...columnasEstimadasViaje(e.recorrido.totales),
         };
@@ -265,11 +268,6 @@ export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
         conEstimacionPorParada(filasParada, c.estimacion.recorrido).map((p) => ({ ...p, id_viaje: c.id_viaje }))
       ),
     });
-    if (condiciones.length > 0) {
-      await tx.condicionRequerida.createMany({
-        data: creados.flatMap((c) => condiciones.map((condicion) => ({ id_viaje: c.id_viaje, condicion }))),
-      });
-    }
     return { id_serie: serie.id_serie, creados };
   });
   const msTx = Date.now() - tTx;

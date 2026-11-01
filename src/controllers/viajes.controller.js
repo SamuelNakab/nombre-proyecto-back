@@ -290,6 +290,10 @@ export async function obtenerViaje(req, res) {
   // de que existiera la columna, o si Google no respondio al crear.
   return res.status(200).json({
     ...viaje,
+    // El ciclo interno no tiene condiciones (pedido del front 20-10-2026): en un
+    // viaje interno no se devuelven, aunque un viaje viejo las tenga guardadas.
+    // undefined -> JSON.stringify saca la clave. Legacy sin cambios.
+    ...(viaje.id_organizacion !== null ? { condiciones_req: undefined } : {}),
     // En un viaje INTERNO el unico que llega hasta aca es el chofer asignado: la
     // parada sale sin id_lugar (el chofer no ve los lugares guardados de la
     // PyME, ver vista-parada.js). En un legacy id_lugar es siempre null.

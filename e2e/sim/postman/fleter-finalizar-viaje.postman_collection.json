@@ -1,0 +1,1540 @@
+{
+  "info": {
+    "name": "Fleter — finalizar viaje (Paso 3)",
+    "description": "Recorrido de un viaje de PyME contra staging, simulando la ubicación del chofer en el body de iniciar y confirmar-parada. Verifica que confirmar la última parada ya no finaliza y que 'salir' de la última sí. Correr con el Collection Runner en orden (o `npx newman run`). Antes: poner firebase_api_key (la FIREBASE_WEB_API_KEY) en las variables de la colección. El viaje lleva motivo y descripcion (obligatorios) y no condiciones. El GPS por socket (conductor:ubicacion) no entra en una colección: está en sim-finalizar-viaje.mjs.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "0. Armado (cuentas, PyME, chofer, vehículo, viaje)",
+      "description": "Crea todo desde cero con emails sim+...@fleter.test. Correr una vez por recorrido.",
+      "item": [
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/health",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "health"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            },
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Datos únicos para esta corrida",
+                  "const s = String(Date.now()).slice(-8);",
+                  "const azar = (n) => Array.from({ length: n }, () => Math.floor(Math.random() * 10)).join(\"\");",
+                  "const pesos = [5,4,3,2,7,6,5,4,3,2];",
+                  "let cuit;",
+                  "for (;;) {",
+                  "  const base = \"30\" + azar(8);",
+                  "  const r = base.split(\"\").reduce((a, d, i) => a + Number(d) * pesos[i], 0) % 11;",
+                  "  const dv = r === 0 ? 0 : 11 - r;",
+                  "  if (dv !== 10) { cuit = base + dv; break; }",
+                  "}",
+                  "pm.collectionVariables.set(\"sufijo\", s);",
+                  "pm.collectionVariables.set(\"email_pyme\", \"sim+pyme-\" + s + \"@fleter.test\");",
+                  "pm.collectionVariables.set(\"email_chofer\", \"sim+chofer-\" + s + \"@fleter.test\");",
+                  "pm.collectionVariables.set(\"password\", \"Sim-\" + s);",
+                  "pm.collectionVariables.set(\"dni_pyme\", azar(8));",
+                  "pm.collectionVariables.set(\"dni_chofer\", azar(8));",
+                  "pm.collectionVariables.set(\"cuit\", cuit);",
+                  "pm.collectionVariables.set(\"patente\", \"SM\" + s.slice(-5));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Registrar PyME (cliente)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/auth/registro-cliente",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "auth",
+                "registro-cliente"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nombre\": \"Pyme\",\n  \"apellido\": \"Sim {{sufijo}}\",\n  \"dni\": \"{{dni_pyme}}\",\n  \"email\": \"{{email_pyme}}\",\n  \"contrasena\": \"{{password}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));",
+                  "// Loguea la cuenta recién registrada en Firebase y guarda el idToken.",
+                  "const email = pm.collectionVariables.get(\"email_pyme\");",
+                  "const pass = pm.collectionVariables.get(\"password\");",
+                  "pm.sendRequest({",
+                  "  url: \"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=\" + pm.variables.get(\"firebase_api_key\"),",
+                  "  method: \"POST\",",
+                  "  header: { \"Content-Type\": \"application/json\" },",
+                  "  body: { mode: \"raw\", raw: JSON.stringify({ email, password: pass, returnSecureToken: true }) },",
+                  "}, (err, res) => {",
+                  "  pm.test(\"login Firebase pyme\", () => pm.expect(res.json().idToken, JSON.stringify(res.json())).to.be.a(\"string\"));",
+                  "  pm.collectionVariables.set(\"token_pyme\", res.json().idToken);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Registrar chofer",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/auth/registro-conductor",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "auth",
+                "registro-conductor"
+              ]
+            },
+            "auth": {
+              "type": "noauth"
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"nombre\": \"Chofer\",\n  \"apellido\": \"Sim {{sufijo}}\",\n  \"dni\": \"{{dni_chofer}}\",\n  \"email\": \"{{email_chofer}}\",\n  \"contrasena\": \"{{password}}\",\n  \"nro_licencia\": \"LIC{{sufijo}}\",\n  \"licencia_vencimiento\": \"2030-12-31T00:00:00.000Z\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));",
+                  "// Loguea la cuenta recién registrada en Firebase y guarda el idToken.",
+                  "const email = pm.collectionVariables.get(\"email_chofer\");",
+                  "const pass = pm.collectionVariables.get(\"password\");",
+                  "pm.sendRequest({",
+                  "  url: \"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=\" + pm.variables.get(\"firebase_api_key\"),",
+                  "  method: \"POST\",",
+                  "  header: { \"Content-Type\": \"application/json\" },",
+                  "  body: { mode: \"raw\", raw: JSON.stringify({ email, password: pass, returnSecureToken: true }) },",
+                  "}, (err, res) => {",
+                  "  pm.test(\"login Firebase chofer\", () => pm.expect(res.json().idToken, JSON.stringify(res.json())).to.be.a(\"string\"));",
+                  "  pm.collectionVariables.set(\"token_chofer\", res.json().idToken);",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Crear PyME",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/organizaciones",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "organizaciones"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_pyme}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"nombre\": \"PyME Sim {{sufijo}}\", \"cuit\": \"{{cuit}}\" }",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set(\"id_org\", pm.response.json().id_organizacion);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Código de chofer",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/organizaciones/{{id_org}}/invitaciones",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "organizaciones",
+                "{{id_org}}",
+                "invitaciones"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_pyme}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"tipo\": \"CHOFER\" }",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set(\"codigo\", pm.response.json().codigo);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Chofer canjea el código",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/invitaciones/canjear",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "invitaciones",
+                "canjear"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_chofer}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"codigo\": \"{{codigo}}\" }",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Chofer registra vehículo",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/conductores/mis-vehiculos",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "conductores",
+                "mis-vehiculos"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_chofer}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"patente\": \"{{patente}}\",\n  \"marca\": \"Fiat\",\n  \"modelo\": \"Fiorino\",\n  \"anio\": 2022,\n  \"color\": \"Blanco\",\n  \"tipo_vehiculo\": \"Utilitario\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));",
+                  "pm.collectionVariables.set(\"id_vehiculo\", pm.response.json().id_vehiculo);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "PyME lista choferes",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/organizaciones/{{id_org}}/choferes",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "organizaciones",
+                "{{id_org}}",
+                "choferes"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_pyme}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "pm.collectionVariables.set(\"id_conductor\", pm.response.json()[0].id_conductor);"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "PyME crea viaje (3 paradas)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/organizaciones/{{id_org}}/viajes",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "organizaciones",
+                "{{id_org}}",
+                "viajes"
+              ]
+            },
+            "description": "fecha_programada = ahora + 60 min + 30 s: la anticipación mínima es 60 min y la ventana de inicio abre 60 min antes, así que se puede iniciar en ~30 s.",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_pyme}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"id_conductor\": {{id_conductor}},\n  \"fecha_programada\": \"{{fecha_programada}}\",\n  \"paradas\": [\n    { \"lat\": {{p1_lat}}, \"lng\": {{p1_lng}}, \"direccion\": \"Plaza de Mayo, CABA\" },\n    { \"lat\": {{p2_lat}}, \"lng\": {{p2_lng}}, \"direccion\": \"Obelisco, CABA\" },\n    { \"lat\": {{p3_lat}}, \"lng\": {{p3_lng}}, \"direccion\": \"Recoleta, CABA\" }\n  ],\n  \"motivo\": \"Simulación del front (Postman)\",\n  \"descripcion\": \"Simulación de finalizar viaje\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 201\", () => pm.response.to.have.status(201));",
+                  "const v = pm.response.json();",
+                  "const p = v.paradas.sort((a, b) => a.orden - b.orden);",
+                  "pm.collectionVariables.set(\"id_viaje\", v.id_viaje);",
+                  "pm.collectionVariables.set(\"id_parada_1\", p[0].id_parada);",
+                  "pm.collectionVariables.set(\"id_parada_2\", p[1].id_parada);",
+                  "pm.collectionVariables.set(\"id_parada_3\", p[2].id_parada);",
+                  "pm.test(\"estado ASIGNADO\", () => pm.expect(v.estado).to.eql(\"ASIGNADO\"));"
+                ]
+              }
+            },
+            {
+              "listen": "prerequest",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.collectionVariables.set(\"fecha_programada\", new Date(Date.now() + 60 * 60000 + 30000).toISOString());"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Chofer confirma (elige vehículo)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/choferes/viajes/{{id_viaje}}/confirmar",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "choferes",
+                "viajes",
+                "{{id_viaje}}",
+                "confirmar"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_chofer}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"id_vehiculo\": {{id_vehiculo}} }",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"CONFIRMADO\", () => pm.expect(pm.response.json().estado).to.eql(\"CONFIRMADO\"));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "1. Recorrido con ubicación simulada",
+      "description": "Iniciar → salir → confirmar → … El cambio a verificar: confirmar la última parada deja el viaje en DESCARGANDO; recién 'salir' de la última lo FINALIZA.",
+      "item": [
+        {
+          "name": "Iniciar LEJOS del origen → 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/choferes/viajes/{{id_viaje}}/iniciar",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "choferes",
+                "viajes",
+                "{{id_viaje}}",
+                "iniciar"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_chofer}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"lat\": {{p1_lat_lejos}}, \"lng\": {{p1_lng}} }",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"error dice m del origen\", () => pm.expect(pm.response.json().error).to.match(/m del origen/));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Iniciar en el origen → CARGANDO",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/choferes/viajes/{{id_viaje}}/iniciar",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "choferes",
+                "viajes",
+                "{{id_viaje}}",
+                "iniciar"
+              ]
+            },
+            "description": "Si responde 400 'solo puede iniciarse a partir de las HH:MM', esperá unos segundos y reintentá (en el runner se reintenta solo).",
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_chofer}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"lat\": {{p1_lat_cerca}}, \"lng\": {{p1_lng}} }",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "const j = pm.response.json();",
+                  "const intentos = Number(pm.collectionVariables.get(\"intentos_iniciar\") || 0);",
+                  "if (pm.response.code === 400 && /a partir de/.test(j.error) && intentos < 18) {",
+                  "  // La ventana todavía no abrió: reintento en 10 s (solo en el Collection Runner / newman).",
+                  "  pm.collectionVariables.set(\"intentos_iniciar\", intentos + 1);",
+                  "  setTimeout(() => {}, 10000);",
+                  "  pm.execution.setNextRequest(pm.info.requestName);",
+                  "} else {",
+                  "  pm.collectionVariables.set(\"intentos_iniciar\", 0);",
+                  "  pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "  pm.test(\"CARGANDO\", () => pm.expect(j.estado).to.eql(\"CARGANDO\"));",
+                  "}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Confirmar parada 2 sin salir de la 1 → 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/viajes/{{id_viaje}}/confirmar-parada",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "viajes",
+                "{{id_viaje}}",
+                "confirmar-parada"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_chofer}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"id_parada\": {{id_parada_2}}, \"lat\": {{p2_lat_cerca}}, \"lng\": {{p2_lng}} }",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"error dice Salir\", () => pm.expect(pm.response.json().error).to.match(/Salir/));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Salir de la parada 1 → EN_RUTA",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/choferes/viajes/{{id_viaje}}/salir",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "choferes",
+                "viajes",
+                "{{id_viaje}}",
+                "salir"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_chofer}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"EN_RUTA\", () => pm.expect(pm.response.json().estado).to.eql(\"EN_RUTA\"));",
+                  "pm.test(\"viaje_finalizado false\", () => pm.expect(pm.response.json().viaje_finalizado).to.eql(false));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Salir estando EN_RUTA → 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/choferes/viajes/{{id_viaje}}/salir",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "choferes",
+                "viajes",
+                "{{id_viaje}}",
+                "salir"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_chofer}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"error dice ninguna parada\", () => pm.expect(pm.response.json().error).to.match(/ninguna parada/));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Confirmar parada 3 salteando la 2 → 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/viajes/{{id_viaje}}/confirmar-parada",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "viajes",
+                "{{id_viaje}}",
+                "confirmar-parada"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_chofer}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"id_parada\": {{id_parada_3}}, \"lat\": {{p3_lat_cerca}}, \"lng\": {{p3_lng}} }",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"error dice parada 2\", () => pm.expect(pm.response.json().error).to.match(/parada 2/));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Confirmar parada 2 LEJOS → 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/viajes/{{id_viaje}}/confirmar-parada",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "viajes",
+                "{{id_viaje}}",
+                "confirmar-parada"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_chofer}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"id_parada\": {{id_parada_2}}, \"lat\": {{p2_lat_lejos}}, \"lng\": {{p2_lng}} }",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));",
+                  "pm.test(\"error dice Estas a\", () => pm.expect(pm.response.json().error).to.match(/Estas a/));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Confirmar parada 2 cerca → DESCARGANDO",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/viajes/{{id_viaje}}/confirmar-parada",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "viajes",
+                "{{id_viaje}}",
+                "confirmar-parada"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_chofer}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"id_parada\": {{id_parada_2}}, \"lat\": {{p2_lat_cerca}}, \"lng\": {{p2_lng}} }",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"DESCARGANDO\", () => pm.expect(pm.response.json().estado).to.eql(\"DESCARGANDO\"));",
+                  "pm.test(\"viaje_finalizado false\", () => pm.expect(pm.response.json().viaje_finalizado).to.eql(false));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Salir de la parada 2 → EN_RUTA",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/choferes/viajes/{{id_viaje}}/salir",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "choferes",
+                "viajes",
+                "{{id_viaje}}",
+                "salir"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_chofer}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"EN_RUTA\", () => pm.expect(pm.response.json().estado).to.eql(\"EN_RUTA\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "★ Confirmar la ÚLTIMA → DESCARGANDO, NO finaliza",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/viajes/{{id_viaje}}/confirmar-parada",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "viajes",
+                "{{id_viaje}}",
+                "confirmar-parada"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_chofer}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"id_parada\": {{id_parada_3}}, \"lat\": {{p3_lat_cerca}}, \"lng\": {{p3_lng}} }",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"DESCARGANDO (no FINALIZADO)\", () => pm.expect(pm.response.json().estado).to.eql(\"DESCARGANDO\"));",
+                  "pm.test(\"viaje_finalizado false\", () => pm.expect(pm.response.json().viaje_finalizado).to.eql(false));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "PyME ve el viaje en DESCARGANDO",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/organizaciones/{{id_org}}/viajes/{{id_viaje}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "organizaciones",
+                "{{id_org}}",
+                "viajes",
+                "{{id_viaje}}"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_pyme}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"DESCARGANDO\", () => pm.expect(pm.response.json().estado).to.eql(\"DESCARGANDO\"));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "PATCH estado en viaje de PyME → 400",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/viajes/{{id_viaje}}/estado",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "viajes",
+                "{{id_viaje}}",
+                "estado"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_chofer}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"estado\": \"EN_RUTA\" }",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "★ Salir de la ÚLTIMA → FINALIZADO",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/choferes/viajes/{{id_viaje}}/salir",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "choferes",
+                "viajes",
+                "{{id_viaje}}",
+                "salir"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_chofer}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"FINALIZADO\", () => pm.expect(j.estado).to.eql(\"FINALIZADO\"));",
+                  "pm.test(\"viaje_finalizado true\", () => pm.expect(j.viaje_finalizado).to.eql(true));",
+                  "pm.test(\"precio_real numérico\", () => pm.expect(j.precio_real).to.be.a(\"number\"));",
+                  "pm.test(\"remito_url\", () => pm.expect(j.remito_url).to.be.a(\"string\"));",
+                  "pm.test(\"estimado y real\", () => { pm.expect(j.estimado).to.be.an(\"object\"); pm.expect(j.real).to.be.an(\"object\"); });"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Salir otra vez → 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/choferes/viajes/{{id_viaje}}/salir",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "choferes",
+                "viajes",
+                "{{id_viaje}}",
+                "salir"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_chofer}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"400 o 409\", () => pm.expect(pm.response.code).to.be.oneOf([400, 409]));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "Confirmar la última otra vez → 400",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/viajes/{{id_viaje}}/confirmar-parada",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "viajes",
+                "{{id_viaje}}",
+                "confirmar-parada"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_chofer}}",
+                  "type": "string"
+                }
+              ]
+            },
+            "body": {
+              "mode": "raw",
+              "raw": "{ \"id_parada\": {{id_parada_3}}, \"lat\": {{p3_lat_cerca}}, \"lng\": {{p3_lng}} }",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 400\", () => pm.response.to.have.status(400));"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "PyME: detalle FINALIZADO con tiempos por parada",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/organizaciones/{{id_org}}/viajes/{{id_viaje}}",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "organizaciones",
+                "{{id_org}}",
+                "viajes",
+                "{{id_viaje}}"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_pyme}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "const j = pm.response.json();",
+                  "pm.test(\"FINALIZADO\", () => pm.expect(j.estado).to.eql(\"FINALIZADO\"));",
+                  "pm.test(\"3 paradas con llegada_real y salida_real\", () => {",
+                  "  pm.expect(j.paradas).to.have.length(3);",
+                  "  j.paradas.forEach((p) => { pm.expect(p.llegada_real, \"llegada \" + p.orden).to.be.a(\"string\"); pm.expect(p.salida_real, \"salida \" + p.orden).to.be.a(\"string\"); });",
+                  "});"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "name": "PyME: remito",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{base_url}}/api/organizaciones/{{id_org}}/viajes/{{id_viaje}}/remito",
+              "host": [
+                "{{base_url}}"
+              ],
+              "path": [
+                "api",
+                "organizaciones",
+                "{{id_org}}",
+                "viajes",
+                "{{id_viaje}}",
+                "remito"
+              ]
+            },
+            "auth": {
+              "type": "bearer",
+              "bearer": [
+                {
+                  "key": "token",
+                  "value": "{{token_pyme}}",
+                  "type": "string"
+                }
+              ]
+            }
+          },
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test(\"status 200\", () => pm.response.to.have.status(200));",
+                  "pm.test(\"remito_url\", () => pm.expect(pm.response.json().remito_url).to.be.a(\"string\"));"
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "https://nombre-proyecto-back-staging.up.railway.app"
+    },
+    {
+      "key": "firebase_api_key",
+      "value": "PEGAR_NEXT_PUBLIC_FIREBASE_API_KEY"
+    },
+    {
+      "key": "p1_lat",
+      "value": "-34.6083"
+    },
+    {
+      "key": "p1_lng",
+      "value": "-58.3712"
+    },
+    {
+      "key": "p1_lat_cerca",
+      "value": "-34.60812"
+    },
+    {
+      "key": "p1_lat_lejos",
+      "value": "-34.5983"
+    },
+    {
+      "key": "p2_lat",
+      "value": "-34.6037"
+    },
+    {
+      "key": "p2_lng",
+      "value": "-58.3816"
+    },
+    {
+      "key": "p2_lat_cerca",
+      "value": "-34.60352"
+    },
+    {
+      "key": "p2_lat_lejos",
+      "value": "-34.5937"
+    },
+    {
+      "key": "p3_lat",
+      "value": "-34.5875"
+    },
+    {
+      "key": "p3_lng",
+      "value": "-58.3974"
+    },
+    {
+      "key": "p3_lat_cerca",
+      "value": "-34.58732"
+    },
+    {
+      "key": "p3_lat_lejos",
+      "value": "-34.5775"
+    }
+  ]
+}

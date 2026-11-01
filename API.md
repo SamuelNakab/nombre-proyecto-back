@@ -119,10 +119,17 @@ Crea una cuenta de conductor.
   "email": "string email válido (requerido)",
   "contrasena": "string mínimo 6 caracteres (requerido)",
   "telefono": "string (opcional)",
-  "nro_licencia": "string (requerido)",
-  "licencia_vencimiento": "string ISO 8601 (requerido) — ej: '2027-12-31T00:00:00.000Z'"
+  "nro_licencia": "string (requerido salvo LICENCIA_OPCIONAL)",
+  "licencia_vencimiento": "string ISO 8601 (requerido salvo LICENCIA_OPCIONAL) — ej: '2027-12-31T00:00:00.000Z'"
 }
 ```
+
+**Licencia (pedido del front 20-10-2026).** Mientras la variable `LICENCIA_OPCIONAL` no sea `true`
+(default `false`, hoy en staging y production) las dos son obligatorias, igual que siempre. Con
+`LICENCIA_OPCIONAL=true` las dos son opcionales; si llega una, se valida igual (`nro_licencia` no vacío,
+`licencia_vencimiento` ISO 8601). En las lecturas (`/api/auth/me`, admin) `nro_licencia` y
+`licencia_vencimiento` **pueden ser `null`** (chofer sin licencia cargada). `PUT /api/auth/perfil` no
+acepta la licencia.
 
 **Respuesta exitosa — 201:**
 ```json
@@ -2012,6 +2019,11 @@ socket.on('viaje:estado_cambiado', (data) => {
 
 ## /conductores — Vehículos de conductores independientes
 
+> **Condiciones del vehículo = solo marketplace.** `condiciones` es **opcional** al registrar un vehículo
+> (un vehículo sin condiciones es válido) y se sigue devolviendo: es un dato del vehículo. Lo usa la
+> elegibilidad del marketplace (dormido). El viaje de PyME **no** las lee ni las valida en ningún lado
+> (pedido del front 20-10-2026): el chofer confirma con cualquier vehículo propio.
+
 ### POST /api/conductores/mis-vehiculos
 
 Registra un vehículo propio del conductor autenticado.
@@ -2692,7 +2704,8 @@ aplicables vienen `null` o `[]`).
 Detalle de un usuario, con include **condicional según su rol**:
 - `CLIENTE`: datos personales + `cliente` con su historial de viajes creados.
 - `CONDUCTOR`: datos personales + `conductor` con `nro_licencia`,
-  `licencia_vencimiento`, `calificacion_promedio`, `vehiculos` (propios + asignados vía
+  `licencia_vencimiento` (las dos pueden ser `null`: chofer sin licencia cargada, ver
+  [registro-conductor](#post-apiauthregistro-conductor)), `calificacion_promedio`, `vehiculos` (propios + asignados vía
   empresa, en un array plano) y su historial de viajes aceptados.
 - `GERENTE`: datos personales + `empresas` (empresa(s) asociada(s), sus conductores y
   vehículos). Puede venir vacío en el MVP.
@@ -3959,6 +3972,17 @@ Los viajes del marketplace (legacy) no cambian.
    `viaje:asignado` por cada uno). Los viajes de una serie se listan, confirman y rechazan **uno por
    uno** como cualquier otro, y traen `id_serie` (null en un viaje suelto).
 
+**Pedido del front 20-10-2026, también para mobile:**
+
+7. **Sin condiciones especiales** en los viajes de PyME: los viajes (REST y sockets) ya **no** traen
+   `condiciones_requeridas`, y confirmar acepta **cualquier** vehículo propio (aunque el viaje sea viejo
+   y tenga condiciones guardadas). Un cliente que todavía haga `.map` sobre `condiciones_requeridas`
+   tiene que tolerar que no venga.
+8. Los viajes traen **`motivo`** (para qué es el viaje, 1 a 120 caracteres) y `descripcion` (las
+   indicaciones). Los dos son obligatorios al crear; `motivo` es `null` en viajes anteriores al cambio.
+9. Las condiciones del **vehículo** (`/api/conductores/mis-vehiculos`) siguen igual: son opcionales y
+   son del marketplace; el ciclo de la PyME no las usa.
+
 ---
 
 ## Viaje interno — la PyME asigna, el chofer confirma (Paso 2)
@@ -4016,8 +4040,10 @@ viaje); el front ve `estado: "VENCIDO"` y `vencido: true`, y recibe `viaje:venci
 **Forma del viaje.** Las listas y el detalle devuelven la fila del viaje más:
 - `organizacion` `{ id_organizacion, nombre, cuit }`, `creador` `{ id_usuario, nombre, apellido }`,
   `conductor` `{ id_conductor, id_usuario, nombre, apellido, telefono }` (o `null`), `vehiculo` (`null`
-  hasta que el chofer confirma), `paradas` (con `id_parada`, ordenadas) y `condiciones_requeridas`
-  (array de strings).
+  hasta que el chofer confirma) y `paradas` (con `id_parada`, ordenadas). **No** trae
+  `condiciones_requeridas` (pedido del front 20-10-2026: el ciclo de la PyME no tiene condiciones).
+- `motivo` (para qué es el viaje; `null` en viajes anteriores al 20-10-2026) y `descripcion` (las
+  indicaciones para el chofer).
 - `metodo_cobro` (copiado del vínculo con el chofer), `fecha_confirmacion`, `fecha_rechazo`,
   `causa_cancelacion` (`CHOFER` | `ORGANIZACION` | `ADMIN` | `DESVINCULACION`) y `motivo_cancelacion`.
 - Paso 3: `estimado` / `real` y, en cada parada, sus tiempos (ver
@@ -4052,12 +4078,16 @@ lo elige el chofer al confirmar.
     { "lat": -34.6037, "lng": -58.3816, "direccion": "Plaza de Mayo, CABA" },
     { "lat": -34.5895, "lng": -58.3974, "direccion": "Recoleta, CABA" }
   ],
-  "condiciones_requeridas": ["FRAGIL"],
-  "descripcion": "string (opcional, max 500)"
+  "motivo": "Reposición sucursal Pilar",
+  "descripcion": "Portón azul, tocar timbre"
 }
 ```
 - `id_conductor`: el `id_conductor` de [`GET /api/organizaciones/:id/choferes`](#get-apiorganizacionesidchoferes).
-- `paradas` y `condiciones_requeridas`: mismo formato que la ruta vieja. La primera parada es el **origen**
+- `motivo` (**obligatorio**): para qué es el viaje. Texto libre, se guarda sin espacios en los bordes,
+  1 a 120 caracteres.
+- `descripcion` (**obligatoria**): las indicaciones para el chofer, 1 a 500 caracteres (mismo trim).
+- `condiciones_requeridas`: ya **no existe** en este ciclo. Si llega (un cliente viejo), se ignora sin error.
+- `paradas`: mismo formato que la ruta vieja. La primera parada es el **origen**
   (ahí se inicia el viaje). `zona` se acepta y se ignora (la calcula el servidor). Entre 2 y
   `MAX_PARADAS_POR_VIAJE` (default 10) paradas.
 - **Paso 4:** cada parada puede ser `{ "id_lugar": 40 }` (un [lugar guardado](#lugares-guardados) de
@@ -4084,7 +4114,8 @@ lo elige el chofer al confirmar.
   "tiempo_capital": null,
   "duracion_estimada_horas": 1.244722222222222,
   "fecha_programada": "2026-10-09T21:38:09.241Z",
-  "descripcion": null,
+  "descripcion": "Portón azul, tocar timbre",
+  "motivo": "Reposición sucursal Pilar",
   "estado": "ASIGNADO",
   "fecha_inicio": null,
   "puntualidad_inicio": null,
@@ -4188,9 +4219,6 @@ lo elige el chofer al confirmar.
     "distancia_km": 4.337
   },
   "real": null,
-  "condiciones_requeridas": [
-    "FRAGIL"
-  ],
   "conductor": {
     "id_conductor": 287,
     "id_usuario": 614,
@@ -4238,8 +4266,9 @@ lo elige el chofer al confirmar.
 | Status | Body | Causa |
 |--------|------|-------|
 | 400 | `{"error": "El chofer no esta vinculado a esta PyME"}` | El chofer no tiene vínculo activo con esta PyME |
-| 400 | `{"error": "El chofer no tiene un vehiculo propio que cumpla las condiciones del viaje: REFRIGERADO"}` | Ningún vehículo **propio** del chofer cumple las condiciones (la flota de empresas no cuenta) |
-| 400 | `{ "error": "El chofer no tiene vehiculos propios registrados" }` | El chofer no tiene vehículos |
+| 400 | `{ "error": "El chofer no tiene vehiculos propios registrados" }` | El chofer no tiene vehículos **propios** (la flota de empresas no cuenta) |
+| 400 | `{ "error": "motivo es requerido" }` / `"motivo no puede estar vacio"` / `"motivo puede tener como máximo 120 caracteres"` | `motivo` ausente, vacío (o solo espacios) o largo |
+| 400 | `{ "error": "descripcion es requerida" }` / `"descripcion no puede estar vacia"` / `"descripcion puede tener como máximo 500 caracteres"` | Ídem `descripcion` |
 | 400 | `{ "error": "id_conductor es requerido" }` / errores de `paradas` / `fecha_programada` | Body inválido |
 | 400 | `{ "error": "Un viaje puede tener como máximo 10 paradas" }` | Más de `MAX_PARADAS_POR_VIAJE` paradas |
 | 400 | `{ "error": "El lugar 42 no existe o no esta activo" }` | Un `id_lugar` borrado, inexistente o de otra PyME (mismo mensaje) |
@@ -4278,7 +4307,8 @@ cerrada.
   "tiempo_capital": null,
   "duracion_estimada_horas": 0.5,
   "fecha_programada": "2026-10-04T05:02:57.061Z",
-  "descripcion": null,
+  "descripcion": "Portón azul, tocar timbre",
+  "motivo": "Reposición sucursal Pilar",
   "estado": "CANCELADO",
   "fecha_inicio": null,
   "puntualidad_inicio": null,
@@ -4363,7 +4393,6 @@ cerrada.
       "origen": "CLIENTE"
     }
   ],
-  "condiciones_requeridas": [],
   "conductor": {
     "id_conductor": 189,
     "id_usuario": 373,
@@ -4407,7 +4436,8 @@ Detalle de un viaje de la PyME, con `ruta_planeada` (`[[lng, lat], ...]` o `null
   "tiempo_capital": 0,
   "duracion_estimada_horas": 0.5,
   "fecha_programada": "2026-10-04T02:05:08.761Z",
-  "descripcion": null,
+  "descripcion": "Portón azul, tocar timbre",
+  "motivo": "Reposición sucursal Pilar",
   "estado": "FINALIZADO",
   "fecha_inicio": "2026-10-04T02:03:11.939Z",
   "puntualidad_inicio": "A_TIEMPO",
@@ -4516,7 +4546,6 @@ Detalle de un viaje de la PyME, con `ruta_planeada` (`[[lng, lat], ...]` o `null
       "origen": "CONDUCTOR"
     }
   ],
-  "condiciones_requeridas": [],
   "conductor": {
     "id_conductor": 189,
     "id_usuario": 373,
@@ -4553,16 +4582,19 @@ Edita un viaje que todavía no arrancó. Mandá solo lo que cambia (al menos un 
 {
   "paradas": [ { "lat": -34.6037, "lng": -58.3816 }, { "lat": -34.5895, "lng": -58.3974 } ],
   "fecha_programada": "2026-10-05T14:00:00.000Z",
-  "condiciones_requeridas": ["FRAGIL", "REFRIGERADO"],
-  "descripcion": "string | null"
+  "motivo": "string (1 a 120)",
+  "descripcion": "string (1 a 500)"
 }
 ```
 - Solo en `ASIGNADO` o `CONFIRMADO`. Si estaba **`CONFIRMADO` vuelve a `ASIGNADO`**: se borra el
   vehículo y el chofer tiene que volver a confirmar.
 - Si cambian las paradas o la fecha se recalculan precio, zona y duración (y la ruta si cambian las
   paradas). Se reprograma el vencimiento.
-- El chofer actual tiene que seguir teniendo un vehículo que cumpla las condiciones nuevas; si no, `400`
-  (reasigná el viaje).
+- **Estado resultante:** el viaje tiene que **quedar** con `motivo` y `descripcion`. En el body son
+  opcionales, pero si vienen siguen las reglas de crear (`null` o vacío → `400`). Un viaje viejo sin
+  `motivo` (o sin `descripcion`) no se puede editar sin mandarlo; sí se puede leer, cancelar y reasignar.
+- `condiciones_requeridas` ya no existe: si llega, se ignora (un body con **solo** eso → `400`, no hay
+  nada que editar).
 
 **Respuesta exitosa — 200:** el viaje actualizado (misma forma que el detalle). Real, recortado:
 ```json
@@ -4580,6 +4612,7 @@ Edita un viaje que todavía no arrancó. Mandá solo lo que cambia (al menos un 
   "duracion_estimada_horas": 1,
   "fecha_programada": "2026-10-04T02:33:50.189Z",
   "descripcion": "editado",
+  "motivo": "Motivo editado",
   "estado": "ASIGNADO",
   "fecha_inicio": null,
   "puntualidad_inicio": null,
@@ -4666,10 +4699,6 @@ Edita un viaje que todavía no arrancó. Mandá solo lo que cambia (al menos un 
       "origen": "CLIENTE"
     }
   ],
-  "condiciones_requeridas": [
-    "FRAGIL",
-    "REFRIGERADO"
-  ],
   "conductor": {
     "id_conductor": 189,
     "id_usuario": 373,
@@ -4691,9 +4720,10 @@ Edita un viaje que todavía no arrancó. Mandá solo lo que cambia (al menos un 
 **Errores posibles:**
 | Status | Body | Causa |
 |--------|------|-------|
-| 400 | `{ "error": "Mandá al menos un campo para editar (paradas, fecha_programada, condiciones_requeridas o descripcion)" }` | Body vacío |
+| 400 | `{ "error": "Mandá al menos un campo para editar (paradas, fecha_programada, motivo o descripcion)" }` | Body vacío (o solo campos que se ignoran) |
+| 400 | `{ "error": "El viaje no tiene motivo: completalo para poder editarlo" }` | Viaje viejo sin `motivo` y el body no lo trae (ídem `descripcion`; las dos: `"El viaje no tiene motivo ni descripcion: completalos para poder editarlo"`) |
+| 400 | `{ "error": "descripcion debe ser texto" }` / `"motivo no puede estar vacio"` / … | `motivo` o `descripcion` en `null`, vacíos o largos |
 | 400 | `{ "error": "Solo se puede editar un viaje ASIGNADO o CONFIRMADO; este esta en estado CARGANDO" }` | Ya arrancó o terminó |
-| 400 | `{ "error": "El chofer no tiene un vehiculo propio que cumpla las condiciones del viaje: CARGA_PESADA. Reasigna el viaje a otro chofer" }` | Condiciones que el chofer no cumple |
 | 403 | `{ "error": "La PyME esta suspendida: no puede crear ni modificar viajes" }` | PyME `SUSPENDIDA` |
 | 404 | `{ "error": "Viaje no encontrado" }` | No existe o es de otra PyME |
 | 409 | `{ "error": "El viaje cambio de estado mientras se procesaba tu pedido: volve a cargarlo" }` | Carrera |
@@ -4705,7 +4735,8 @@ Emite `viaje:editado` al chofer y a la PyME.
 ### POST /api/organizaciones/:id/viajes/:idViaje/reasignar
 
 Pasa el viaje a otro chofer vinculado. Solo en `ASIGNADO` o `CONFIRMADO`. Vuelve a `ASIGNADO`, sin
-vehículo, con el `metodo_cobro` del vínculo nuevo.
+vehículo, con el `metodo_cobro` del vínculo nuevo. El chofer nuevo necesita al menos un vehículo propio
+(sin condiciones). **No** exige `motivo` ni `descripcion`: un viaje viejo sin ellos se reasigna igual.
 
 **Autenticación:** Requerida — miembro activo.
 
@@ -4726,7 +4757,8 @@ vehículo, con el `metodo_cobro` del vínculo nuevo.
   "tiempo_capital": null,
   "duracion_estimada_horas": 0.5,
   "fecha_programada": "2026-10-04T02:05:41.840Z",
-  "descripcion": null,
+  "descripcion": "Portón azul, tocar timbre",
+  "motivo": "Reposición sucursal Pilar",
   "estado": "ASIGNADO",
   "fecha_inicio": null,
   "puntualidad_inicio": null,
@@ -4802,9 +4834,6 @@ vehículo, con el `metodo_cobro` del vínculo nuevo.
       "id_usuario": 369,
       "origen": "CLIENTE"
     }
-  ],
-  "condiciones_requeridas": [
-    "FRAGIL"
   ],
   "conductor": {
     "id_conductor": 188,
@@ -4907,7 +4936,8 @@ cerrada.
   "tiempo_capital": 0,
   "duracion_estimada_horas": 0.5,
   "fecha_programada": "2026-10-04T02:05:08.761Z",
-  "descripcion": null,
+  "descripcion": "Portón azul, tocar timbre",
+  "motivo": "Reposición sucursal Pilar",
   "estado": "FINALIZADO",
   "fecha_inicio": "2026-10-04T02:03:11.939Z",
   "puntualidad_inicio": "A_TIEMPO",
@@ -5016,7 +5046,6 @@ cerrada.
       "origen": "CONDUCTOR"
     }
   ],
-  "condiciones_requeridas": [],
   "conductor": {
     "id_conductor": 189,
     "id_usuario": 373,
@@ -5048,8 +5077,9 @@ El chofer acepta el viaje y elige con qué vehículo lo hace. `ASIGNADO` → `CO
 
 **Autenticación:** Requerida — rol `CONDUCTOR`, el chofer asignado.
 
-**Body:** `{ "id_vehiculo": 25 }` — un vehículo **propio** (de `GET /api/conductores/mis-vehiculos`) que
-cumpla las condiciones del viaje.
+**Body:** `{ "id_vehiculo": 25 }` — **cualquier** vehículo **propio** (de `GET /api/conductores/mis-vehiculos`).
+El ciclo de la PyME no tiene condiciones (pedido del front 20-10-2026): un viaje viejo con condiciones
+guardadas se confirma igual.
 
 **Respuesta exitosa — 200:**
 ```json
@@ -5072,7 +5102,6 @@ cumpla las condiciones del viaje.
 | Status | Body | Causa |
 |--------|------|-------|
 | 400 | `{"error": "El vehiculo no es tuyo"}` | El vehículo no es suyo |
-| 400 | `{"error": "El vehiculo no cumple las condiciones del viaje: FRAGIL"}` | No cumple las condiciones |
 | 400 | `{ "error": "No se puede confirmar un viaje en estado CONFIRMADO" }` | Ya no está `ASIGNADO` (incluye `VENCIDO`) |
 | 404 | `{ "error": "Viaje no encontrado" }` | No es su viaje |
 | 409 | `{ "error": "El viaje cambio de estado mientras se procesaba tu pedido: volve a cargarlo" }` | Carrera (la PyME lo canceló, lo reasignó o lo editó en ese instante) |
@@ -5283,12 +5312,12 @@ personal. Todos los payloads traen `id_viaje` e `id_organizacion`.
 
 | Evento | Quién lo recibe | Cuándo |
 |---|---|---|
-| `viaje:asignado` | PyME + chofer | Al crear, y al chofer nuevo al reasignar |
+| `viaje:asignado` | PyME + chofer | Al crear, y al chofer nuevo al reasignar. Trae `motivo` y `descripcion`; **no** trae `condiciones_requeridas` |
 | `viaje:desasignado` | PyME + chofer anterior | Al reasignar |
 | `viaje:editado` | PyME + chofer | Al editar. `confirmacion_anulada: true` si estaba `CONFIRMADO` |
 | `viaje:confirmado` | PyME | El chofer confirma |
 | `viaje:rechazado` | PyME | El chofer rechaza |
-| `viaje:iniciado`, `viaje:estado_cambiado`, `viaje:finalizado` | PyME | Iniciar, salir, confirmar parada, cierre. `estado_cambiado` trae `id_parada`; `finalizado` trae `estimado`, `real` y `paradas` |
+| `viaje:iniciado`, `viaje:estado_cambiado`, `viaje:finalizado` | PyME | Iniciar, salir, confirmar parada, cierre. `estado_cambiado` trae `{ id_viaje, estado_anterior, estado_nuevo, id_parada }` (salir de la **última** no lo emite: solo `viaje:finalizado`); `finalizado` trae `estimado`, `real` y `paradas` |
 | `viaje:cancelado` | PyME + chofer | Cualquier cancelación. `causa`: `CHOFER` / `ORGANIZACION` / `ADMIN` / `DESVINCULACION` |
 | `viaje:vencido` | PyME + chofer | Pasó a `VENCIDO`. Trae `estado_anterior` |
 | `mapa:actualizar`, `costo:actualizar`, `eta:actualizar`, `alerta:desvio`, `alerta:parada`, `ruta:recalculada` | PyME | Tracking en vivo de sus viajes en curso |
@@ -5315,7 +5344,8 @@ Payloads reales:
   "estado": "ASIGNADO",
   "fecha_programada": "2026-10-04T02:04:48.340Z",
   "precio_estimado": 1750,
-  "descripcion": null,
+  "descripcion": "Portón azul, tocar timbre",
+  "motivo": "Reposición sucursal Pilar",
   "paradas": [
     {
       "id_parada": 918,
@@ -5331,9 +5361,6 @@ Payloads reales:
       "latitud": -34.5895,
       "longitud": -58.3974
     }
-  ],
-  "condiciones_requeridas": [
-    "FRAGIL"
   ]
 }
 ```
@@ -5381,6 +5408,7 @@ Payloads reales:
   "fecha_programada": "2026-10-04T02:33:50.189Z",
   "precio_estimado": 3500,
   "descripcion": "editado",
+  "motivo": "Motivo editado",
   "paradas": [
     {
       "id_parada": 944,
@@ -5403,10 +5431,6 @@ Payloads reales:
       "latitud": -34.5895,
       "longitud": -58.3974
     }
-  ],
-  "condiciones_requeridas": [
-    "FRAGIL",
-    "REFRIGERADO"
   ],
   "confirmacion_anulada": true
 }
@@ -6009,7 +6033,7 @@ cualquiera → `503` y **no se crea nada** (ni la serie ni ningún viaje).
   "fecha_desde": "2026-10-11",
   "fecha_hasta": "2026-10-12",
   "paradas": [{ "id_lugar": 40 }, { "lat": -34.5895, "lng": -58.3974, "direccion": "Recoleta, CABA" }],
-  "condiciones_requeridas": ["FRAGIL"],
+  "motivo": "Reparto diario Pilar",
   "descripcion": "Reparto diario"
 }
 ```
@@ -6022,7 +6046,7 @@ cualquiera → `503` y **no se crea nada** (ni la serie ni ningún viaje).
 | `fecha_desde` | `"YYYY-MM-DD"` (fecha de Argentina), de hoy a hoy + 90 días |
 | `fecha_hasta` | Opcional, por defecto `fecha_desde` + 30 días; como máximo eso. La ventana es **inclusiva**: una serie diaria genera hasta **31** viajes |
 | `paradas` | Igual que un viaje (coordenadas o `{ id_lugar }`), máximo `MAX_PARADAS_POR_VIAJE` |
-| `id_conductor`, `condiciones_requeridas`, `descripcion` | Igual que [crear un viaje](#post-apiorganizacionesidviajes): mismo chofer vinculado y vehículo compatible |
+| `id_conductor`, `motivo`, `descripcion` | Igual que [crear un viaje](#post-apiorganizacionesidviajes): chofer vinculado con vehículo propio, `motivo` (1 a 120) y `descripcion` (1 a 500) **obligatorios**. Se copian a cada viaje generado (después cada viaje se edita por su cuenta). `condiciones_requeridas` ya no existe: se ignora |
 
 - **Ocurrencias salteadas:** las que no cumplen `ANTICIPACION_MINIMA_MINUTOS` (la misma regla que
   crear un viaje) no se crean y vuelven en `salteadas` con `motivo`: `PASADA` (ya pasó) o
@@ -6053,8 +6077,8 @@ cualquiera → `503` y **no se crea nada** (ni la serie ni ningún viaje).
       { "lat": -34.6037, "lng": -58.3816, "orden": 1, "id_lugar": 40, "direccion": "Ruta 8 km 50, Pilar", "lugar": { "id_lugar": 40, "nombre": "Deposito Pilar", "activo": true } },
       { "lat": -34.5895, "lng": -58.3974, "orden": 2, "id_lugar": null, "direccion": "Recoleta, CABA", "lugar": null }
     ],
-    "condiciones_requeridas": ["FRAGIL"],
     "descripcion": "Reparto diario",
+    "motivo": "Reparto diario Pilar",
     "estado": "ACTIVA",
     "fecha_baja": null,
     "creado_en": "2026-10-10T03:05:48.681Z",
@@ -6177,12 +6201,12 @@ formato que [`viaje:asignado`](#websocket--eventos-del-viaje-interno) (sin nombr
       "fecha_programada": "2026-10-11T12:00:00.000Z",
       "precio_estimado": 1026.388888888889,
       "descripcion": "Reparto diario",
+      "motivo": "Reparto diario Pilar",
       "id_serie": 38,
       "paradas": [
         { "id_parada": 2349, "orden": 1, "direccion": "Ruta 8 km 50, Pilar", "latitud": -34.6037, "longitud": -58.3816 },
         { "id_parada": 2350, "orden": 2, "direccion": "Recoleta, CABA", "latitud": -34.5895, "longitud": -58.3974 }
-      ],
-      "condiciones_requeridas": ["FRAGIL"]
+      ]
     },
     { "id_viaje": 1160, "…": "…" }
   ]

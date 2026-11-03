@@ -32,7 +32,7 @@ import * as turf from '@turf/turf';
 import prisma from '../src/config/prisma.js';
 import { registrarCambioEstado } from '../src/services/historial-estado.service.js';
 import { conServer } from './_server-efimero.js';
-import { getToken } from './_firebase-auth.js';
+import { getToken, exigirAdminTest } from './_firebase-auth.js';
 import { crearRegistro, terminar } from './_limpieza.js';
 
 // Todo lo que crea la corrida se borra al final (ver _limpieza.js): los
@@ -40,7 +40,8 @@ import { crearRegistro, terminar } from './_limpieza.js';
 const reg = crearRegistro();
 const SETUP_BASE = process.env.TEST_BASE_URL ?? 'http://localhost:3000'; // solo para el alta de fixtures
 
-const ADMIN = { email: 'admin-test@fleter.com', password: 'admintest123' };
+// TEST_ADMIN_PASSWORD: sin ella la suite no arranca.
+const ADMIN = exigirAdminTest();
 
 const PARADA_1 = { lat: -34.6037, lng: -58.3816, direccion: 'Plaza de Mayo, CABA' };
 const PARADA_2 = { lat: -34.5895, lng: -58.3974, direccion: 'Recoleta, CABA' };

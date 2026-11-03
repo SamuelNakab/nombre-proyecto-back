@@ -9,6 +9,8 @@ import {
 } from '../services/reserva.service.js';
 import { registrarCambioEstado } from '../services/historial-estado.service.js';
 import { io } from '../sockets/index.js';
+import { responder400 } from '../services/errores-validacion.js';
+import { idParam } from '../services/id-param.js';
 
 // ─── Schemas ─────────────────────────────────────────────────────────────────
 
@@ -23,11 +25,6 @@ const schemaAsignar = z.object({
 });
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-function idParam(valor) {
-  const n = Number(valor);
-  return Number.isInteger(n) && n > 0 ? n : null;
-}
 
 // Resuelve con que empresa opera el gerente al reservar. Si viene id_empresa lo
 // valida (debe ser suya); si no viene y tiene una sola empresa, usa esa.
@@ -92,7 +89,7 @@ function notificarAsignacion(gerenteIdUsuario, viaje, conductor, vehiculo) {
 export async function reservarViaje(req, res) {
   const parsed = schemaReservar.safeParse(req.body ?? {});
   if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.issues[0].message });
+    return responder400(res, parsed);
   }
 
   const id_viaje = idParam(req.params.id);
@@ -155,7 +152,7 @@ export async function reservarViaje(req, res) {
 export async function asignarViaje(req, res) {
   const parsed = schemaAsignar.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.issues[0].message });
+    return responder400(res, parsed);
   }
 
   const id_viaje = idParam(req.params.id);
@@ -231,7 +228,7 @@ export async function asignarViaje(req, res) {
 export async function reasignarViaje(req, res) {
   const parsed = schemaAsignar.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.issues[0].message });
+    return responder400(res, parsed);
   }
 
   const id_viaje = idParam(req.params.id);

@@ -8,19 +8,24 @@ export async function verificarToken(req, res, next) {
   }
 
   const token = authHeader.slice(7);
+  let decoded;
   try {
-    const decoded = await admin.auth().verifyIdToken(token);
-    const usuario = await prisma.usuario.findUnique({
-      where: { firebase_uid: decoded.uid },
-    });
-    if (!usuario) {
-      return res.status(404).json({ error: 'Usuario no registrado' });
-    }
-    req.usuario = usuario;
-    next();
+    decoded = await admin.auth().verifyIdToken(token);
   } catch {
     return res.status(401).json({ error: 'Token invalido o expirado' });
   }
+
+  // Fuera del try del token: un error de la base va al manejador global (503 /
+  // 500 y Sentry). Antes salia como "Token invalido o expirado", una caida de la
+  // DB disfrazada de 401.
+  const usuario = await prisma.usuario.findUnique({
+    where: { firebase_uid: decoded.uid },
+  });
+  if (!usuario) {
+    return res.status(404).json({ error: 'Usuario no registrado' });
+  }
+  req.usuario = usuario;
+  next();
 }
 
 export function requireRol(...roles) {

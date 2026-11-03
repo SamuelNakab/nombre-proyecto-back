@@ -1,6 +1,8 @@
 import { z } from 'zod';
 import prisma from '../config/prisma.js';
 import { ESTADOS_TERMINALES } from '../services/estado-viaje.service.js';
+import { responder400 } from '../services/errores-validacion.js';
+import { idParam } from '../services/id-param.js';
 
 const TIPOS_CONDICION = ['FRAGIL', 'REFRIGERADO', 'CARGA_PESADA', 'PELIGROSO', 'VOLUMINOSO'];
 
@@ -29,7 +31,7 @@ async function getConductor(id_usuario) {
 export async function registrarVehiculo(req, res) {
   const parsed = schemaRegistrar.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.errors[0].message });
+    return responder400(res, parsed);
   }
 
   const conductor = await getConductor(req.usuario.id_usuario);
@@ -80,7 +82,7 @@ export async function listarMisVehiculos(req, res) {
 export async function actualizarVehiculo(req, res) {
   const parsed = schemaActualizar.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.errors[0].message });
+    return responder400(res, parsed);
   }
 
   const conductor = await getConductor(req.usuario.id_usuario);
@@ -88,7 +90,10 @@ export async function actualizarVehiculo(req, res) {
     return res.status(400).json({ error: 'El usuario no tiene perfil de conductor' });
   }
 
-  const id_vehiculo = parseInt(req.params.id);
+  const id_vehiculo = idParam(req.params.id);
+  if (!id_vehiculo) {
+    return res.status(400).json({ error: 'id de vehiculo invalido' });
+  }
   const vehiculo = await prisma.vehiculo.findUnique({ where: { id_vehiculo } });
   if (!vehiculo) {
     return res.status(404).json({ error: 'Vehiculo no encontrado' });
@@ -113,7 +118,10 @@ export async function eliminarVehiculo(req, res) {
     return res.status(400).json({ error: 'El usuario no tiene perfil de conductor' });
   }
 
-  const id_vehiculo = parseInt(req.params.id);
+  const id_vehiculo = idParam(req.params.id);
+  if (!id_vehiculo) {
+    return res.status(400).json({ error: 'id de vehiculo invalido' });
+  }
   const vehiculo = await prisma.vehiculo.findUnique({ where: { id_vehiculo } });
   if (!vehiculo) {
     return res.status(404).json({ error: 'Vehiculo no encontrado' });
@@ -150,7 +158,10 @@ export async function agregarCondicion(req, res) {
     return res.status(400).json({ error: 'El usuario no tiene perfil de conductor' });
   }
 
-  const id_vehiculo = parseInt(req.params.id);
+  const id_vehiculo = idParam(req.params.id);
+  if (!id_vehiculo) {
+    return res.status(400).json({ error: 'id de vehiculo invalido' });
+  }
   const vehiculo = await prisma.vehiculo.findUnique({
     where: { id_vehiculo },
     include: { condiciones: true },
@@ -189,7 +200,10 @@ export async function quitarCondicion(req, res) {
     return res.status(400).json({ error: 'El usuario no tiene perfil de conductor' });
   }
 
-  const id_vehiculo = parseInt(req.params.id);
+  const id_vehiculo = idParam(req.params.id);
+  if (!id_vehiculo) {
+    return res.status(400).json({ error: 'id de vehiculo invalido' });
+  }
   const vehiculo = await prisma.vehiculo.findUnique({ where: { id_vehiculo } });
   if (!vehiculo) {
     return res.status(404).json({ error: 'Vehiculo no encontrado' });

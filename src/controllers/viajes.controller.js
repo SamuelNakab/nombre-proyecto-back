@@ -46,6 +46,8 @@ import {
   paradasParaCrear,
 } from '../services/viaje-validacion.js';
 import { io } from '../sockets/index.js';
+import { responder400 } from '../services/errores-validacion.js';
+import { idParam } from '../services/id-param.js';
 
 // ─── Schemas de validacion ───────────────────────────────────────────────────
 
@@ -66,7 +68,7 @@ const schemaCrear = z.object({
 export async function estimarCosto(req, res) {
   const parsed = schemaEstimar.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.issues[0].message });
+    return responder400(res, parsed);
   }
 
   // parsed.data.zona se descarta a proposito: estimarCostoService la calcula de
@@ -86,7 +88,7 @@ export async function estimarCosto(req, res) {
 export async function crearViaje(req, res) {
   const parsed = schemaCrear.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.issues[0].message });
+    return responder400(res, parsed);
   }
 
   // parsed.data.zona se descarta a proposito: la zona que se persiste es la que
@@ -235,8 +237,11 @@ export async function listarViajesDisponibles(req, res) {
 }
 
 export async function obtenerViaje(req, res) {
+  const id_viaje = idParam(req.params.id);
+  if (!id_viaje) return res.status(400).json({ error: 'id de viaje invalido' });
+
   const viaje = await prisma.viaje.findUnique({
-    where: { id_viaje: Number(req.params.id) },
+    where: { id_viaje },
     include: {
       paradas: { orderBy: { orden: 'asc' } },
       condiciones_req: true,
@@ -315,10 +320,11 @@ export async function cambiarEstado(req, res) {
   const schema = z.object({ estado: z.enum(['CARGANDO', 'DESCARGANDO', 'EN_RUTA']) });
   const parsed = schema.safeParse(req.body);
   if (!parsed.success) {
-    return res.status(400).json({ error: parsed.error.issues[0].message });
+    return responder400(res, parsed);
   }
 
-  const id_viaje = Number(req.params.id);
+  const id_viaje = idParam(req.params.id);
+  if (!id_viaje) return res.status(400).json({ error: 'id de viaje invalido' });
   const { estado } = parsed.data;
 
   const viaje = await prisma.viaje.findUnique({
@@ -396,7 +402,8 @@ export async function cambiarEstado(req, res) {
 // CONDUCTOR_ASIGNADO a EN_CAMINO_A_ORIGEN. Recien despues de este 200 el mobile
 // debe arrancar el GPS — los pings previos se rechazan (ver gps.socket.js).
 export async function iniciarViaje(req, res) {
-  const id_viaje = Number(req.params.id);
+  const id_viaje = idParam(req.params.id);
+  if (!id_viaje) return res.status(400).json({ error: 'id de viaje invalido' });
 
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },
@@ -503,7 +510,8 @@ export async function iniciarViaje(req, res) {
 }
 
 export async function cancelarViajeConductor(req, res) {
-  const id_viaje = Number(req.params.id);
+  const id_viaje = idParam(req.params.id);
+  if (!id_viaje) return res.status(400).json({ error: 'id de viaje invalido' });
 
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },
@@ -631,7 +639,8 @@ export async function cancelarViajeConductor(req, res) {
 }
 
 export async function cancelarViajeCliente(req, res) {
-  const id_viaje = Number(req.params.id);
+  const id_viaje = idParam(req.params.id);
+  if (!id_viaje) return res.status(400).json({ error: 'id de viaje invalido' });
 
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },
@@ -702,7 +711,8 @@ export async function cancelarViajeCliente(req, res) {
 }
 
 export async function obtenerCostoAcumulado(req, res) {
-  const id_viaje = Number(req.params.id);
+  const id_viaje = idParam(req.params.id);
+  if (!id_viaje) return res.status(400).json({ error: 'id de viaje invalido' });
 
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },
@@ -735,10 +745,11 @@ export async function confirmarParada(req, res) {
   });
 
   const parsed = schema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
+  if (!parsed.success) return responder400(res, parsed);
 
   const { id_parada, lat, lng } = parsed.data;
-  const id_viaje = Number(req.params.id);
+  const id_viaje = idParam(req.params.id);
+  if (!id_viaje) return res.status(400).json({ error: 'id de viaje invalido' });
 
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },
@@ -848,10 +859,11 @@ export async function calificarViaje(req, res) {
   });
 
   const parsed = schema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
+  if (!parsed.success) return responder400(res, parsed);
 
   const { puntuacion, comentario } = parsed.data;
-  const id_viaje = Number(req.params.id);
+  const id_viaje = idParam(req.params.id);
+  if (!id_viaje) return res.status(400).json({ error: 'id de viaje invalido' });
 
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },
@@ -899,7 +911,8 @@ export async function calificarViaje(req, res) {
 }
 
 export async function obtenerRemito(req, res) {
-  const id_viaje = Number(req.params.id);
+  const id_viaje = idParam(req.params.id);
+  if (!id_viaje) return res.status(400).json({ error: 'id de viaje invalido' });
 
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },

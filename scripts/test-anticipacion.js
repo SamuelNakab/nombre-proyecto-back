@@ -78,6 +78,8 @@ async function conServer(valor, puerto, fn) {
       RESERVA_BARRIDO_ARRANQUE: '0',
       VENCIMIENTO_BARRIDO_ARRANQUE: '0',
       CIERRE_BARRIDO_ARRANQUE: '0',
+      RATE_LIMIT_HABILITADO: '0',
+      SENTRY_DSN: '',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });

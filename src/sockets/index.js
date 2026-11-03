@@ -6,14 +6,27 @@ import { registrarHandlersGPS } from './gps.socket.js';
 import { conductorEsElegible } from '../services/elegibilidad.service.js';
 import { marketplaceHabilitado } from '../middlewares/flags.middleware.js';
 import { salaOrganizacion } from './salas.js';
+import { limitarHandshakeIp } from './limite-handshake.js';
+import { reportarError } from '../config/sentry.js';
 
 export let io = null;
 
-export function inicializarSockets(httpServer) {
+// `origenPermitido`: el mismo criterio que CORS de Express (config/cors.js). Sin
+// CORS_ORIGINS deja pasar todo, como antes. El `cors` de socket.io solo aplica al
+// transporte polling; allowRequest cubre tambien el upgrade a WebSocket (que no
+// pasa por CORS). Un handshake sin Origin (mobile) pasa siempre.
+export function inicializarSockets(httpServer, { origenPermitido = () => true } = {}) {
   io = new Server(httpServer, {
-    cors: { origin: '*' },
+    cors: { origin: (origin, cb) => cb(null, origenPermitido(origin)) },
+    allowRequest: (req, cb) => {
+      const ok = origenPermitido(req.headers.origin);
+      cb(ok ? null : 'Origen no permitido', ok);
+    },
   });
 
+  // Primero el limite por IP (sin tocar Firebase ni la DB), despues la
+  // autenticacion (que tiene su propio limite por uid). Ver limite-handshake.js.
+  io.use(limitarHandshakeIp);
   io.use(autenticarSocket);
 
   io.on('connection', (socket) => {
@@ -22,10 +35,16 @@ export function inicializarSockets(httpServer) {
     socket.join('usuario:' + id_usuario);
     console.log(`[Socket] conectado: ${rol} id:${socket.id}`);
 
+    // Sin catch, un error de la DB al conectarse era un unhandledRejection, y
+    // Node 22 tumbaba el proceso entero.
+    const fallo = (err) => {
+      console.error(`[Socket] no se pudo unir a las salas (${rol} uid:${id_usuario}):`, err.message);
+      reportarError(err, { contexto: 'socket:salas', usuario: socket.data.usuario });
+    };
     if (rol === 'CONDUCTOR') {
-      unirseARoomsDisponibles(socket);
+      unirseARoomsDisponibles(socket).catch(fallo);
     } else if (rol === 'CLIENTE') {
-      unirseARoomsCliente(socket);
+      unirseARoomsCliente(socket).catch(fallo);
     }
 
     manejarAceptarViaje(socket, io);

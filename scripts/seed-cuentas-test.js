@@ -10,6 +10,9 @@
 //
 // Idempotente. Por cada cuenta:
 //   - Firebase: si existe, le resetea la password a la conocida; si no, la crea.
+//     La de admin-test sale de TEST_ADMIN_PASSWORD (no esta en el codigo: la DB
+//     compartida la hace un ADMIN real de production). Sin la variable, esa
+//     cuenta se saltea con un aviso; nunca se resetea a vacio.
 //   - DB: si no existe la fila (por email) la crea con su perfil (cliente /
 //     conductor con licencia / admin); si existe con otro firebase_uid, lo alinea.
 //
@@ -35,7 +38,7 @@ const CUENTAS = [
   { email: 'conductor@test.com', password: 'test123456', rol: 'CONDUCTOR', nombre: 'Conductor', apellido: 'Uno', dni: '22222222', nro_licencia: 'LIC001' },
   { email: 'conductor2@test.com', password: 'test123456', rol: 'CONDUCTOR', nombre: 'Conductor', apellido: 'Dos', dni: '33333333', nro_licencia: 'LIC002' },
   { email: 'stress-conductor2@test.com', password: 'test123456', rol: 'CONDUCTOR', nombre: 'Stress', apellido: 'ConductorDos', dni: '33333334', nro_licencia: 'LIC003' },
-  { email: 'admin-test@fleter.com', password: 'admintest123', rol: 'ADMIN', nombre: 'Admin', apellido: 'Test', dni: '90000001' },
+  { email: 'admin-test@fleter.com', password: process.env.TEST_ADMIN_PASSWORD, rol: 'ADMIN', nombre: 'Admin', apellido: 'Test', dni: '90000001' },
 ];
 
 async function asegurarFirebase({ email, password }) {
@@ -245,6 +248,10 @@ async function seedE2E() {
 async function main() {
   console.log('\nSeed de cuentas fijas de test\n');
   for (const c of CUENTAS) {
+    if (!c.password) {
+      console.log(`  ⚠  ${c.email}: TEST_ADMIN_PASSWORD no esta en el entorno, se saltea esta cuenta.`);
+      continue;
+    }
     const fb = await asegurarFirebase(c);
     const db = await asegurarDb(c, fb.uid);
     console.log(`  ${c.email.padEnd(28)} ${c.rol.padEnd(9)} firebase: ${fb.accion.padEnd(28)} db: ${db}`);

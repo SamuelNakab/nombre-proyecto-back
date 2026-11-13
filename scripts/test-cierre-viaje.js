@@ -39,7 +39,7 @@
 //  11. Un chofer con un viaje en curso no puede iniciar otro (409) y la carrera
 //      de dos iniciar a la vez (3 rondas): uno gana.
 //  12. Flujo normal (Salir a tiempo, sin deteccion): igual que siempre, origen
-//      CHOFER, precio = el del acumulado.
+//      CHOFER, precio v2 medido con el acumulado completo.
 //  13. Tres pings simultaneos al cumplirse el umbral: una sola deteccion (guard
 //      del updateMany de salida-deteccion.service).
 //
@@ -59,7 +59,7 @@ import { conServer, esperarLinea } from './_server-efimero.js';
 import { crearRegistro } from './_limpieza.js';
 import { restos } from './restos.js';
 import { getToken as loginFirebase } from './_firebase-auth.js';
-import { precioDesdeMediciones } from '../src/services/precio-real.js';
+import { calcularPrecioV2 } from '../src/services/precio-v2.js';
 
 const PUERTO = 3951;
 const PUERTO_TIMER = 3952;
@@ -697,16 +697,22 @@ async function casos(ctx) {
       acumulado = JSON.parse(await redis.get(`gps:${id}:acumulado`));
       if (acumulado?.ultima_actualizacion !== ts2) await esperar(150);
     }
-    const viaje = await prisma.viaje.findUnique({ where: { id_viaje: id }, include: { paradas: true } });
-    const esperado = precioDesdeMediciones(viaje, acumulado).precio_real;
     const s = await salir(K1, id);
     const v = await viajeDb(id);
-    const ultima = (await paradasDb(id)).at(-1);
+    const ps = await paradasDb(id);
+    const ultima = ps.at(-1);
+    // Precio v2 (precio.service): medido con el acumulado COMPLETO (el corte es
+    // la salida, posterior al ultimo ping) y las horas por reloj desde la
+    // llegada a la parada 1; recalculable con el snapshot del viaje.
+    const e = v.precio_medido_desglose?.entradas;
+    const horas = (ms(v.fecha_corte_precio) - ms(ps[0].llegada_real)) / HORA;
     paso(
-      'CASO 12: cerrado CHOFER, origen CHOFER, corte = salida, precio = el del acumulado',
+      'CASO 12: cerrado CHOFER, origen CHOFER, corte = salida, precio v2 medido con el acumulado completo',
       s.status === 200 && s.data.origen_salida === 'CHOFER' && v.cerrado_por === 'CHOFER' && ultima.origen_salida === 'CHOFER' &&
-        ms(v.fecha_corte_precio) === ms(ultima.salida_real) && Math.abs(v.precio_real - esperado) < 1e-6,
-      `${r2s(s)} | precio ${v.precio_real} vs ${esperado}`
+        ms(v.fecha_corte_precio) === ms(ultima.salida_real) && v.precio_real === v.precio_medido && e &&
+        Math.abs(e.km_gps - acumulado.distancia_km) < 1e-9 && e.pings === acumulado.pings && Math.abs(e.horas - horas) < 1e-9 &&
+        calcularPrecioV2(e, v.precio_parametros.parametros).total === v.precio_medido,
+      `${r2s(s)} | precio ${v.precio_real} km_gps ${e?.km_gps} vs ${acumulado?.distancia_km}`
     );
   }
 }

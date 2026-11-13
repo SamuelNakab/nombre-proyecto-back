@@ -170,6 +170,10 @@ export async function borrar(r) {
   });
   await prisma.transaccion.deleteMany({ where: enViajes });
   await prisma.historialEstadoViaje.deleteMany({ where: enViajes });
+  // Precio v2: tienen FK ON DELETE CASCADE, pero se borran explicito (y antes)
+  // para que el conteo no dependa de la cascada.
+  await prisma.historialPrecioViaje.deleteMany({ where: enViajes });
+  await prisma.precioPagadoViaje.deleteMany({ where: enViajes });
   await prisma.parada.deleteMany({ where: enViajes });
   await prisma.condicionRequerida.deleteMany({ where: enViajes });
   const viajes = (await prisma.viaje.deleteMany({ where: enViajes })).count;

@@ -23,12 +23,31 @@
 // reasignar; desvincular toma el mismo lock con su updateMany, asi que no se
 // puede crear o reasignar un viaje contra un vinculo que se esta cortando. El
 // orden de locks es siempre vinculo -> viaje: no hay deadlock posible.
+import { Prisma } from '@prisma/client';
 import prisma from '../config/prisma.js';
+import { configPrecio } from '../config/precio.js';
 import { ErrorNegocio } from './error-negocio.js';
 import { OPCIONES_TX, exigirPymeOperativa } from './organizacion.service.js';
 import { resolverParadas } from './lugar.service.js';
 import { paradaVistaChofer, paradaVistaPyme } from './vista-parada.js';
-import { estimarCosto } from './costo.service.js';
+import {
+  estimarPrecioInterno,
+  precioV2DesdeRecorrido,
+  peajesGoogleDeViaje,
+  columnasPrecioV2,
+  exigirDatosPrecio,
+  facturaAPorDefecto,
+  filaHistorial,
+  registrarHistorialPrecio,
+  serializarEstimacionPrecio,
+  esV2,
+  SELECT_PARADAS_PRECIO,
+} from './precio.service.js';
+import { declaradosDe, CAMPOS_DECLARADOS } from './precio-entradas.js';
+import { viajeVistaChofer, resumenVistaChofer } from './vista-chofer.js';
+import { precioPagadoPendiente, serializarPrecioPagado } from './precio-pagado-reglas.js';
+import { medicionesHasta } from './gps.service.js';
+import { clasificarZona } from './zona.service.js';
 import {
   columnasEstimadasViaje,
   columnasEstimadasParada,
@@ -75,7 +94,7 @@ import {
   paradasConTiempos,
 } from './duracion.service.js';
 import { paradasParaCrear, faltantesContenido, mensajeFaltantes } from './viaje-validacion.js';
-import { emitirViajeInterno, salasDeViaje } from '../sockets/salas.js';
+import { emitirViajeInterno, emitirViajeInternoDividido, salasDeViaje } from '../sockets/salas.js';
 
 // ─── Constantes ──────────────────────────────────────────────────────────────
 
@@ -135,6 +154,10 @@ export const INCLUDE_VIAJE_INTERNO = {
   },
   ...INCLUDE_HISTORIAL,
 };
+
+// Lo que lee la PyME: lo mismo + el feedback del precio pagado (Parte D). El
+// chofer NUNCA lo lee (no se incluye en sus lecturas).
+export const INCLUDE_VIAJE_PYME = { ...INCLUDE_VIAJE_INTERNO, precio_pagado: true };
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -309,8 +332,22 @@ function serializarViaje(viaje, vistaParada) {
   };
 }
 
-export const serializarViajePyme = (viaje) => serializarViaje(viaje, paradaVistaPyme);
-export const serializarViajeChofer = (viaje) => serializarViaje(viaje, paradaVistaChofer);
+// La PyME ve todo, mas el feedback del precio pagado: precio_pagado (objeto o
+// null) y precio_pagado_pendiente (FINALIZADO, dentro de la ventana y sin
+// feedback). El viaje tiene que venir con INCLUDE_VIAJE_PYME (precioPagadoPendiente
+// TIRA si falta la relacion).
+export function serializarViajePyme(viaje) {
+  const { precio_pagado, ...sinFeedback } = viaje;
+  return {
+    ...serializarViaje(sinFeedback, paradaVistaPyme),
+    precio_pagado: serializarPrecioPagado(precio_pagado ?? null),
+    precio_pagado_pendiente: precioPagadoPendiente(viaje, new Date(), configPrecio().FEEDBACK_PRECIO_EDICION_DIAS),
+  };
+}
+
+// El chofer: LISTA BLANCA (vista-chofer.js). Sin precios, peajes ni tarifas, y
+// sin datos personales de otros usuarios.
+export const serializarViajeChofer = (viaje) => viajeVistaChofer(serializarViaje(viaje, paradaVistaChofer));
 
 // Payload compacto de los eventos de socket. Lo reciben la PyME Y el chofer en
 // el MISMO emit: las paradas van con campos EXPLICITOS y NUNCA con el lugar
@@ -324,7 +361,10 @@ export function resumenViaje(viaje) {
       : null,
     estado: viaje.estado,
     fecha_programada: viaje.fecha_programada,
+    // Solo para la PyME: al chofer le llega resumenVistaChofer (sin precios).
     precio_estimado: viaje.precio_estimado,
+    precio_estimado_min: viaje.precio_estimado_min ?? null,
+    precio_estimado_max: viaje.precio_estimado_max ?? null,
     motivo: viaje.motivo ?? null,
     descripcion: viaje.descripcion,
     id_serie: viaje.id_serie ?? null,
@@ -339,7 +379,20 @@ export function resumenViaje(viaje) {
 }
 
 export const leerViaje = (id_viaje) =>
-  prisma.viaje.findUnique({ where: { id_viaje }, include: INCLUDE_VIAJE_INTERNO });
+  prisma.viaje.findUnique({ where: { id_viaje }, include: INCLUDE_VIAJE_PYME });
+
+// Eventos con el resumen del viaje: completo a la sala de la PyME, sin precios al
+// chofer. Nada a viaje:{id} (en un viaje interno nadie entra a esa sala).
+function emitirResumen(io, viaje, evento, extra = {}, id_usuario_chofer = destinosDe(viaje).id_usuario_chofer) {
+  const resumen = { ...resumenViaje(viaje), ...extra };
+  emitirViajeInternoDividido(
+    io,
+    { id_organizacion: viaje.id_organizacion, id_usuario_chofer },
+    evento,
+    resumen,
+    resumenVistaChofer(resumen)
+  );
+}
 
 const destinosDe = (viaje) => ({
   id_viaje: viaje.id_viaje,
@@ -361,14 +414,14 @@ export async function listarViajesOrganizacion(io, id_organizacion, filtros = {}
   await ponerAlDia(io, { id_organizacion });
   const viajes = await prisma.viaje.findMany({
     where: { id_organizacion, ...filtroEstado(filtros, GRUPOS_PYME) },
-    include: INCLUDE_VIAJE_INTERNO,
+    include: INCLUDE_VIAJE_PYME,
     orderBy: [{ fecha_programada: 'desc' }, { id_viaje: 'desc' }],
   });
   return viajes.map(serializarViajePyme);
 }
 
 // Un viaje de OTRA PyME da 404, igual que uno que no existe: no se filtran ids.
-async function viajeDeOrganizacion(id_organizacion, id_viaje, include = INCLUDE_VIAJE_INTERNO) {
+async function viajeDeOrganizacion(id_organizacion, id_viaje, include = INCLUDE_VIAJE_PYME) {
   const viaje = await prisma.viaje.findFirst({ where: { id_viaje, id_organizacion }, include });
   if (!viaje) throw new ErrorNegocio(404, 'Viaje no encontrado');
   return viaje;
@@ -423,7 +476,7 @@ export async function remitoOrganizacion(id_organizacion, id_viaje) {
 
 export async function viajeParaCostoAcumulado(id_organizacion, id_viaje) {
   return viajeDeOrganizacion(id_organizacion, id_viaje, {
-    paradas: { select: { latitud: true, longitud: true } },
+    paradas: { select: SELECT_PARADAS_PRECIO },
   });
 }
 
@@ -447,12 +500,22 @@ export async function crearViajeInterno({ io, id_organizacion, id_usuario, datos
   // no existe, es de otra PyME o esta borrado).
   const paradas = await resolverParadas(id_organizacion, datos.paradas);
 
-  // Precio, duracion (manejo + peon) y ruta: UNA estimacion (costo.service).
-  // Fuera de la tx y ANTES de escribir nada: llama a Google. Si Google falla,
-  // ErrorMaps (503, o 400 si no hay ruta posible) y no se crea nada.
-  const resultado = await estimarCosto({ paradas, fecha_programada });
-  const { tarifa_hora, tarifa_km } = resultado.desglose;
-  const { recorrido } = resultado;
+  // Precio v2: lo declarado por la PyME (null = no declarado) y sus reglas sobre
+  // las paradas ya resueltas (el acceso de un lugar se copio en el snapshot).
+  const declarados = declaradosDe(datos);
+  exigirDatosPrecio({ ...declarados, paradas });
+
+  // Precio v2, duracion (manejo + peon) y ruta: UNA estimacion. Fuera de la tx y
+  // ANTES de escribir nada: llama a Google. Si los tramos fallan, ErrorMaps (503,
+  // o 400 si no hay ruta posible) y no se crea nada. Los peajes (UNA llamada
+  // Enterprise, en paralelo, o el cache de un estimar-precio previo) nunca
+  // bloquean: si fallan, el viaje se crea sin peajes de Google.
+  const { zona, recorrido, precio, peajes } = await estimarPrecioInterno({
+    paradas,
+    fecha_programada,
+    declarados,
+    facturaAOrganizacion: await facturaAPorDefecto(id_organizacion),
+  });
 
   const { id_viaje } = await transaccion(async (tx) => {
     const vinculo = await bloquearVinculoActivo(tx, id_organizacion, id_conductor);
@@ -466,15 +529,12 @@ export async function crearViajeInterno({ io, id_organizacion, id_usuario, datos
         id_cliente: cliente.id_cliente,
         id_conductor,
         metodo_cobro: vinculo.metodo_cobro,
-        zona: resultado.zona,
-        tarifa_hora,
-        tarifa_km,
         fecha_programada: new Date(fecha_programada),
         motivo,
         descripcion,
-        precio_estimado: resultado.precio_estimado,
+        ...columnasPrecioV2(precio, zona, declarados),
         ...columnasEstimadasViaje(recorrido.totales),
-        paradas: { create: conEstimacionPorParada(paradasParaCrear(paradas), recorrido) },
+        paradas: { create: conEstimacionPorParada(paradasParaCrear(paradas), recorrido, peajes.tramos) },
       },
       select: { id_viaje: true },
     });
@@ -486,6 +546,7 @@ export async function crearViajeInterno({ io, id_organizacion, id_usuario, datos
     id_usuario,
     origen: ORIGEN_HISTORIAL.PYME,
   });
+  await registrarHistorialPrecio(filaHistorial({ id_viaje, motivo: 'CREAR', id_usuario }, precio));
 
   // Ruta planeada: la polilinea de los tramos de la estimacion (sin otra
   // llamada a Google). Si Redis falla el viaje ya existe: se loguea y la ruta
@@ -495,13 +556,33 @@ export async function crearViajeInterno({ io, id_organizacion, id_usuario, datos
   programarVencimientoInterno(io, id_viaje, new Date(fecha_programada));
 
   const viaje = await leerViaje(id_viaje);
-  emitirViajeInterno(io, destinosDe(viaje), 'viaje:asignado', resumenViaje(viaje));
+  emitirResumen(io, viaje, 'viaje:asignado');
 
   return {
     ...serializarViajePyme(viaje),
     ruta_planeada,
-    desglose_estimado: resultado.desglose,
+    desglose_estimado: precio.desglose,
   };
+}
+
+// POST /api/organizaciones/:id/viajes/estimar-precio: el mismo calculo que crear
+// (acepta id_lugar y los datos de la Parte B), sin escribir nada. Mismas
+// validaciones de lo declarado; id_conductor, motivo y descripcion no hacen falta.
+// SUSPENDIDA -> 403 como crear (no gasta llamadas a Google de una PyME
+// suspendida).
+export async function estimarPrecioOrganizacion({ id_organizacion, datos }) {
+  await exigirPymeOperativa(id_organizacion);
+  const paradas = await resolverParadas(id_organizacion, datos.paradas);
+  const declarados = declaradosDe(datos);
+  exigirDatosPrecio({ ...declarados, paradas });
+  const fecha = datos.fecha_programada ?? new Date().toISOString();
+  const estimacion = await estimarPrecioInterno({
+    paradas,
+    fecha_programada: fecha,
+    declarados,
+    facturaAOrganizacion: await facturaAPorDefecto(id_organizacion),
+  });
+  return serializarEstimacionPrecio(estimacion);
 }
 
 // ─── Chofer: confirmar / rechazar / iniciar / cancelar ───────────────────────
@@ -518,10 +599,25 @@ export async function confirmarViaje({ io, id_usuario, id_viaje, id_vehiculo }) 
 
   // Cualquier vehiculo PROPIO sirve: el ciclo interno no tiene condiciones (un
   // viaje viejo con condiciones guardadas se confirma igual).
-  const vehiculo = await prisma.vehiculo.findUnique({ where: { id_vehiculo } });
+  const vehiculo = await prisma.vehiculo.findUnique({
+    where: { id_vehiculo },
+    include: { condiciones: { select: { condicion: true } } },
+  });
   if (!vehiculo || vehiculo.id_conductor !== id_conductor) {
     throw new ErrorNegocio(400, 'El vehiculo no es tuyo');
   }
+  // Copia del vehiculo al confirmar: se puede editar despues y el viaje tiene que
+  // recordar con que se hizo.
+  const vehiculo_snapshot = {
+    id_vehiculo: vehiculo.id_vehiculo,
+    patente: vehiculo.patente,
+    marca: vehiculo.marca,
+    modelo: vehiculo.modelo,
+    anio: vehiculo.anio,
+    color: vehiculo.color,
+    tipo_vehiculo: vehiculo.tipo_vehiculo,
+    condiciones: vehiculo.condiciones.map((c) => c.condicion),
+  };
 
   const ahora = new Date();
   const limite = fechaProgramadaLimiteVencimiento(ahora, ventanaInicioDespuesMinutos());
@@ -537,7 +633,7 @@ export async function confirmarViaje({ io, id_usuario, id_viaje, id_vehiculo }) 
         id_conductor,
         fecha_programada: { gte: limite },
       },
-      data: { estado: 'CONFIRMADO', id_vehiculo, fecha_confirmacion: ahora },
+      data: { estado: 'CONFIRMADO', id_vehiculo, fecha_confirmacion: ahora, vehiculo_snapshot },
     });
     if (r.count === 0) throw conflicto();
   });
@@ -830,7 +926,8 @@ export async function salirDeParada({ io, id_usuario, id_viaje }) {
       salida_real: cierre.salida.fecha,
       origen_salida: cierre.salida.origen,
       viaje_finalizado: true,
-      precio_real: cierre.precio_real,
+      // Sin precio_real: el chofer no ve precios de un viaje de PyME (lo ve la
+      // PyME en viaje:finalizado y en el detalle).
       remito_url: cierre.remito_url,
       estimado: cierre.estimado,
       real: cierre.real,
@@ -893,6 +990,27 @@ export async function salirDeParada({ io, id_usuario, id_viaje }) {
   };
 }
 
+// Distancia GPS del tramo que termina en `parada`: lo medido hasta la llegada
+// menos lo medido hasta la salida de la anterior (los puntos de medicion de
+// Redis, gps.service.medicionesHasta). Se lee al confirmar la llegada: CERO
+// queries por ping. null si la anterior no salio, si no hubo pings o si Redis
+// falla (no traba la confirmacion).
+async function distanciaGpsTramo(id_viaje, paradas, parada, llegada) {
+  const anterior = paradas.filter((p) => p.orden < parada.orden).at(-1);
+  if (!anterior?.salida_real) return null;
+  try {
+    const [desde, hasta] = await Promise.all([
+      medicionesHasta(id_viaje, anterior.salida_real),
+      medicionesHasta(id_viaje, llegada),
+    ]);
+    if (hasta.sin_pings) return null;
+    return Math.max(0, hasta.distancia_km - desde.distancia_km);
+  } catch (err) {
+    console.error(`[viaje-interno] no se pudo medir el tramo de la parada ${parada.id_parada}: ${err.message}`);
+    return null;
+  }
+}
+
 // Confirmar la llegada a una parada de un viaje INTERNO. La llama
 // POST /api/viajes/:id/confirmar-parada despues de sus validaciones comunes
 // (viaje 404, chofer 403, parada ajena 400, ya confirmada 400). Aca, en este
@@ -924,6 +1042,7 @@ export async function confirmarParadaInterna({ io, viaje, parada, id_usuario, la
   validarTransicion('EN_RUTA', 'DESCARGANDO', { ciclo: 'INTERNO', quien: 'CHOFER' });
 
   const ahora = new Date();
+  const distancia_real_km = await distanciaGpsTramo(viaje.id_viaje, paradas, parada, ahora);
   await transaccion(async (tx) => {
     const r = await tx.viaje.updateMany({
       where: { id_viaje: viaje.id_viaje, estado: 'EN_RUTA', id_conductor: viaje.id_conductor },
@@ -949,6 +1068,9 @@ export async function confirmarParadaInterna({ io, viaje, parada, id_usuario, la
         fecha_entrega: ahora,
         estado: 'ENTREGADO',
         manejo_real_horas: (ahora.getTime() - anterior.salida_real.getTime()) / HORA_MS,
+        // Distancia GPS del tramo que termina aca. Una sola escritura por parada:
+        // va en este updateMany condicionado a llegada_real null.
+        distancia_real_km,
       },
     });
     if (p.count === 0) throw conflicto();
@@ -1041,7 +1163,7 @@ async function cancelar({ io, viaje, quien, id_usuario, motivo }) {
   // cierra en este instante para el calculo). ANTES de limpiar Redis: la
   // distancia real sale del acumulado GPS. Nunca tira.
   if (ESTADOS_CURSO_INTERNO.includes(estado_anterior)) {
-    await guardarMedicionParcial(id_viaje, ahora);
+    await guardarMedicionParcial(id_viaje, ahora, { id_usuario });
   }
   await limpiarViajeActivo(id_viaje);
 
@@ -1180,6 +1302,7 @@ export async function reasignarViaje({ io, id_organizacion, id_usuario, id_viaje
         estado: 'ASIGNADO',
         id_conductor,
         id_vehiculo: null,
+        vehiculo_snapshot: Prisma.DbNull,
         fecha_confirmacion: null,
         metodo_cobro: vinculo.metodo_cobro,
       },
@@ -1211,12 +1334,7 @@ export async function reasignarViaje({ io, id_organizacion, id_usuario, id_viaje
     'viaje:desasignado',
     { id_viaje, id_organizacion, motivo: 'reasignado' }
   );
-  emitirViajeInterno(
-    io,
-    { id_organizacion, id_usuario_chofer: actualizado.conductor.usuario.id_usuario },
-    'viaje:asignado',
-    resumenViaje(actualizado)
-  );
+  emitirResumen(io, actualizado, 'viaje:asignado', {}, actualizado.conductor.usuario.id_usuario);
 
   return serializarViajePyme(actualizado);
 }
@@ -1248,26 +1366,70 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
   const paradasNuevas = datos.paradas ? await resolverParadas(id_organizacion, datos.paradas) : null;
   const paradas =
     paradasNuevas ??
-    viaje.paradas.map((p) => ({ lat: p.latitud, lng: p.longitud, direccion: p.direccion }));
+    viaje.paradas.map((p) => ({
+      lat: p.latitud,
+      lng: p.longitud,
+      direccion: p.direccion,
+      acceso: p.acceso ?? null,
+      pisos: p.pisos ?? null,
+      operacion: p.operacion ?? null,
+    }));
   const fecha_programada = datos.fecha_programada
     ? new Date(datos.fecha_programada)
     : viaje.fecha_programada;
 
-  // Precio, zona, duracion (manejo + peon) y ruta se recalculan si cambian las
-  // paradas o la fecha (la fecha define la hora pico y el trafico de cada
-  // tramo). Mismo calculo que al crear, ANTES de la tx: si Google falla,
-  // ErrorMaps y no se modifica nada.
+  // Precio v2: lo declarado RESULTANTE (lo guardado + lo que llega; null en el
+  // body borra lo declarado) y sus reglas sobre las paradas resultantes.
+  const declarados = declaradosDe(viaje);
+  for (const c of CAMPOS_DECLARADOS) if (datos[c] !== undefined) declarados[c] = datos[c];
+  const cambiaDeclarado = CAMPOS_DECLARADOS.some((c) => datos[c] !== undefined);
+  exigirDatosPrecio({ ...declarados, paradas });
+
+  // Se recalcula el precio si cambian las paradas, la fecha o cualquier dato de
+  // la Parte B, y siempre si el viaje es v1 (este codigo lo deja en v2). Google
+  // solo si cambian paradas o fecha (la fecha define el trafico de cada tramo)
+  // o si el viaje no tiene estimados guardados; si no, el precio sale de los
+  // estimados de la fila. Todo ANTES de la tx: si Google falla, ErrorMaps y no
+  // se modifica nada. La duracion y la ruta solo cambian con Google.
+  // PEAJES de Google: se vuelven a pedir SOLO si cambian paradas o fecha (UNA
+  // llamada Enterprise o el cache; nunca bloquea). Si no, salen de la fila
+  // (peajes_google_ida / _incompleto): un cambio de tipo_servicio recalcula el
+  // monto con el multiplicador nuevo sin llamar a Google.
+  const cambiaRecorrido = Boolean(datos.paradas || datos.fecha_programada);
+  const necesitaGoogle =
+    cambiaRecorrido || viaje.manejo_estimado_horas == null || viaje.distancia_estimada_km == null;
+  const recalcular = necesitaGoogle || cambiaDeclarado || !esV2(viaje);
   let costo = {};
   let recorrido = null;
-  if (datos.paradas || datos.fecha_programada) {
-    const resultado = await estimarCosto({ paradas, fecha_programada: fecha_programada.toISOString() });
-    recorrido = resultado.recorrido;
+  let precio = null;
+  // Solo con peajes NUEVOS de Google se reescriben los tramos de las paradas.
+  let tramosPeajes = null;
+  if (recalcular) {
+    const facturaAOrganizacion = await facturaAPorDefecto(id_organizacion);
+    let zona;
+    if (necesitaGoogle) {
+      const estimacion = await estimarPrecioInterno({
+        paradas,
+        fecha_programada: fecha_programada.toISOString(),
+        declarados,
+        facturaAOrganizacion,
+        ...(cambiaRecorrido ? {} : { peajesGoogle: peajesGoogleDeViaje(viaje) }),
+      });
+      ({ zona, recorrido, precio } = estimacion);
+      if (cambiaRecorrido) tramosPeajes = estimacion.peajes.tramos ?? [];
+    } else {
+      zona = clasificarZona(paradas);
+      precio = precioV2DesdeRecorrido({
+        paradas,
+        totales: { manejo_horas: viaje.manejo_estimado_horas, distancia_km: viaje.distancia_estimada_km },
+        declarados,
+        facturaAOrganizacion,
+        peajesGoogle: peajesGoogleDeViaje(viaje),
+      });
+    }
     costo = {
-      zona: resultado.zona,
-      tarifa_hora: resultado.desglose.tarifa_hora,
-      tarifa_km: resultado.desglose.tarifa_km,
-      precio_estimado: resultado.precio_estimado,
-      ...columnasEstimadasViaje(recorrido.totales),
+      ...columnasPrecioV2(precio, zona, declarados),
+      ...(recorrido ? columnasEstimadasViaje(recorrido.totales) : {}),
     };
   }
 
@@ -1280,6 +1442,7 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
       data: {
         estado: 'ASIGNADO',
         id_vehiculo: null,
+        vehiculo_snapshot: Prisma.DbNull,
         fecha_confirmacion: null,
         fecha_programada,
         ...(datos.motivo !== undefined ? { motivo: datos.motivo } : {}),
@@ -1292,7 +1455,7 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
     if (paradasNuevas) {
       await tx.parada.deleteMany({ where: { id_viaje } });
       await tx.parada.createMany({
-        data: conEstimacionPorParada(paradasParaCrear(paradasNuevas), recorrido).map((p) => ({
+        data: conEstimacionPorParada(paradasParaCrear(paradasNuevas), recorrido, tramosPeajes).map((p) => ({
           ...p,
           id_viaje,
         })),
@@ -1306,7 +1469,10 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
       for (const [i, p] of actuales.entries()) {
         await tx.parada.update({
           where: { id_parada: p.id_parada },
-          data: columnasEstimadasParada(recorrido.paradas[i]),
+          data: {
+            ...columnasEstimadasParada(recorrido.paradas[i]),
+            ...(tramosPeajes ? { peajes_google_tramo: tramosPeajes[i] ?? null } : {}),
+          },
         });
       }
     }
@@ -1322,6 +1488,8 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
     });
   }
 
+  if (precio) await registrarHistorialPrecio(filaHistorial({ id_viaje, motivo: 'EDITAR', id_usuario }, precio));
+
   // La ruta de la estimacion nueva (sin otra llamada a Google).
   if (recorrido) await guardarRutaSinTirar(id_viaje, recorrido.polilinea);
 
@@ -1329,15 +1497,13 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
   programarVencimientoInterno(io, id_viaje, fecha_programada);
 
   const actualizado = await leerViaje(id_viaje);
-  emitirViajeInterno(
+  emitirResumen(
     io,
-    { id_viaje, id_organizacion, id_usuario_chofer: viaje.conductor?.id_usuario },
+    actualizado,
     'viaje:editado',
-    {
-      ...resumenViaje(actualizado),
-      // true si estaba CONFIRMADO: el chofer tiene que volver a confirmar.
-      confirmacion_anulada: estado_anterior === 'CONFIRMADO',
-    }
+    // true si estaba CONFIRMADO: el chofer tiene que volver a confirmar.
+    { confirmacion_anulada: estado_anterior === 'CONFIRMADO' },
+    viaje.conductor?.id_usuario
   );
 
   return {

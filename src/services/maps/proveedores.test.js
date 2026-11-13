@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import * as routes from './routes.js';
 import * as legacy from './legacy.js';
 import { ErrorMaps } from './comun.js';
-import { calcularTramo, calcularEta, calcularRuta, estadisticasMaps } from './index.js';
+import { calcularTramo, calcularEta, calcularRuta, calcularPeajes, estadisticasMaps } from './index.js';
 
 const A = { lat: -34.6037, lng: -58.3816 };
 const B = { latitud: -34.6098, longitud: -58.3925 };
@@ -18,7 +18,7 @@ describe('routes.js — pedidos', () => {
     expect(p.url).not.toContain('K');
     expect(p.init.headers['X-Goog-Api-Key']).toBe('K');
     expect(p.init.headers['X-Goog-FieldMask']).toBe(
-      'routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline'
+      'routes.duration,routes.staticDuration,routes.distanceMeters,routes.polyline.encodedPolyline'
     );
     expect(body.routingPreference).toBe('TRAFFIC_AWARE');
     expect(body.departureTime).toBe(salida.toISOString());
@@ -49,6 +49,43 @@ describe('routes.js — pedidos', () => {
   });
 });
 
+describe('routes.js — peajes (Enterprise)', () => {
+  const C = { lat: -34.9214, lng: -57.9545 };
+
+  it('UNA llamada: origen, intermedios y destino; TOLLS, AR_TELEPASE, TRAFFIC_AWARE y FieldMask solo de tollInfo', () => {
+    const salida = new Date(AHORA.getTime() + 3600_000);
+    const p = routes.pedidoPeajes({ puntos: [A, B, C], salida, ahora: AHORA, apiKey: 'K' });
+    const body = JSON.parse(p.init.body);
+    expect(p.sku).toBe('ENTERPRISE');
+    expect(p.url).not.toContain('K');
+    expect(p.init.headers['X-Goog-FieldMask']).toBe('routes.travelAdvisory.tollInfo,routes.legs.travelAdvisory.tollInfo');
+    expect(body.travelMode).toBe('DRIVE');
+    expect(body.routingPreference).toBe('TRAFFIC_AWARE');
+    expect(body.extraComputations).toEqual(['TOLLS']);
+    expect(body.routeModifiers).toEqual({ tollPasses: ['AR_TELEPASE'] });
+    expect(body.departureTime).toBe(salida.toISOString());
+    expect(body.origin.location.latLng).toEqual({ latitude: A.lat, longitude: A.lng });
+    expect(body.intermediates).toHaveLength(1);
+    expect(body.intermediates[0].location.latLng).toEqual({ latitude: B.latitud, longitude: B.longitud });
+    expect(body.destination.location.latLng).toEqual({ latitude: C.lat, longitude: C.lng });
+  });
+
+  it('dos paradas: sin intermediates; salida pasada o inminente sin departureTime', () => {
+    for (const ms of [-60_000, 0, 30_000]) {
+      const body = JSON.parse(
+        routes.pedidoPeajes({ puntos: [A, C], salida: new Date(AHORA.getTime() + ms), ahora: AHORA, apiKey: 'K' }).init.body
+      );
+      expect(body.intermediates).toBeUndefined();
+      expect(body.departureTime).toBeUndefined();
+    }
+  });
+
+  it('leerPeajes: routes vacio -> SIN_RUTA; si no, el parseo', () => {
+    expect(() => routes.leerPeajes({ routes: [] })).toThrow(expect.objectContaining({ tipo: 'SIN_RUTA' }));
+    expect(routes.leerPeajes({ routes: [{ legs: [{}] }] })).toEqual({ ida: 0, incompleto: false, tramos: [null, 0] });
+  });
+});
+
 describe('routes.js — respuestas', () => {
   it('tramo: duracion, distancia y polilinea [lng, lat]', () => {
     const r = routes.leerTramo({
@@ -57,6 +94,12 @@ describe('routes.js — respuestas', () => {
     expect(r.manejo_horas).toBeCloseTo(658 / 3600, 10);
     expect(r.distancia_km).toBeCloseTo(2.418, 10);
     expect(r.polilinea[0]).toEqual([-120.2, 38.5]);
+    expect(r.manejo_sin_transito_horas).toBeNull();
+  });
+
+  it('tramo: staticDuration = manejo sin transito', () => {
+    const r = routes.leerTramo({ routes: [{ duration: '5057s', staticDuration: '4883s', distanceMeters: 68270 }] });
+    expect(r.manejo_sin_transito_horas).toBeCloseTo(4883 / 3600, 10);
   });
 
   it('distanceMeters omitido (0 en proto3) -> 0 km', () => {
@@ -92,6 +135,7 @@ describe('legacy.js (rollback)', () => {
       ],
     });
     expect(r.manejo_horas).toBeCloseTo(720 / 3600, 10);
+    expect(r.manejo_sin_transito_horas).toBeCloseTo(500 / 3600, 10);
     expect(r.distancia_km).toBe(3);
   });
 
@@ -159,8 +203,39 @@ describe('index.js — errores de la capa', () => {
     const antes = estadisticasMaps().por_sku.PRO ?? 0;
     vi.stubGlobal('fetch', vi.fn(async () => respuesta(200, { routes: [{ duration: '60s', distanceMeters: 1000 }] })));
     const r = await tramo();
-    expect(r).toEqual({ distancia_km: 1, manejo_horas: 60 / 3600, polilinea: [] });
+    expect(r).toEqual({ distancia_km: 1, manejo_horas: 60 / 3600, manejo_sin_transito_horas: null, polilinea: [] });
     expect(estadisticasMaps().por_sku.PRO).toBe(antes + 1);
+  });
+
+  it('peajes: OK cuenta ENTERPRISE y loguea la operacion "peajes"', async () => {
+    const antes = estadisticasMaps().por_sku.ENTERPRISE ?? 0;
+    const cuerpo = {
+      routes: [
+        {
+          travelAdvisory: { tollInfo: { estimatedPrice: [{ currencyCode: 'ARS', units: '5187', nanos: 60000000 }] } },
+          legs: [{ travelAdvisory: { tollInfo: { estimatedPrice: [{ currencyCode: 'ARS', units: '5187', nanos: 60000000 }] } } }],
+        },
+      ],
+    };
+    vi.stubGlobal('fetch', vi.fn(async () => respuesta(200, cuerpo)));
+    const r = await calcularPeajes({ puntos: [A, B], salida: AHORA, ahora: AHORA });
+    expect(r).toEqual({ ida: 5187, incompleto: false, tramos: [null, 5187] });
+    expect(estadisticasMaps().por_sku.ENTERPRISE).toBe(antes + 1);
+    expect(console.log.mock.calls.flat().join(' ')).toMatch(/\[maps\] routes peajes 200 /);
+  });
+
+  it('peajes con MAPS_PROVIDER=legacy: tira sin llamar a Google', async () => {
+    const original = process.env.MAPS_PROVIDER;
+    process.env.MAPS_PROVIDER = 'legacy';
+    const fetchFalso = vi.fn();
+    vi.stubGlobal('fetch', fetchFalso);
+    try {
+      expect(() => calcularPeajes({ puntos: [A, B], salida: AHORA })).toThrow(ErrorMaps);
+      expect(fetchFalso).not.toHaveBeenCalled();
+    } finally {
+      if (original === undefined) delete process.env.MAPS_PROVIDER;
+      else process.env.MAPS_PROVIDER = original;
+    }
   });
 
   it('nunca loguea la key', async () => {

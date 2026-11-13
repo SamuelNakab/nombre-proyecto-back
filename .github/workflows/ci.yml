@@ -50,12 +50,12 @@ jobs:
       - name: Esperar a que staging tenga el deploy nuevo
         run: |
           for i in $(seq 1 30); do
-            if curl -fsS "$TEST_API_URL/health" | grep -q '"viaje-interno"'; then
+            if curl -fsS "$TEST_API_URL/health" | grep -q '"peajes-google"'; then
               echo "staging tiene el deploy nuevo"; exit 0
             fi
             echo "intento $i/30: staging todavia no tiene el deploy nuevo"; sleep 10
           done
-          echo "::error::staging no tiene el deploy nuevo (5 min sin capacidad viaje-interno en /health)"
+          echo "::error::staging no tiene el deploy nuevo (5 min sin capacidad peajes-google en /health)"
           exit 1
         env:
           TEST_API_URL: ${{ secrets.TEST_API_URL }}

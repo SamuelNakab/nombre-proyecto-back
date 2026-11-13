@@ -8,6 +8,7 @@ import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
 import { configurarCors } from './config/cors.js';
+import { advertirConfigPrecio } from './config/precio.js';
 import { limitarGeneral } from './middlewares/rate-limit.middleware.js';
 import { manejarErrores, rutaNoEncontrada } from './middlewares/errores.middleware.js';
 import { saltosProxy } from './sockets/limite-handshake.js';
@@ -35,11 +36,13 @@ instalarManejadoresProceso();
 const app = express();
 
 // La IP real del cliente detras del proxy de Railway (TRUST_PROXY saltos, default
-// 1: el proxy AGREGA la IP que vio al final de X-Forwarded-For). La usan el rate
-// limit y el canje de codigos.
+// 2: Railway pone dos saltos y cada proxy AGREGA la IP que vio al final de
+// X-Forwarded-For). La usan el rate limit y el canje de codigos.
 app.set('trust proxy', saltosProxy());
 
 const corsConfig = configurarCors();
+// Precio v2: un warning por cada PRECIO_* / FEEDBACK_* invalida (se usa el default).
+advertirConfigPrecio();
 
 // API JSON: CSP que no permite cargar nada ni embeber la API en un iframe.
 app.use(
@@ -56,7 +59,9 @@ app.use(cors(corsConfig.express));
 // ruta nueva no sirve de sonda: todo /api/organizaciones/* da 401 sin token
 // tambien en el codigo viejo). Para una capacidad futura: sumar el string aca y
 // buscarlo en el poll de ci.yml.
-const CAPACIDADES = ['viaje-interno'];
+// 'peajes-google': peajes de Google en el precio v2 (el simulador del front los
+// chequea en la respuesta de crear).
+const CAPACIDADES = ['viaje-interno', 'peajes-google'];
 
 // /health NO toca la base (UptimeRobot lo consulta cada 5 minutos y Neon tiene que
 // poder dormirse) y queda FUERA del rate limit. `version` = commit corto del deploy

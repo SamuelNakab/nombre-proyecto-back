@@ -42,6 +42,9 @@ const schemaEditar = z
     cuit: textoRequerido('cuit').optional(),
     razon_social: z.string().trim().min(1).nullable().optional(),
     direccion: z.string().trim().min(1).nullable().optional(),
+    // Precio v2: factura A por defecto de los viajes que no la declaran. null
+    // la borra (el calculo usa false).
+    factura_a_por_defecto: z.boolean().nullable().optional(),
   })
   .refine((d) => Object.values(d).some((v) => v !== undefined), {
     message: 'Mandá al menos un campo para editar',

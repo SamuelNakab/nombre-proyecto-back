@@ -15,7 +15,7 @@
 import prisma from '../config/prisma.js';
 import { ErrorNegocio } from './error-negocio.js';
 import { OPCIONES_TX, exigirPymeOperativa } from './organizacion.service.js';
-import { snapshotParadas } from './viaje-validacion.js';
+import { snapshotParadas, faltanPisos, MENSAJE_PISOS } from './viaje-validacion.js';
 
 const MENSAJE_SUSPENDIDA = 'La PyME esta suspendida: no puede crear ni modificar lugares';
 
@@ -30,6 +30,8 @@ export function serializarLugar(l) {
     direccion: l.direccion,
     lat: l.latitud,
     lng: l.longitud,
+    acceso_por_defecto: l.acceso_por_defecto ?? null,
+    pisos_por_defecto: l.pisos_por_defecto ?? null,
     activo: l.activo,
     creado_en: l.creado_en,
     actualizado_en: l.actualizado_en,
@@ -82,6 +84,8 @@ export async function crearLugar({ id_organizacion, id_usuario, datos }) {
         direccion: datos.direccion.trim(),
         latitud: datos.lat,
         longitud: datos.lng,
+        acceso_por_defecto: datos.acceso_por_defecto ?? null,
+        pisos_por_defecto: datos.pisos_por_defecto ?? null,
       },
     });
   }, OPCIONES_TX);
@@ -90,13 +94,20 @@ export async function crearLugar({ id_organizacion, id_usuario, datos }) {
 
 export async function editarLugar({ id_organizacion, id_lugar, datos }) {
   await exigirPymeOperativa(id_organizacion, MENSAJE_SUSPENDIDA);
-  await lugarActivo(id_organizacion, id_lugar);
+  const actual = await lugarActivo(id_organizacion, id_lugar);
+
+  // Estado resultante: pisos obligatorio si el acceso queda ESCALERA / ASCENSOR.
+  const acceso = datos.acceso_por_defecto !== undefined ? datos.acceso_por_defecto : actual.acceso_por_defecto;
+  const pisos = datos.pisos_por_defecto !== undefined ? datos.pisos_por_defecto : actual.pisos_por_defecto;
+  if (faltanPisos(acceso, pisos)) throw new ErrorNegocio(400, MENSAJE_PISOS);
 
   const data = {};
   if (datos.nombre !== undefined) data.nombre = normalizarNombreLugar(datos.nombre);
   if (datos.direccion !== undefined) data.direccion = datos.direccion.trim();
   if (datos.lat !== undefined) data.latitud = datos.lat;
   if (datos.lng !== undefined) data.longitud = datos.lng;
+  if (datos.acceso_por_defecto !== undefined) data.acceso_por_defecto = datos.acceso_por_defecto;
+  if (datos.pisos_por_defecto !== undefined) data.pisos_por_defecto = datos.pisos_por_defecto;
 
   await prisma.$transaction(async (tx) => {
     if (data.nombre !== undefined) await exigirNombreLibre(tx, id_organizacion, data.nombre, id_lugar);

@@ -1,7 +1,7 @@
 // CAPA UNICA DE GOOGLE. Es el UNICO modulo del backend que habla con Google
 // Maps: nadie mas hace fetch a routes.googleapis.com ni a maps.googleapis.com.
 //
-// Tres operaciones:
+// Cuatro operaciones:
 //   - calcularTramo: un tramo origen -> destino saliendo a una hora dada, con
 //     trafico. Distancia, manejo y polilinea. Lo usa la estimacion (crear,
 //     editar, estimar-costo). SKU Pro.
@@ -10,6 +10,9 @@
 //   - calcularRuta: una ruta por N puntos en UNA llamada, sin trafico. La usan
 //     el recalculo por desvio y el fallback de ruta de gps.socket. SKU
 //     Essentials (Pro con mas de 10 intermedios).
+//   - calcularPeajes: los peajes de todo el viaje (TOLLS) en UNA llamada. La
+//     usa peajes.service (crear, serie, editar, estimar-precio). SKU Enterprise.
+//     Si falla, el caller NO bloquea el estimado (a diferencia de los tramos).
 //
 // REGLA: NUNCA devuelve valores inventados. Si Google falla tira ErrorMaps:
 // NO_DISPONIBLE (503) o SIN_RUTA (400). Cada caller decide: crear / editar /
@@ -93,7 +96,8 @@ async function llamar(operacion, datos) {
   }
 }
 
-// { origen, destino, salida: Date, ahora?: Date } -> { distancia_km, manejo_horas, polilinea }
+// { origen, destino, salida: Date, ahora?: Date }
+//   -> { distancia_km, manejo_horas, manejo_sin_transito_horas, polilinea }
 export function calcularTramo({ origen, destino, salida, ahora = new Date() }) {
   return llamar('tramo', { origen, destino, salida, ahora });
 }
@@ -101,6 +105,19 @@ export function calcularTramo({ origen, destino, salida, ahora = new Date() }) {
 // { origen, destino } -> { segundos, distancia_metros }
 export function calcularEta({ origen, destino }) {
   return llamar('eta', { origen, destino });
+}
+
+// Peajes de un viaje completo: UNA llamada Enterprise (Routes, TOLLS). Solo con
+// MAPS_PROVIDER=routes: legacy no implementa esta operacion (el caller,
+// peajes.service, ni la llama).
+// { puntos: [parada, ...] (>= 2), salida: Date, ahora?: Date }
+//   -> { ida, incompleto, tramos }
+export function calcularPeajes({ puntos, salida, ahora = new Date() }) {
+  if (!Array.isArray(puntos) || puntos.length < 2) {
+    throw new Error('calcularPeajes: hacen falta al menos 2 puntos');
+  }
+  if (proveedorMaps() !== 'routes') throw noDisponible('peajes solo con MAPS_PROVIDER=routes');
+  return llamar('peajes', { puntos, salida, ahora });
 }
 
 // [punto, ...] (>= 2) -> [[lng, lat], ...]

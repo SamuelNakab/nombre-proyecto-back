@@ -23,7 +23,17 @@
 import prisma from '../config/prisma.js';
 import { ErrorNegocio } from './error-negocio.js';
 import { ErrorMaps } from './maps/comun.js';
-import { estimarCosto } from './costo.service.js';
+import {
+  estimarPrecioInterno,
+  peajesDeEstimacion,
+  columnasPrecioV2,
+  exigirDatosPrecio,
+  facturaAPorDefecto,
+  filaHistorial,
+  registrarHistorialPrecio,
+} from './precio.service.js';
+import { declaradosDe, CAMPOS_DECLARADOS } from './precio-entradas.js';
+import { resumenVistaChofer } from './vista-chofer.js';
 import { columnasEstimadasViaje, conEstimacionPorParada } from './estimacion.service.js';
 import { paradasParaCrear, anticipacionMinimaMinutos } from './viaje-validacion.js';
 import { resolverParadas } from './lugar.service.js';
@@ -35,14 +45,14 @@ import {
   guardarRutaSinTirar,
   resumenViaje,
   serializarViajePyme,
-  INCLUDE_VIAJE_INTERNO,
+  INCLUDE_VIAJE_PYME,
 } from './viaje-interno.service.js';
 import { registrarCambiosEstado } from './historial-estado.service.js';
 import { ORIGEN_HISTORIAL } from './estado-viaje.service.js';
 import { programarVencimientoInterno, vencerSiCorresponde } from './vencimiento.service.js';
 import { generarOcurrencias, resolverVentana, ZONA_HORARIA } from './serie-fechas.js';
 import { ejecutarConLimite } from './limite-concurrencia.js';
-import { emitirViajeInterno } from '../sockets/salas.js';
+import { emitirViajeInterno, emitirViajeInternoDividido } from '../sockets/salas.js';
 
 // ─── Configuracion ───────────────────────────────────────────────────────────
 
@@ -127,6 +137,8 @@ export function serializarSerie(serie, lugares = new Map()) {
     // series_viaje.condiciones queda en su default [] sin uso).
     motivo: serie.motivo ?? null,
     descripcion: serie.descripcion,
+    // Precio v2: lo declarado (null = no declarado), copiado a cada viaje.
+    ...Object.fromEntries(CAMPOS_DECLARADOS.map((c) => [c, serie[c] ?? null])),
     estado: serie.estado,
     fecha_baja: serie.fecha_baja,
     creado_en: serie.creado_en,
@@ -156,8 +168,15 @@ export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
 
   await validarChoferAsignable(id_organizacion, id_conductor);
 
-  // Plantilla: { id_lugar } -> snapshot de direccion y coordenadas.
+  // Plantilla: { id_lugar } -> snapshot de direccion y coordenadas (y del acceso
+  // por defecto del lugar).
   const paradas = await resolverParadas(id_organizacion, datos.paradas);
+
+  // Precio v2: lo declarado se valida una vez y se copia a la serie y a cada
+  // viaje. La factura A por defecto de la PyME se resuelve una vez.
+  const declarados = declaradosDe(datos);
+  exigirDatosPrecio({ ...declarados, paradas });
+  const facturaAOrganizacion = await facturaAPorDefecto(id_organizacion);
 
   const { ocurrencias, salteadas } = generarOcurrencias({
     frecuencia,
@@ -176,6 +195,11 @@ export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
     });
   }
 
+  // PEAJES: UNA sola llamada Enterprise por serie (con la salida de la PRIMERA
+  // ocurrencia), en paralelo con los tramos. La MISMA promesa va a todas las
+  // estimaciones: el resultado se copia a todos los viajes. Nunca tira.
+  const peajesSerie = peajesDeEstimacion({ paradas, fecha_programada: ocurrencias[0].fecha_programada.toISOString() });
+
   // Estimaciones: TODAS antes de escribir nada. Cada una con SU fecha (trafico y
   // hora pico propios). Si cualquiera falla, sale su error y no se crea nada.
   const tEstimacion = Date.now();
@@ -183,7 +207,14 @@ export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
   const estimaciones = await ejecutarConLimite(
     ocurrencias,
     serieConcurrenciaMaps(),
-    (o) => estimarCosto({ paradas, fecha_programada: o.fecha_programada.toISOString() }),
+    (o) =>
+      estimarPrecioInterno({
+        paradas,
+        fecha_programada: o.fecha_programada.toISOString(),
+        declarados,
+        facturaAOrganizacion,
+        peajesGoogle: peajesSerie,
+      }),
     {
       deadlineMs: timeoutMs,
       errorDeadline: () => new ErrorMaps('NO_DISPONIBLE', { detalle: `serie: se supero el limite de ${timeoutMs}ms` }),
@@ -198,6 +229,9 @@ export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
     lat: p.latitud,
     lng: p.longitud,
     id_lugar: p.id_lugar,
+    acceso: p.acceso,
+    pisos: p.pisos,
+    operacion: p.operacion,
   }));
 
   const tTx = Date.now();
@@ -222,6 +256,7 @@ export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
         paradas: plantilla,
         motivo,
         descripcion,
+        ...declarados,
       },
       select: { id_serie: true },
     });
@@ -237,14 +272,12 @@ export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
           id_conductor,
           id_serie: serie.id_serie,
           metodo_cobro: vinculo.metodo_cobro,
-          zona: e.zona,
-          tarifa_hora: e.desglose.tarifa_hora,
-          tarifa_km: e.desglose.tarifa_km,
           fecha_programada: o.fecha_programada,
           // Copia de la serie: despues cada viaje se edita por su cuenta.
           motivo,
           descripcion,
-          precio_estimado: e.precio_estimado,
+          // Precio v2 con SU estimacion (y lo declarado de la serie).
+          ...columnasPrecioV2(e.precio, e.zona, declarados),
           ...columnasEstimadasViaje(e.recorrido.totales),
         };
       }),
@@ -265,7 +298,10 @@ export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
 
     await tx.parada.createMany({
       data: creados.flatMap((c) =>
-        conEstimacionPorParada(filasParada, c.estimacion.recorrido).map((p) => ({ ...p, id_viaje: c.id_viaje }))
+        conEstimacionPorParada(filasParada, c.estimacion.recorrido, c.estimacion.peajes.tramos).map((p) => ({
+          ...p,
+          id_viaje: c.id_viaje,
+        }))
       ),
     });
     return { id_serie: serie.id_serie, creados };
@@ -276,6 +312,10 @@ export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
   // vencimiento y la ruta de los que salen dentro de 24 h.
   await registrarCambiosEstado(
     creados.map((c) => ({ id_viaje: c.id_viaje, estado: 'ASIGNADO', id_usuario, origen: ORIGEN_HISTORIAL.PYME }))
+  );
+  // Un calculo de precio por viaje (CREAR), en lote. Nunca tira.
+  await registrarHistorialPrecio(
+    creados.map((c) => filaHistorial({ id_viaje: c.id_viaje, motivo: 'CREAR', id_usuario }, c.estimacion.precio))
   );
   for (const c of creados) {
     programarVencimientoInterno(io, c.id_viaje, c.fecha_programada);
@@ -288,18 +328,15 @@ export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
     prisma.serieViaje.findUnique({ where: { id_serie }, include: INCLUDE_SERIE }),
     prisma.viaje.findMany({
       where: { id_serie },
-      include: INCLUDE_VIAJE_INTERNO,
+      include: INCLUDE_VIAJE_PYME,
       orderBy: [{ fecha_programada: 'asc' }, { id_viaje: 'asc' }],
     }),
   ]);
 
-  // UN evento para toda la serie (no N viaje:asignado): al chofer y a la sala de
-  // la PyME. Las paradas van por resumenViaje: sin el nombre del lugar.
-  emitirViajeInterno(
-    io,
-    { id_organizacion, id_usuario_chofer: serie.conductor.usuario.id_usuario },
-    'serie:asignada',
-    {
+  // UN evento para toda la serie (no N viaje:asignado): a la sala de la PyME
+  // con precios y al chofer SIN precios. Las paradas van por resumenViaje: sin el
+  // nombre del lugar.
+  const evento = {
       id_serie,
       id_organizacion,
       organizacion: viajes[0].organizacion
@@ -312,13 +349,19 @@ export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
       fecha_hasta: fechaTexto(serie.fecha_hasta),
       cantidad_viajes: viajes.length,
       viajes: viajes.map(resumenViaje),
-    }
+  };
+  emitirViajeInternoDividido(
+    io,
+    { id_organizacion, id_usuario_chofer: serie.conductor.usuario.id_usuario },
+    'serie:asignada',
+    evento,
+    { ...evento, viajes: evento.viajes.map(resumenVistaChofer) }
   );
 
   const llamadas = ocurrencias.length * (paradas.length - 1);
   console.log(
     `[series] serie ${id_serie}: ${viajes.length} viajes, ${llamadas} llamadas Pro, ` +
-      `estimacion ${msEstimacion}ms, tx ${msTx}ms, total ${Date.now() - t0}ms`
+      `estimacion ${msEstimacion}ms, tx ${msTx}ms, total ${Date.now() - t0}ms, peajes ${estimaciones[0].peajes.origen}`
   );
 
   return {
@@ -360,7 +403,7 @@ export async function obtenerSerie(io, id_organizacion, id_serie) {
   const serie = await serieDeOrganizacion(id_organizacion, id_serie);
   const viajes = await prisma.viaje.findMany({
     where: { id_serie, id_organizacion },
-    include: INCLUDE_VIAJE_INTERNO,
+    include: INCLUDE_VIAJE_PYME,
     orderBy: [{ fecha_programada: 'asc' }, { id_viaje: 'asc' }],
   });
   return {

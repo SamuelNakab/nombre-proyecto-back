@@ -8,6 +8,7 @@ import {
   obtenerEstadisticas,
   cancelarViaje,
 } from '../controllers/admin.controller.js';
+import { datasetPrecios } from '../controllers/admin-precios.controller.js';
 
 const router = Router();
 
@@ -20,5 +21,7 @@ router.get('/viajes', listarViajes);
 router.get('/viajes/:id', obtenerViaje);
 router.get('/estadisticas', obtenerEstadisticas);
 router.post('/viajes/:id/cancelar', cancelarViaje);
+// Precio v2: dataset para recalibrar (viajes v2 finalizados), JSON o CSV.
+router.get('/precios/dataset', datasetPrecios);
 
 export default router;

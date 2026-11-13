@@ -1107,8 +1107,8 @@ rol a nivel de ruta: la validación real es la tabla de arriba.
 > `null` porque el viaje todavía no arrancó.
 >
 > | `duracion_estimada` | **minutos**, entero | Mostrarle la duración al usuario |
-> | `duracion_estimada_horas` | **horas**, float | La columna cruda; es el input del cálculo de precio |
-> | `desglose_estimado.tiempo_horas` (en `POST /api/viajes`) | **horas**, float | El mismo valor que `duracion_estimada_horas` |
+> | `duracion_estimada_horas` | **horas**, float | La columna cruda: el TOTAL estimado (manejo + peón). **No** es input del precio: la v1 usa solo el manejo y la v2 el manejo + 15 min por parada |
+> | `desglose_estimado.tiempo_horas` (en `POST /api/viajes`) | **horas**, float | El MANEJO estimado (el input del precio legacy); no coincide con `duracion_estimada_horas` |
 > | `duracion_real` (en `mis-viajes`) | **minutos**, entero | Duración efectiva del viaje ya cerrado |
 >
 > Regla: **todo lo que se llama `duracion_*` (sin sufijo `_horas`) va en minutos enteros.** Todo
@@ -1700,6 +1700,10 @@ decir mientras está en `BUSCANDO_CONDUCTOR` (todavía nadie lo aceptó) o `COND
 
 ### GET /api/viajes/:id/costo-acumulado
 
+> **Precio v2:** este cálculo es el mismo que usa la PyME (elige v1 o v2 por `version_precio`) y
+> suma `version_precio`. En un **viaje de PyME** este endpoint responde **403** al chofer (el único
+> que pasaba el control de acceso): el chofer no ve precios. Ver [Precio v2](#precio-v2).
+
 Devuelve el costo acumulado del viaje en curso calculado a partir de los datos GPS en Redis.
 
 **Quién puede llamarlo.** Misma regla de acceso que
@@ -1867,6 +1871,11 @@ socket.on('mapa:actualizar', (data) => {
 ---
 
 ### Evento: costo:actualizar
+
+> **Precio v2:** el cálculo es el mismo que `costo-acumulado` (se borró la fórmula inline que en
+> MIXTO cobraba tiempo total + distancia total) y suma `version_precio`. En un viaje v2 el
+> `desglose` es el v2 (sin `es_hora_pico`). En un **viaje de PyME** se emite **solo** a la sala
+> `organizacion:{id}`. Ver [Precio v2](#precio-v2).
 
 **Dirección:** servidor → room del viaje  
 **Quién lo recibe:** cliente y conductor conectados al room  
@@ -2507,6 +2516,10 @@ en la parada, se sube la variable.
 
 ### WebSocket — Evento: viaje:finalizado
 
+> **Precio v2:** en un **viaje de PyME** el payload con precio va **solo** a la sala de la PyME y
+> suma `version_precio` y `precio_pagado_pendiente: true` (en v2 el `desglose` es el v2); el chofer
+> lo recibe **sin** `precio_real` ni `desglose`. Ver [Precio v2](#precio-v2).
+
 > **Paso 3:** suma `estimado`, `real` y `paradas` (los tiempos de cada parada). Ver el payload real en
 > [eventos del viaje interno](#websocket--eventos-del-viaje-interno).
 
@@ -2625,6 +2638,9 @@ como el promedio de todos sus puntajes en DB.
 
 
 ### GET /api/viajes/:id/remito
+
+> **Precio v2:** el PDF de un **viaje de PyME** cerrado desde este cambio (v1 o v2) **no lleva
+> bloque de costo** (ni desglose ni TOTAL). El del marketplace no cambia. Ver [Precio v2](#precio-v2).
 
 
 Devuelve la URL pública del remito PDF del viaje. Solo disponible para viajes en estado
@@ -4069,6 +4085,12 @@ Ciclo nuevo del viaje: una **PyME** crea el viaje y lo asigna **directo** a un c
 chofer lo **confirma** (eligiendo con qué vehículo) o lo **rechaza**, lo **inicia en el origen** y lo
 ejecuta. Reemplaza al marketplace, que queda dormido (ver [Flags](#flags--lo-que-queda-dormido)).
 
+> **Precio v2:** el precio, los datos que declara la PyME (servicio, ayudantes, factura A, peajes,
+> carga, acceso por parada), `estimar-precio`, el feedback del precio pagado y lo que el chofer ya
+> **no** recibe (precios, tarifas, datos del creador) están en [Precio v2](#precio-v2). Donde los
+> ejemplos de esta sección muestran `precio_estimado` / `precio_real` / `desglose` al chofer o la
+> forma v1 del desglose, vale lo de esa sección.
+
 **Estados del ciclo:**
 
 ```
@@ -4970,6 +4992,9 @@ Emite `viaje:cancelado` al chofer y a la PyME.
 ---
 
 ### GET /api/organizaciones/:id/viajes/:idViaje/costo-acumulado
+
+> **Precio v2:** elige v1 o v2 por `version_precio` y suma `version_precio`; en v2 el `desglose` es
+> el v2 (reloj desde la llegada a la parada 1, km GPS con fallback). Ver [Precio v2](#precio-v2).
 
 Precio acumulado en vivo de un viaje en curso. Mismo cálculo y misma forma que
 [`GET /api/viajes/:id/costo-acumulado`](#get-apiviajesidcosto-acumulado). `404` si el viaje no es de la PyME.
@@ -6294,6 +6319,332 @@ formato que [`viaje:asignado`](#websocket--eventos-del-viaje-interno) (sin nombr
 
 `viaje:asignado`, `viaje:editado` y los demás eventos del viaje traen ahora `id_serie` (`null` si el
 viaje no es de una serie).
+
+---
+
+<a id="precio-v2"></a>
+## Precio v2 de los viajes de PyME
+
+El precio de los viajes **internos** (de PyME) pasa a la **v2**, calibrada con 52 presupuestos
+reales de fleteros. El marketplace (`POST /api/viajes`, `POST /api/viajes/estimar-costo`, el cierre
+legacy) **no cambia**: sigue con las tarifas por zona y hora pico.
+
+### Versión de cada viaje
+
+- `version_precio`: `2` en todo viaje creado o editado desde este cambio; `null` en los viajes
+  anteriores (v1). Un viaje se **cierra, se muestra en vivo y se calcula siempre con la versión
+  con la que se estimó**: un `null` sigue con la fórmula vieja hasta el final.
+- `precio_parametros`: el **snapshot** de todos los parámetros y entradas con los que se estimó.
+  El precio medido y el vivo usan ese snapshot: cambiar la configuración no altera viajes ya
+  creados.
+- Editar un viaje v1 lo pasa a v2 (se recalcula aunque solo cambie el motivo).
+
+### La fórmula
+
+```
+h         = max(horas mínimas del servicio, horas subidas a la fracción de 30 min)
+tiempo    = mínimo del servicio + (h - horas mínimas) × precio hora del servicio
+            (+ h × ayudantes × hora de ayudante, salvo EQUIPO)
+distancia = km de ida × precio por km
+precio    = max(tiempo, distancia)           régimen TIEMPO si distancia <= tiempo
++ 10 % del tiempo si hay parada fuera de CABA, régimen TIEMPO y no es CAMION
++ 25 % del tiempo si alguna parada tiene acceso por ESCALERA
++ 25.000 por cada parada después de la segunda
+IVA 21 % sobre ese subtotal si el viaje lleva factura A (los peajes NO llevan IVA)
+total = subtotal + IVA + peajes, redondeado a $1.000 (mitades hacia arriba)
+rango = total −20 % / +30 %, redondeados igual
+```
+
+Los valores son configurables (variables `PRECIO_*`, ver `.env.example`). Todo en **pesos
+enteros**.
+
+- **Estimado** (crear, editar, serie, estimar-precio): km de ida = suma de los tramos de Google
+  (sin vuelta); horas = manejo con tránsito + 15 min por parada.
+- **Medido** (al cerrar): horas = reloj real desde la llegada a la parada 1 hasta el instante de
+  corte (`fecha_corte_precio`); km = distancia GPS hasta el corte. Si el GPS no es confiable (menos
+  de 10 pings, o menos del 50 % de la distancia de referencia) se usa la estimada y el desglose lo
+  dice en `entradas.fuente_km`: `GPS`, `ESTIMADA`, o `ESTIMADA_PARCIAL` en un cierre incompleto
+  (no llegó a la última, o se canceló en curso), que usa solo los km estimados de los tramos hasta
+  la última parada a la que llegó. El precio nunca sale 0 por falta de GPS.
+- **En vivo** (`costo-acumulado` y `costo:actualizar`): la misma fórmula con lo medido hasta ahora
+  (fallback a la distancia estimada completa).
+
+**En v2, `precio_estimado` y `precio_real` incluyen el IVA (si hay factura A) y los peajes.** El
+subtotal sin IVA, el IVA y los peajes van separados en el desglose (`subtotal_sin_iva`, `iva`,
+`peajes`, `fuente_peajes`).
+
+### El desglose v2
+
+`desglose_estimado` (respuesta de crear), `precio_estimado_desglose` y `precio_medido_desglose`
+(columnas del viaje), `desglose` de `costo-acumulado`, `costo:actualizar` y `viaje:finalizado`:
+
+```json
+{
+  "version": 2,
+  "servicio": "LIVIANO",
+  "horas": 0.70, "horas_facturables": 2,
+  "tiempo_base": 84000, "ayudantes": 1, "costo_ayudantes": 24000, "tiempo": 108000,
+  "km_ida": 4.32, "distancia": 19440, "regimen": "TIEMPO", "precio_base": 108000,
+  "recargo_provincia": 0, "recargo_escalera": 27000,
+  "paradas_extra": 0, "monto_paradas_extra": 0,
+  "subtotal_sin_iva": 135000, "factura_a": false, "iva": 0,
+  "peajes": 0, "fuente_peajes": "NINGUNA",
+  "peajes_detalle": { "google_ida": null, "factor_vuelta": 2, "multiplicador": 1, "google_total": null, "pyme": null, "usados": 0, "fuente": "NINGUNA", "incompleto": null, "error": false },
+  "ajuste_redondeo": 0, "total": 135000, "bajo": 108000, "alto": 176000,
+  "parametros": { "minimo": 84000, "minimo_horas": 2, "hora": 37500, "hora_ayudante": 12000, "km_ida": 4500, "...": "..." },
+  "entradas": { "km_ida": 4.32, "horas": 0.70, "servicio": "LIVIANO", "ayudantes": 1, "provincia": false, "escalera": true, "fuente_km": "GPS", "...": "..." }
+}
+```
+
+En el medido, `entradas` suma `fuente_km`, `km_gps`, `pings`, `referencia_km`, `km_estimados` y
+`horas_estimadas`.
+
+**Compatibilidad**: en v2 `zona` se sigue calculando; `tarifa_hora` = precio hora del servicio y
+`tarifa_km` = precio por km del snapshot; `tiempo_capital` y `distancia_provincia` quedan `null`
+(también al cerrar). No hay hora pico en v2.
+
+### Peajes: Google y lo que declara la PyME
+
+Los peajes se calculan **automáticamente con Google** (Routes API, `extraComputations: TOLLS`,
+pase `AR_TELEPASE`). Es **una sola llamada por cálculo**, aparte de las llamadas por tramo, con
+origen = primera parada, destino = última y el resto como intermedias. Sale a la hora de salida
+estimada del origen: **la tarifa depende de la franja horaria** (Belgrano → La Plata: ARS 6.483,84
+de ida a las 08:00 y 5.187,06 a las 14:00).
+
+- **Monto de Google** = peaje de **ida** × `PRECIO_PEAJES_FACTOR_VUELTA` (2) ×
+  `PRECIO_PEAJES_MULTIPLICADOR_<SERVICIO>` (LIVIANO 1, EQUIPO 1, CAMION 2), redondeado a pesos.
+  Google cotiza un auto; el multiplicador lleva a la categoría del vehículo.
+- **Prioridad**: lo declarado por la PyME (`peajes_estimados`, total del viaje) **gana siempre**,
+  después Google, si no 0. `fuente_peajes`: `PYME` | `GOOGLE` | `NINGUNA`. Google se pide igual
+  aunque la PyME declare (queda el dato para comparar).
+  - Google respondió que la ruta no tiene peajes → 0 con fuente `GOOGLE`.
+  - Un peaje con tarifa desconocida (u otra moneda que ARS) → se usa lo conocido e `incompleto: true`.
+  - Si la llamada de peajes **falla** (timeout, error, cuota) **no bloquea** (no hay 503): el viaje
+    se crea o estima sin peajes de Google, `fuente` `NINGUNA` (o `PYME`) y `error: true`.
+  - Con `PEAJES_GOOGLE_HABILITADO=false` o `MAPS_PROVIDER=legacy` no se llama: `NINGUNA`, `error: false`.
+- **Cuándo se calculan**: crear, crear serie (**una** llamada por serie, con la primera ocurrencia;
+  el resultado se copia a todos sus viajes) y estimar-precio. Editar llama a Google solo si cambian
+  las paradas o la fecha; si cambia el tipo de servicio se recalcula el monto con el multiplicador
+  nuevo **sin llamar**. Cierre, medido y vivo usan los peajes del snapshot (no se recalculan con la
+  ruta real).
+- **Cache**: el resultado crudo de Google se guarda en Redis por `PRECIO_PEAJES_CACHE_SEGUNDOS`
+  (900), por paradas (5 decimales) + franja de 1 hora (hora argentina) de la salida. Así
+  `estimar-precio` y crear el mismo viaje con la misma fecha hacen **una** sola llamada.
+
+Campos nuevos (la PyME y el admin; **el chofer nunca los recibe**):
+- Viaje: `peajes_google_ida` (entero, pesos: el crudo de **ida** de Google, sin factores; `null` si
+  no se calculó) y `peajes_google_incompleto` (boolean o `null`).
+- Parada: `peajes_google_tramo` (peaje de ida del tramo que **llega** a esa parada; `null` en la
+  primera, si no se calculó o si la tarifa del tramo es desconocida).
+- Desglose (estimado, medido, `desglose_estimado` de crear, `costo-acumulado`, `viaje:finalizado` a
+  la PyME): `peajes` sigue siendo el **entero** usado y se suma `peajes_detalle`:
+
+```json
+{ "google_ida": 5187, "factor_vuelta": 2, "multiplicador": 1, "google_total": 10374, "pyme": null, "usados": 10374, "fuente": "GOOGLE", "incompleto": false, "error": false }
+```
+
+Ejemplo (Belgrano → La Plata, LIVIANO, mañana 14:00, sin factura A): 68,2 km de ida → régimen
+DISTANCIA 307.080; peajes 5.187 × 2 × 1 = 10.374; total **$317.000**.
+
+### Datos que declara la PyME (crear y editar viaje, crear serie, estimar-precio)
+
+Todo **opcional** (el front actual no lo manda). Si no viene, se guarda `null` ("no declarado"),
+el cálculo usa el default y el snapshot registra el valor usado. En **editar**, `null` borra lo
+declarado.
+
+| Campo | Tipo | Default de cálculo | Reglas |
+|---|---|---|---|
+| `tipo_servicio` | `LIVIANO` \| `EQUIPO` \| `CAMION` | `LIVIANO` | |
+| `ayudantes` | entero | 0 (EQUIPO: 2) | LIVIANO y CAMION: 0 a 1. EQUIPO: siempre 2 (otro valor → 400) |
+| `factura_a` | boolean | el de la PyME (`factura_a_por_defecto`), si no `false` | |
+| `peajes_estimados` | entero ≥ 0, pesos | 0 | **Total de peajes del viaje (ida y vuelta)** en pesos; se suma tal cual (no se multiplica) |
+| `tipo_carga` | `GENERAL` \| `REFRIGERADA` \| `PELIGROSA` \| `FRAGIL` | — | no entra en la fórmula |
+| `bultos` | entero 1 a 10.000 | — | no entra en la fórmula |
+| `peso_kg` | número > 0 hasta 45.000 | — | no entra en la fórmula |
+| `volumen_m3` | número > 0 hasta 120 | — | no entra en la fórmula |
+| `pallets` | entero 0 a 60 | — | no entra en la fórmula |
+| `valor_declarado` | entero 0 a 2.000.000.000 | — | no entra en la fórmula |
+
+Por **parada** (en `paradas[]`, con coordenadas o con `id_lugar`):
+
+| Campo | Tipo | Reglas |
+|---|---|---|
+| `acceso` | `PLANTA_BAJA` \| `ESCALERA` \| `ASCENSOR` | default de cálculo `PLANTA_BAJA`. Con `id_lugar` y sin `acceso`, se copian `acceso` y `pisos` del lugar (snapshot) |
+| `pisos` | entero 0 a 60 | obligatorio si `acceso` es `ESCALERA` o `ASCENSOR` |
+| `operacion` | `CARGA` \| `DESCARGA` \| `CARGA_Y_DESCARGA` | opcional |
+
+Errores nuevos (400):
+- `Con el servicio EQUIPO los ayudantes son siempre 2`
+- `Con el servicio LIVIANO los ayudantes pueden ser como máximo 1` (o `CAMION`)
+- `Si alguna parada tiene acceso por escalera, el viaje necesita al menos 1 ayudante o el servicio EQUIPO`
+- `pisos es obligatorio si el acceso es ESCALERA o ASCENSOR`
+
+Editar valida el **estado resultante** (lo guardado + lo que llega) y recalcula el precio si
+cambian paradas, fecha o cualquiera de estos datos. Si solo cambian estos datos no se llama a
+Google (se usan los estimados y los peajes de Google guardados). La regla de reconfirmación no cambia (CONFIRMADO →
+ASIGNADO).
+
+Otros campos nuevos:
+- `PUT /api/organizaciones/:id` (RESPONSABLE): `factura_a_por_defecto` (boolean o `null`). Se
+  devuelve en `GET` / `PUT` de la PyME.
+- Lugares: `acceso_por_defecto` y `pisos_por_defecto` al crear / editar / listar (mismas reglas).
+- Series: los mismos datos en la serie y en la plantilla de paradas; se copian a cada viaje.
+
+### POST /api/organizaciones/:id/viajes/estimar-precio
+
+Cualquier miembro; rate limit MAPS (el mismo de crear). PyME SUSPENDIDA → 403. **No crea nada.**
+
+Body: el de crear (`paradas` con coordenadas o `id_lugar`, y los datos de arriba);
+`fecha_programada` opcional (sin fecha se estima saliendo ahora); `id_conductor`, `motivo` y
+`descripcion` no hacen falta.
+
+Respuesta 200:
+
+```json
+{
+  "version_precio": 2,
+  "zona": "CABA",
+  "total": 136000, "bajo": 109000, "alto": 177000,
+  "desglose": { "version": 2, "...": "..." },
+  "peajes": { "pyme": 1200, "google": 10374, "google_ida": 5187, "factor_vuelta": 2, "multiplicador": 1, "google_total": 10374, "google_incompleto": false, "incompleto": false, "error": false, "usados": 1200, "fuente": "PYME" },
+  "estimado": { "manejo_horas": 0.2, "peon_horas": 1, "total_horas": 1.2, "distancia_km": 4.3, "horas_precio": 0.7, "inicio_estimado": "...", "fin_estimado": "..." },
+  "tramos": [{ "orden": 2, "manejo_estimado_min": 12, "manejo_sin_transito_min": 11, "distancia_estimada_km": 4.3, "...": "..." }]
+}
+```
+
+`peajes.google` es el monto de Google **ya con vuelta y multiplicador** (comparable con `pyme`);
+`google_ida` es el crudo de ida. `google_incompleto` queda como alias de `incompleto`. Ver
+[Peajes](#peajes-google-y-lo-que-declara-la-pyme).
+
+### Columnas nuevas del viaje y de la parada
+
+En la fila del viaje (listas y detalle de la PyME, admin): `version_precio`, `precio_parametros`,
+`precio_estimado_desglose`, `precio_estimado_min`, `precio_estimado_max`, `precio_medido`,
+`precio_medido_desglose`, lo declarado (`tipo_servicio`, `ayudantes`, `factura_a`,
+`peajes_estimados`, `tipo_carga`, `bultos`, `peso_kg`, `volumen_m3`, `pallets`,
+`valor_declarado`), `fuente_peajes`, `gps_puntos` y `gps_mayor_hueco_segundos` (calidad del GPS al
+cerrar o cancelar en curso) y `vehiculo_snapshot` (copia del vehículo al confirmar).
+
+En cada parada: `acceso`, `pisos`, `operacion`, `distancia_real_km` (GPS del tramo que termina en
+esa parada), `manejo_sin_transito_horas` y su `manejo_sin_transito_min` (tramo sin tránsito, de
+Google).
+
+Cancelado en curso: el precio medido parcial se registra solo en el historial de precios
+(`precio_real` sigue `null`).
+
+### Feedback del precio pagado
+
+Para recalibrar: la PyME carga cuánto le pagó al chofer. RESPONSABLE o MIEMBRO de la PyME del
+viaje; el chofer no tiene acceso (403).
+
+**PUT /api/organizaciones/:id/viajes/:idViaje/precio-pagado** — crea (201) o actualiza (200).
+
+```json
+{ "monto": 250000, "incluye_iva": true, "monto_peajes": 3000, "metodo_pago": "TRANSFERENCIA", "ayudantes_reales": 1, "comentario": "Pagado al chofer" }
+```
+
+| Campo | Reglas |
+|---|---|
+| `monto` | obligatorio, entero > 0, hasta `FEEDBACK_PRECIO_MONTO_MAX` (100.000.000) |
+| `incluye_iva` | obligatorio, boolean |
+| `monto_peajes` | opcional, entero ≥ 0 |
+| `metodo_pago` | opcional, `EFECTIVO` \| `TRANSFERENCIA` \| `OTRO` |
+| `ayudantes_reales` | opcional, entero 0 a 10 |
+| `comentario` | opcional, 1 a 500 caracteres |
+
+PUT reemplaza: lo opcional que no llega queda `null`. Solo viajes `FINALIZADO` (también el
+finalizado incompleto) → si no, 400 `Solo se puede cargar el precio pagado de un viaje
+finalizado`. Editable hasta `FEEDBACK_PRECIO_EDICION_DIAS` (30) días desde el fin del viaje
+(`fecha_corte_precio`) → después, 409 `El plazo para cargar el precio pagado vencio: se puede
+cargar hasta 30 dias despues del fin del viaje`. Dos PUT simultáneos nunca crean dos filas: uno
+crea (201) y el otro actualiza (200).
+
+Respuesta (PUT y GET):
+
+```json
+{
+  "id_viaje": 3434,
+  "precio_pagado": { "monto": 250000, "incluye_iva": true, "monto_peajes": 3000, "metodo_pago": "TRANSFERENCIA", "ayudantes_reales": 1, "comentario": "Pagado al chofer", "id_usuario": 1810, "creado_en": "...", "actualizado_en": "...", "ediciones": 0 },
+  "precio_pagado_pendiente": false,
+  "editable": true,
+  "editable_hasta": "2026-12-13T00:13:13.743Z",
+  "creado": true
+}
+```
+
+**GET /api/organizaciones/:id/viajes/:idViaje/precio-pagado** — lo mismo (sin `creado`);
+`precio_pagado: null` si todavía no se cargó.
+
+**GET /api/organizaciones/:id/viajes/precio-pagado/pendientes?page=&limit=** — finalizados dentro
+de la ventana y sin feedback, del más reciente al más viejo (`limit` hasta 200):
+
+```json
+{ "total": 3, "page": 1, "limit": 50, "viajes": [
+  { "id_viaje": 3441, "fecha_programada": "...", "fecha_fin": "...", "editable_hasta": "...", "motivo": "...",
+    "origen": "Plaza de Mayo, CABA", "destino": "Recoleta, CABA", "cantidad_paradas": 2,
+    "version_precio": 2, "precio_estimado": 84000, "rango": { "bajo": 67000, "alto": 109000 }, "precio_real": 84000 } ] }
+```
+
+En la lista y el detalle de viajes de la PyME: `precio_pagado` (el objeto, o `null`) y
+`precio_pagado_pendiente` (true si está FINALIZADO, dentro de la ventana y sin feedback).
+`viaje:finalizado` a la PyME suma `precio_pagado_pendiente: true`.
+
+### GET /api/admin/precios/dataset (ADMIN)
+
+El dataset para recalibrar: una fila por viaje **v2 FINALIZADO**, con lo declarado, lo usado, lo
+medido, los peajes (Google, PyME y pagados), el estimado con su rango, el medido, lo pagado y los
+parámetros. Query: `page`, `limit` (hasta 1000, default 200), `desde` / `hasta` (sobre el fin del
+viaje) y `formato=csv` (descarga `text/csv`, una página por pedido; `X-Total-Count` con el total).
+JSON: `{ total, page, limit, viajes: [fila] }`. Columnas: las de `COLUMNAS_DATASET` en
+`src/controllers/admin-precios.controller.js` (`id_viaje`, `servicio`, `km_estimado`, `km_medido`,
+`fuente_km`, `peajes_google` (con vuelta y multiplicador), `peajes_google_ida`,
+`peajes_google_incompleto`, `peajes_google_error`, `peajes_pyme`, `fuente_peajes`, `peajes_pagados`,
+`estimado_total`, `medido_total`, `pagado_monto`, `parametros`, ...).
+
+### El chofer no ve precios (ni datos personales de la PyME)
+
+En los viajes de PyME el chofer deja de recibir todo precio, peaje y tarifa, y todo dato personal
+de otros usuarios. La PyME y el admin siguen recibiendo todo.
+
+- `GET /api/choferes/viajes` y `/:id`: **lista blanca** de campos. Ya no trae `precio_estimado`,
+  `precio_real`, `tarifa_hora`, `tarifa_km`, `tiempo_capital`, `distancia_provincia`,
+  `id_creador`, `id_cliente`, `cancelado_por_admin_id`, `creador` ni `historial_estados[].id_usuario`;
+  nunca trae las columnas nuevas de precio (`version_precio`, `precio_*`, `peajes_estimados`,
+  `fuente_peajes`, `peajes_google_ida`, `peajes_google_incompleto`) ni el feedback. Las paradas
+  también van por **lista blanca**: nunca traen `id_lugar` ni `peajes_google_tramo`. Sí trae lo operativo nuevo: `tipo_servicio`, `ayudantes`,
+  `factura_a`, la carga, `vehiculo_snapshot` y `acceso` / `pisos` / `operacion` por parada.
+- `GET /api/viajes/:id` de un viaje interno: **la misma forma** que `GET /api/choferes/viajes/:id`.
+  Ya no trae `cliente` (la fila completa del usuario que creó el viaje), `empresa`, `calificacion`
+  ni el `conductor.usuario` completo (queda `{ id_conductor, id_usuario, nombre, apellido, telefono }`).
+- `GET /api/viajes/:id/costo-acumulado` de un viaje interno: **403** `El precio de un viaje de PyME
+  no esta disponible para el chofer` (la PyME usa su ruta).
+- `POST /api/choferes/viajes/:id/salir` (la última): sin `precio_real` (sigue `remito_url`).
+- `viaje:asignado`, `viaje:editado`, `serie:asignada`: al chofer sin `precio_estimado` (ni
+  `precio_estimado_min` / `max`); a la PyME, con los tres.
+- `viaje:finalizado`: al chofer sin `precio_real` ni `desglose`.
+- `costo:actualizar` y el `viaje:finalizado` con precio de un viaje interno van **solo** a la sala
+  de la PyME (`organizacion:{id}`); a `viaje:{id}` no se manda nada con precio.
+
+### Remito
+
+El remito PDF de **todo viaje de PyME que se cierre desde este cambio (v1 o v2) no lleva bloque de
+costo** (ni desglose ni TOTAL): es un comprobante de entrega. Un solo PDF, que el chofer sigue
+recibiendo por los mismos canales. La PyME ve el precio y el desglose en la app. Los remitos ya
+generados no se regeneran. El remito del marketplace no cambia.
+
+### Cambio de contrato
+
+| Quién | Qué cambia | ¿Rompe? |
+|---|---|---|
+| Web | `desglose_estimado` (crear), `desglose` de `costo-acumulado` / `costo:actualizar` / `viaje:finalizado`: forma v2 en viajes v2 (sin `precio_por_tiempo`, `tarifa_hora`, `es_hora_pico`, `fraccion_caba`) | **Sí**, si se leen esos campos |
+| Web | `precio_estimado` / `precio_real` en v2: pesos enteros, con IVA (si factura A) y peajes | No (mismo nombre) |
+| Web | `tiempo_capital` / `distancia_provincia` en v2: `null` | Leve |
+| Web | Remito sin bloque de costo | Sí (visual) |
+| Web | Campos y endpoints nuevos (Parte B, estimar-precio, precio pagado, `factura_a_por_defecto`, lugares) | No (aditivos) |
+| Web | Peajes de Google: `peajes.google` de estimar-precio con valor, `peajes_detalle` en el desglose, `peajes_google_ida` / `_incompleto` en el viaje y `peajes_google_tramo` en la parada; `fuente_peajes` puede ser `GOOGLE` | No (aditivos; `precio_estimado` ahora incluye los peajes de Google) |
+| Mobile | Detalle / lista del chofer, `GET /api/viajes/:id`, `salir` de la última, `viaje:asignado` / `editado` / `serie:asignada` / `finalizado`: sin precios ni datos del creador | **Sí**, si la app muestra precio o el creador |
+| Mobile | `GET /api/viajes/:id/costo-acumulado` de un viaje interno → 403 | **Sí** |
+| Mobile | Campos operativos nuevos (servicio, ayudantes, carga, acceso por parada) | No (aditivos) |
 
 ---
 

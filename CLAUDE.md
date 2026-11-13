@@ -70,6 +70,17 @@ elegibles) queda DORMIDO detras de MARKETPLACE_HABILITADO. MVP: CABA + GBA.
   API JSON, Sentry solo errores (no-op sin DSN), /health con version y uptime, y
   la password de admin-test fuera del codigo (TEST_ADMIN_PASSWORD) COMPLETO. Ver
   "Seguridad y monitoreo (Tarea 6)".
+- PRECIO V2 de los viajes internos (formula calibrada, version y
+  snapshot por viaje, medido y vivo con fallback de GPS), datos que declara la
+  PyME (servicio, ayudantes, factura A, peajes, carga, acceso por parada),
+  estimar-precio, historial de precios, calidad del GPS, distancia por tramo,
+  feedback del precio pagado y dataset admin, el chofer sin precios ni datos
+  personales (lista blanca), remito interno sin precio y TRUST_PROXY default 2
+  COMPLETO. Ver "Precio v2".
+- PEAJES DE GOOGLE en el precio v2 (UNA llamada Enterprise por calculo, cache
+  en Redis, una por serie, nunca bloquea, kill switch PEAJES_GOOGLE_HABILITADO,
+  multiplicador por servicio, PyME > Google > 0) y las paradas del chofer por
+  LISTA BLANCA COMPLETO. Ver "Precio v2 — Peajes de Google".
 
 ## Stack
 - Node.js 22, ES Modules (NUNCA require()). Async/await siempre.
@@ -142,6 +153,18 @@ elegibles) queda DORMIDO detras de MARKETPLACE_HABILITADO. MVP: CABA + GBA.
   COLUMN ... DROP NOT NULL. Las condiciones (condicion_requerida,
   series_viaje.condiciones, el enum TipoCondicion) NO se tocaron: quedan sin uso
   en el ciclo interno hasta separar las DBs.
+- Precio v2: 7 enums NUEVOS (TipoServicio, AccesoParada,
+  OperacionParada, TipoCarga, FuentePeajes, MotivoCalculoPrecio, MetodoPagoFlete;
+  ningun enum existente tocado), columnas NULLABLE en organizaciones (1), lugares
+  (2), series_viaje (10), viajes (21) y paradas (5), y 2 tablas nuevas
+  (historial_precio_viaje con indice (id_viaje, fecha), precios_pagados_viaje con
+  unique en id_viaje), ambas con FK a viajes ON DELETE CASCADE (el codigo viejo
+  borra viajes sin conocerlas). Revisado con el mismo migrate diff: solo CREATE
+  TYPE, ADD COLUMN, CREATE TABLE / INDEX y FKs de las tablas nuevas.
+- Peajes de Google: 2 columnas NULLABLE en viajes (peajes_google_ida INTEGER,
+  peajes_google_incompleto BOOLEAN) y 1 en paradas (peajes_google_tramo
+  INTEGER). Sin enums (FuentePeajes.GOOGLE ya existia), indices ni FKs.
+  Revisado con el mismo migrate diff: solo ADD COLUMN.
 - OJO con relajar un NOT NULL mientras la DB esta compartida: es compatible
   para ESCRIBIR, pero el Prisma VIEJO (production antes del merge a main) TIRA
   al LEER una fila con NULL en esa columna (p. ej. GET /api/admin/usuarios, que
@@ -267,7 +290,8 @@ interactiva (OPCIONES_TX: maxWait 10s, timeout 20s):
   INVITACION_VENTANA_MINUTOS (15), por usuario Y por IP, contando cada intento.
   MULTI de SET NX EX + INCR (la clave nunca queda sin TTL; no depende de EXPIRE
   NX de Redis 7). IP = req.ip: desde la Tarea 6 la app corre con `trust proxy`
-  = TRUST_PROXY (1), que es el ultimo valor de X-Forwarded-For (el que agrega el
+  = TRUST_PROXY (default 2 desde el Precio v2: Railway pone dos saltos), el valor
+  N-esimo desde la derecha de X-Forwarded-For (antes con 1: el ultimo, el que agrega el
   proxy de Railway), el mismo que se tomaba a mano antes. El 429 ahora trae
   Retry-After (PTTL en el mismo MULTI). Si Redis no esta `ready` o no responde en 1s -> se deja pasar y
   se loguea "[invitaciones] rate limit sin Redis". Ese chequeo de status existe
@@ -1158,7 +1182,7 @@ cache de src/sockets/auth.socket.js.
   passOnStoreError deja pasar; el log "[rate-limit] sin Redis" sale a lo sumo 1
   vez por minuto (el logger propio silencia el de express-rate-limit, que seria
   uno por request).
-- `trust proxy` = TRUST_PROXY (1). Claves rl:<limiter>:ip:<ip> (IPv6 agrupado por
+- `trust proxy` = TRUST_PROXY (default 2 desde el Precio v2; antes 1). Claves rl:<limiter>:ip:<ip> (IPv6 agrupado por
   /56, el default de express-rate-limit) o rl:<limiter>:u:<id_usuario>.
 - Limites (MAX por request, ventana al arrancar):
   | Limiter | Clave | Default | Donde |
@@ -1267,6 +1291,279 @@ igual. test-seguridad verifica que 5 GET /health no generan ni una prisma:query.
 - Cupo de series POR PyME (hoy es por usuario).
 - La cache de auth del handshake podria servir tambien para verificarToken de
   HTTP (hoy cada request hace verifyIdToken + 1 query).
+
+## Precio v2
+
+El precio de los viajes INTERNOS pasa a la v2 (calibrada con 52 presupuestos
+reales). El marketplace (POST /api/viajes, estimar-costo, cerrarViaje legacy,
+tarifa.service, TARIFA_*) NO cambia.
+
+Archivos: config/precio.js (UNICO modulo con los numeros: defaults, parseo,
+warning al arrancar), precio-v2.js (PURA: la formula), precio-entradas.js (PURA:
+entradas del estimado y del medido, factura A, peajes, validaciones de la Parte
+B, fallback de km), precio.service.js (elige v1 / v2, columnas, vivo, medido,
+historial), vista-chofer.js (PURA: lista blanca del chofer),
+precio-pagado-reglas.js + precio-pagado.service.js + precio-pagado.controller.js
+(feedback), admin-precios.controller.js + csv.js (dataset).
+
+### Version y snapshot
+- Viaje.version_precio: 2 en lo creado / editado por este codigo; null = v1
+  (creados antes, o por el codigo viejo de main mientras conviven). Un viaje se
+  cierra, se muestra en vivo y en el historial SIEMPRE con la version con la que
+  se estimo (precioMedido / precioEnVivo eligen por la columna).
+- Viaje.precio_parametros = SNAPSHOT { version, parametros (todas las PRECIO_*),
+  entradas (las usadas), declarados (lo que declaro la PyME + la factura A de la
+  org) }. El medido y el vivo usan el snapshot, no el env.
+- Compatibilidad con el codigo viejo: zona se sigue escribiendo; tarifa_hora =
+  PRECIO_HORA_<servicio>, tarifa_km = PRECIO_KM_IDA (del snapshot);
+  precio_estimado = total; precio_real = total medido (contrato);
+  tiempo_capital / distancia_provincia null en v2. Sin hora pico.
+- Editar un viaje v1 lo pasa a v2 (se recalcula aunque solo cambie el motivo).
+  Reasignar no recalcula ni cambia la version.
+
+### Formula (precio-v2.js) y entradas (precio-entradas.js)
+- h = max(min_h, ceil(horas / fraccion) * fraccion) (con tolerancia de float);
+  tiempo = minimo + (h - min_h) * hora (+ h * ayudantes * hora_ayudante si no es
+  EQUIPO); distancia = km_ida * km; max; recargo provincia (regimen TIEMPO y no
+  CAMION) y escalera sobre el tiempo; paradas extra; IVA solo sobre el subtotal
+  (los peajes no llevan IVA); total al multiplo de PRECIO_REDONDEO (mitades
+  arriba); rango -20 % / +30 %. Pesos enteros: cada componente se redondea al
+  peso y el subtotal es la suma de los enteros (el desglose cierra exacto;
+  ajuste_redondeo = total - (subtotal + iva + peajes)).
+- ESTIMADO: km_ida = suma de tramos de Routes; horas = manejo con transito +
+  PRECIO_MINUTOS_POR_PARADA x paradas (distinto de TIEMPO_PEON_MINUTOS, que sigue
+  siendo de la duracion); provincia = alguna parada fuera de CABA (poligono);
+  paradas_extra = max(0, n - 2); escalera = alguna parada con acceso ESCALERA.
+- MEDIDO: horas = reloj desde la llegada a la parada 1 hasta planCierre.corte; km
+  = GPS hasta el corte (medicionesHasta, ahora con `pings`). Fallback si hay menos
+  de PRECIO_GPS_MIN_PUNTOS pings o menos del PRECIO_GPS_DISTANCIA_MIN_PORCENTAJE %
+  de la referencia: cierre completo -> km estimados del snapshot (fuente_km
+  ESTIMADA); cierre INCOMPLETO (plan.incompleto) o cancelado en curso -> suma de
+  distancia_estimada_km de los tramos hasta la ULTIMA parada con llegada_real
+  (ESTIMADA_PARCIAL; 0 si no llego a ninguna despues de la 1: queda el minimo
+  por tiempo); vivo -> estimada completa. Nunca 0 por falta de GPS.
+- VIVO: GET costo-acumulado (PyME y legacy) y costo:actualizar usan
+  precioEnVivo (misma funcion, mismo nombre precio_acumulado, misma frecuencia).
+  Se borro la formula inline de gps.socket (cobraba doble en MIXTO; ahora v1 va
+  por precioDesdeMediciones, tambien en legacy). v2 sin iniciar -> 0; FINALIZADO
+  -> el medido.
+
+### Parte B — lo que declara la PyME (crear / editar viaje, serie, estimar-precio)
+- Todo opcional; null = no declarado (se guarda null, el calculo usa el default y
+  el snapshot registra lo usado). En editar null borra. Viaje y serie:
+  tipo_servicio, ayudantes, factura_a, peajes_estimados (TOTAL del viaje, ida y
+  vuelta, no se multiplica), tipo_carga, bultos, peso_kg, volumen_m3, pallets,
+  valor_declarado. Parada: acceso (default de calculo PLANTA_BAJA), pisos
+  (obligatorio con ESCALERA / ASCENSOR), operacion. Limites en LIMITES_DATOS
+  (viaje-validacion.js).
+- validarDatosPrecio (sobre el estado RESULTANTE y las paradas ya resueltas):
+  EQUIPO con ayudantes != PRECIO_EQUIPO_AYUDANTES -> 400; LIVIANO / CAMION con mas
+  de PRECIO_AYUDANTES_MAX -> 400; escalera sin ayudante ni EQUIPO -> 400.
+- Factura A: la del viaje > Organizacion.factura_a_por_defecto (PUT de la PyME,
+  RESPONSABLE) > false. El viaje guarda lo declarado; el snapshot, lo usado y su
+  fuente (VIAJE / ORGANIZACION / DEFAULT).
+- Lugares: acceso_por_defecto / pisos_por_defecto. Con { id_lugar } y SIN acceso,
+  snapshotParadas los copia; si la parada manda acceso, gana el suyo.
+- Editar recalcula si cambian paradas, fecha, cualquier dato de la Parte B o si
+  el viaje es v1. Google solo si cambian paradas / fecha o faltan los estimados
+  guardados (manejo_estimado_horas / distancia_estimada_km); si no, el precio sale
+  de la fila. La regla de reconfirmacion no cambio.
+- POST /api/organizaciones/:id/viajes/estimar-precio: el mismo calculo, sin
+  escribir; requireMiembro + limitarMaps; SUSPENDIDA -> 403 (no gasta Google).
+
+### Precio v2 — Peajes de Google
+Se calculan con Google aceptando el SKU Enterprise (extraComputations TOLLS es
+disparador Enterprise; se cobra UN SKU por pedido, el mas alto, asi que
+TRAFFIC_AWARE o > 10 intermedios no lo suben mas). staticDuration de los tramos
+sigue Pro (la FieldMask no es disparador de SKU).
+
+Archivos: maps/peajes.js (PURO: parseo), maps/routes.js (pedidoPeajes /
+leerPeajes), maps/index.js (calcularPeajes, operacion "peajes", SKU ENTERPRISE),
+peajes.service.js (kill switch, cache, nunca tira), precio-entradas.js
+(montoPeajesGoogle / entradasPeajes, PURAS), precio-v2.js (detallePeajes).
+
+- UNA llamada por calculo, aparte de los tramos (que no cambiaron): origen =
+  parada 1, destino = la ultima, el resto intermedios; TRAFFIC_AWARE +
+  departureTime = salida estimada del ORIGEN (salidaDelOrigen de
+  estimacion.service, la misma del primer tramo; si es pasada o inminente no se
+  manda); tollPasses AR_TELEPASE; FieldMask SOLO routes.travelAdvisory.tollInfo,
+  routes.legs.travelAdvisory.tollInfo.
+- VERIFICADO (13-11-2026, Belgrano -> La Plata, 3 llamadas): la tarifa DEPENDE
+  DE LA HORA (ARS 6483,84 de ida el lunes a las 08:00, 5187,06 a las 14:00; sin
+  departureTime Google cotiza "ahora"); la ruta fue la misma en las tres. Por eso
+  quedan departureTime y la franja horaria en la clave del cache; TRAFFIC_AWARE
+  no cuesta nada extra y alinea la ruta con la de los tramos.
+- Parseo (estimatedPrice = Money { currencyCode, units string, nanos }; units y
+  nanos se omiten en 0): pesos enteros con redondeo normal, solo ARS (otra
+  moneda = desconocida -> incompleto), tollInfo sin estimatedPrice = tarifa
+  desconocida (incompleto, se suma lo conocido), sin tollInfo = sin peajes (0).
+  tramos[i] = el leg que TERMINA en la parada i (null en la 1; leg con tollInfo
+  sin ningun ARS -> null).
+- Monto usado = aPesos(ida x PRECIO_PEAJES_FACTOR_VUELTA x
+  PRECIO_PEAJES_MULTIPLICADOR_<servicio efectivo>). Prioridad PyME > Google > 0
+  (elegirPeajes). Google que respondio "sin peajes" = 0 con fuente GOOGLE; sin
+  dato (falla, kill switch, legacy) = NINGUNA. Se llama a Google AUNQUE la PyME
+  declare (decision de Samuel: comparar lo declarado, Google y lo pagado).
+- NUNCA bloquea (a diferencia de los tramos, que dan 503): si falla -> fuente
+  NINGUNA (o PYME), peajes_google_error true en el snapshot / desglose, log
+  "[peajes] no se pudieron calcular ..." y warning a Sentry a lo sumo 1 por
+  minuto. Va EN PARALELO con los tramos (Promise.all en estimarPrecioInterno): no
+  suma latencia; si los tramos fallan, la llamada de peajes ya salio (queda en
+  el cache para el reintento).
+- Kill switch PEAJES_GOOGLE_HABILITADO (default true; tipo BOOLEANO nuevo en
+  config/precio.js; aviso al arrancar si esta apagado). Con MAPS_PROVIDER=legacy
+  tampoco se calcula (error false).
+- CACHE (Redis, clave peajes:<sha256>): coordenadas en orden con 5 decimales +
+  franja "YYYY-MM-DDTHH" de la salida en hora argentina; valor = el CRUDO
+  { ida, incompleto, tramos }; TTL PRECIO_PEAJES_CACHE_SEGUNDOS (0 = sin cache).
+  Solo exitos. redisListo + conTimeout 500 ms; Redis caido -> sin cache. Log
+  "[peajes] cache hit". Sin single-flight: dos estimaciones simultaneas con el
+  cache vacio hacen 2 llamadas (aceptado).
+- Cuando: crear, estimar-precio y serie (UNA promesa con la salida de la PRIMERA
+  ocurrencia, compartida por todas las estimarPrecioInterno). Editar: solo si
+  cambian paradas o fecha (reescribe peajes_google_tramo de las paradas); si no,
+  peajesGoogleDeViaje (columnas + el error del snapshot anterior) y un cambio de
+  tipo_servicio recalcula el monto con el multiplicador nuevo SIN llamar. Un viaje
+  sin estimados (pre Paso 3) que se edita sin cambiar paradas ni fecha llama a
+  Google para los tramos pero NO para los peajes. Cierre, medido y vivo usan el
+  snapshot (entradasMedido spreadea snapshot.entradas): nunca se recalculan.
+- Datos: viajes.peajes_google_ida (crudo de ida, sin factores) y
+  peajes_google_incompleto; paradas.peajes_google_tramo. Factor y multiplicador
+  van en el snapshot (parametros y entradas: peajes_pyme, peajes_google_ida,
+  peajes_google_total, peajes_factor_vuelta, peajes_multiplicador,
+  peajes_google_incompleto, peajes_google_error). desglose.peajes sigue siendo el
+  ENTERO usado (contrato) y se suma desglose.peajes_detalle { google_ida,
+  factor_vuelta, multiplicador, google_total, pyme, usados, fuente, incompleto,
+  error } (nulls en un snapshot anterior). estimar-precio: peajes.google =
+  google_total (comparable con pyme) + google_ida, factor_vuelta, multiplicador,
+  incompleto, error (google_incompleto queda como alias). Dataset admin:
+  peajes_google (total con factores), peajes_google_ida, peajes_google_incompleto,
+  peajes_google_error.
+- El chofer NO recibe nada de peajes: las columnas de Viaje van en OCULTAS_CHOFER
+  y paradaVistaChofer (vista-parada.js) paso de lista negra por spread a LISTA
+  BLANCA (VISIBLES_CHOFER_PARADA / OCULTAS_CHOFER_PARADA, mas
+  CALCULADOS_CHOFER_PARADA = lo que suma tiemposParada). vista-parada.test.js
+  recorre Prisma.ParadaScalarFieldEnum y FALLA con una columna sin clasificar, y
+  verifica que el payload del chofer quedo IDENTICO al del spread viejo salvo
+  peajes_google_tramo.
+- /health suma la capacidad 'peajes-google' (el poll de e2e-staging la espera:
+  el simulador chequea peajes_detalle en la respuesta de crear).
+- Llamadas por operacion (n paradas): estimar / crear / editar con paradas o
+  fecha = n-1 Pro + 1 Enterprise (0 con acierto de cache); serie de N = N(n-1)
+  Pro + 1 Enterprise; editar sin paradas ni fecha, cierre, vivo, reasignar = 0
+  Enterprise.
+
+GUARDS VERIFICADOS REVIRTIENDOLOS (test-precio-v2.js CASO 18 y unitarios):
+| Guard | Caso que se pone en rojo sin el |
+|-------|---------------------------------|
+| lista blanca de paradaVistaChofer (volver al spread o peajes_google_tramo en VISIBLES) | vista-parada.test + 17b |
+| OCULTAS_CHOFER con peajes_google_ida / _incompleto | vista-chofer.test |
+| cache de peajes | 18c / 18d (llamadas 1 y 2 en vez de 0 y 1) |
+| una promesa de peajes por serie | 18e (3 llamadas) |
+| prioridad PyME > Google | 18c |
+| kill switch | 18g |
+
+### Datos para recalibrar
+- Viaje: precio_estimado_desglose, _min, _max, precio_medido(_desglose),
+  gps_puntos / gps_mayor_hueco_segundos (del acumulado de Redis, leido antes de
+  limpiar: al cerrar y al cancelar en curso), vehiculo_snapshot (al confirmar;
+  null al reasignar / editar con Prisma.DbNull).
+- Parada: distancia_real_km del tramo (al confirmar la llegada: dos
+  medicionesHasta antes de la tx y se escribe en el MISMO updateMany condicionado
+  a llegada_real null; cero queries por ping) y manejo_sin_transito_horas
+  (staticDuration).
+- historial_precio_viaje: una fila por CALCULO (CREAR, EDITAR, CIERRE,
+  CANCELACION_EN_CURSO), fuera de la tx, nunca tira (registrarHistorialPrecio).
+  Series: en lote. v1 tambien (version 1, parametros { zona, tarifas }).
+- Cancelacion en curso: el precio medido parcial va SOLO al historial
+  (precio_real sigue null), desde guardarMedicionParcial (que ahora recibe
+  { id_usuario }).
+- Acumulado GPS (avanzarAcumulado, PURA en mediciones-gps.js): un ping con
+  timestamp <= al ultimo procesado se IGNORA (antes restaba tiempo y sumaba el
+  zigzag). Cuenta pings y mayor_hueco_ms en el mismo JSON. Sigue siendo GET + SET
+  no atomico (dos pings simultaneos se pueden pisar; un celular manda cada varios
+  segundos).
+
+### Feedback del precio pagado (precios_pagados_viaje, 1:1 con el viaje)
+- PUT / GET /api/organizaciones/:id/viajes/:idViaje/precio-pagado y GET
+  .../viajes/precio-pagado/pendientes (registrada ANTES de /:idViaje). RESPONSABLE
+  o MIEMBRO; el chofer no llega (requireRol CLIENTE).
+- Solo FINALIZADO (400). Editable hasta FEEDBACK_PRECIO_EDICION_DIAS desde
+  fecha_corte_precio (409 despues; un FINALIZADO sin esa fecha, anterior a la
+  Tarea 5, no admite). Upsert = INSERT ... ON CONFLICT (id_viaje) DO UPDATE
+  (ediciones + 1; xmax = 0 dice si creo): dos PUT simultaneos -> 201 + 200 y UNA
+  fila. FINALIZADO es final y fecha_corte_precio no cambia: la lectura previa
+  alcanza para el 400 / 409.
+- Lista y detalle de la PyME: precio_pagado y precio_pagado_pendiente
+  (INCLUDE_VIAJE_PYME; precioPagadoPendiente TIRA si falta la relacion).
+  viaje:finalizado a la PyME suma precio_pagado_pendiente: true.
+- GET /api/admin/precios/dataset (ADMIN): viajes v2 FINALIZADO, paginado (page /
+  limit hasta 1000), desde / hasta sobre fecha_corte_precio, ?formato=csv (csv.js,
+  sin dependencias, neutraliza formulas).
+
+### El chofer no ve precios ni datos personales (Parte E)
+- serializarViajeChofer = viajeVistaChofer(serializar comun): LISTA BLANCA. Cada
+  columna escalar de Viaje esta en VISIBLES_CHOFER u OCULTAS_CHOFER;
+  vista-chofer.test.js recorre Prisma.ViajeScalarFieldEnum y FALLA si aparece una
+  sin clasificar. Relaciones con campos explicitos (organizacion {id, nombre,
+  cuit}, conductor {id_conductor, id_usuario, nombre, apellido, telefono},
+  vehiculo, historial sin id_usuario); sin creador ni precio_pagado.
+- GET /api/viajes/:id de un interno delega en obtenerViajeChofer (misma forma que
+  GET /api/choferes/viajes/:id; antes devolvia la fila completa del Usuario
+  creador). GET /api/viajes/:id/costo-acumulado de un interno -> 403.
+- Eventos: emitirViajeInternoDividido (salas.js) manda el payload con precio SOLO
+  a organizacion:{id} y el sin precio a usuario:{chofer}; nada a viaje:{id}
+  (en un interno nadie entra a esa sala: solo el pool del marketplace, el cliente
+  legacy y el gerente, con viajes legacy). viaje:asignado / viaje:editado /
+  serie:asignada (resumenVistaChofer) y viaje:finalizado. costo:actualizar de un
+  interno, solo a organizacion:{id}. salir de la ultima: sin precio_real.
+- Remito: bloqueCosto(viaje) -> null para TODO viaje interno (v1 y v2) que se
+  cierre desde ahora: sin desglose ni TOTAL (comprobante de entrega; el chofer
+  recibe el mismo PDF). Los PDFs ya generados no se tocan. Legacy igual.
+
+### Auditoria de datos personales (sin cambiar, fuera del chofer interno)
+- GET /api/viajes/:id legacy (viajes.controller, include cliente.usuario /
+  conductor.usuario sin select): el cliente dueño recibe el Usuario COMPLETO del
+  conductor (email, dni, firebase_uid, telefono) y el conductor el del cliente;
+  el gerente, los dos.
+- GET /api/viajes/mis-viajes (include conductor.usuario sin select): el cliente
+  recibe el Usuario completo del conductor y la fila Conductor (licencia).
+- Revisados sin hallazgo: matching.socket (cliente.usuario solo para la sala),
+  remito.service (solo arma el PDF), los `include conductor/cliente: true` de
+  cambiarEstado / iniciarViaje / cancelar-* / confirmarParada / calificar (solo
+  chequeos de permiso; no van en la respuesta), admin (es admin).
+
+GUARDS VERIFICADOS REVIRTIENDOLOS (test-precio-v2.js):
+| Guard | Caso que se pone en rojo sin el |
+|-------|---------------------------------|
+| ON CONFLICT del upsert de precio pagado (find + create) | 15e (201,409 en las 5 rondas) |
+| filtro de pings desordenados (avanzarAcumulado) | 8c / 8d + mediciones-gps.test.js |
+| clasificacion de la vista del chofer (precio_estimado visible) | 17b + vista-chofer.test.js |
+| eleccion por version_precio en el cierre (siempre v1) | 8a |
+| emitirViajeInternoDividido (payload con precio al chofer) | 8f / 17b / 17c |
+- llegada_real null en el updateMany de confirmar (una sola escritura de
+  distancia_real_km): no se puede poner en rojo con un flujo secuencial (el
+  segundo confirmar ya lo frena el 400 de "ya confirmada").
+
+### Riesgos aceptados
+- Ventana develop -> main con la DB compartida: el proceso de production (codigo
+  viejo) puede cerrar un viaje v2 de staging (barrido, timer, perezoso) con la v1
+  sobre las tarifas v2 (precio_real raro, precio_medido null), o editarlo con la
+  API vieja. Achicar la ventana; el dataset filtra version 2 y precio_medido.
+- Las estadisticas y el fee del admin suman precio_real, que en v2 incluye IVA y
+  peajes.
+- TRUST_PROXY default 2: verificar las IPs de rl:general:* en staging.
+
+### PENDIENTES
+- Calibrar PRECIO_PEAJES_MULTIPLICADOR_* contra monto_peajes pagado (Google
+  cotiza un auto; 1 / 1 / 2 es una suposicion).
+- Peajes: el codigo VIEJO (production antes del merge a main) que edite un viaje
+  con peajes de Google lo recalcula sin ellos (fuente NINGUNA) y deja
+  peajes_google_ida desactualizado; el cierre viejo usa snapshot.entradas.peajes
+  (sin problema). Achicar la ventana develop -> main.
+- Usar metodo_cobro / parametros_cobro del vinculo (sigue pendiente del Paso 1).
+- Los datos personales de la auditoria (legacy).
+- Hacer atomico el acumulado GPS (Lua) si los pings se vuelven mas frecuentes.
 
 ## Maquina de estados — src/services/estado-viaje.service.js
 Hay DOS ciclos con su tabla cada uno: TRANSICIONES (este, el LEGACY del
@@ -2049,7 +2346,7 @@ algunos eventos legacy, con payload propio (todos llevan id_viaje e
 id_organizacion):
 | Evento               | Destinatario                         | Cuando |
 |----------------------|--------------------------------------|--------|
-| viaje:asignado       | PyME + chofer nuevo                  | crear, reasignar |
+| viaje:asignado       | PyME (con precios) + chofer nuevo (sin precios, Precio v2) | crear, reasignar |
 | viaje:desasignado    | PyME + chofer viejo                  | reasignar |
 | viaje:editado        | PyME + chofer                        | editar (`confirmacion_anulada` si estaba CONFIRMADO) |
 | viaje:confirmado     | PyME                                 | el chofer confirma |
@@ -2057,12 +2354,12 @@ id_organizacion):
 | viaje:iniciado / viaje:estado_cambiado / viaje:finalizado | PyME + viaje:{id} | iniciar, salir, confirmar-parada, cierre. estado_cambiado trae id_parada; finalizado trae estimado, real y paradas (Paso 3) |
 | viaje:cancelado      | PyME + chofer                        | cualquier cancelacion: `causa` CHOFER / ORGANIZACION / ADMIN / DESVINCULACION |
 | viaje:vencido        | PyME + chofer                        | VENCIDO (estado real; `estado_anterior`) |
-| mapa:actualizar, costo:actualizar, eta:actualizar, alerta:desvio, alerta:parada, ruta:recalculada | viaje:{id} + PyME | tracking; mapa y costo sumaron `id_viaje` al payload |
-| serie:asignada (Paso 4) | PyME + chofer | crear serie: UN evento con todos sus viajes (resumenViaje, sin nombres de lugar) en vez de N viaje:asignado |
+| mapa:actualizar, costo:actualizar, eta:actualizar, alerta:desvio, alerta:parada, ruta:recalculada | viaje:{id} + PyME (costo:actualizar de un interno: SOLO la PyME, Precio v2) | tracking; mapa y costo sumaron `id_viaje` al payload |
+| serie:asignada (Paso 4) | PyME + chofer (sin precios, Precio v2) | crear serie: UN evento con todos sus viajes (resumenViaje, sin nombres de lugar) en vez de N viaje:asignado |
 | serie:cancelada (Paso 4) | PyME | cancelar serie (los viajes no cambian) |
 | parada:salida_detectada (Tarea 5) | PyME + chofer | el GPS detecto la salida de una parada, una vez por parada |
 | viaje:cierre_habilitado (Tarea 5) | PyME | se habilito el cierre manual (motivo TIEMPO o GPS), una vez por viaje |
-| viaje:finalizado (Tarea 5) | PyME + viaje:{id} + chofer | suma cerrado_por, incompleto, paradas_no_visitadas y fecha_corte_precio |
+| viaje:finalizado (Tarea 5) | PyME + chofer (Precio v2: con precio SOLO la PyME, el chofer sin precio_real ni desglose; nada a viaje:{id}) | suma cerrado_por, incompleto, paradas_no_visitadas y fecha_corte_precio; Precio v2: version_precio y precio_pagado_pendiente (PyME) |
 
 El tracking llega a la sala de la PyME porque los emisores reciben las salas de
 salasDeViaje(viaje) (sockets/salas.js) en vez de armar `viaje:${id}` a mano.
@@ -2188,8 +2485,26 @@ CORS_ORIGINS                      (Tarea 6: origenes web permitidos, por coma,
                                    sin barra final; `*` = UNA etiqueta del host.
                                    Sin la variable: todo abierto como antes +
                                    warning al arrancar. Se lee AL ARRANCAR)
-TRUST_PROXY=1                     (saltos de proxy: `trust proxy` y la IP del
-                                   handshake. Al arrancar)
+TRUST_PROXY=2                     (saltos de proxy: `trust proxy` y la IP del
+                                   handshake. Default 2 desde el Precio v2
+                                   (Railway necesita 2). Al arrancar)
+PEAJES_GOOGLE_HABILITADO=true     (Precio v2: kill switch de los peajes de
+                                   Google. true / 1 o false / 0; otra cosa ->
+                                   default + warning. Se lee en cada calculo)
+PRECIO_PEAJES_FACTOR_VUELTA=2     (monto de Google = ida x FACTOR x
+PRECIO_PEAJES_MULTIPLICADOR_LIVIANO=1  MULTIPLICADOR del servicio. En el
+PRECIO_PEAJES_MULTIPLICADOR_EQUIPO=1   snapshot del viaje)
+PRECIO_PEAJES_MULTIPLICADOR_CAMION=2
+PRECIO_PEAJES_CACHE_SEGUNDOS=900  (cache en Redis del crudo de Google; 0 = sin
+                                   cache)
+PRECIO_* / FEEDBACK_PRECIO_*      (Precio v2: los 27 numeros y del
+                                   feedback, con su default en config/precio.js
+                                   y en .env.example. Finito >= 0 se usa (el 0
+                                   vale); vacio / invalido / negativo -> default
+                                   + warning al arrancar. Horas minimas,
+                                   fraccion y redondeo > 0; cantidades y dias
+                                   enteros. Se leen en cada calculo; el viaje
+                                   guarda su snapshot)
 RATE_LIMIT_HABILITADO=1           ('0' / 'false' apagan TODOS los limiters.
                                    SOLO tests / local: conServer y el runner lo
                                    ponen en 0 solos)
@@ -2235,8 +2550,9 @@ MATCHING_TIMEOUT eliminado POR COMPLETO — no queda ningun rastro:
   VENTANA_INICIO_DESPUES_MINUTOS (los dos procesos vencen viajes de la misma DB),
   y CIERRE_EXTENSION_MINUTOS (los dos procesos cierran solos viajes de la misma
   DB).
-  Conviene que MAX_PARADAS_POR_VIAJE tambien valga lo mismo (un viaje creado en
-  un environment se edita desde el otro). LICENCIA_OPCIONAL se prende en los
+  Conviene que MAX_PARADAS_POR_VIAJE y las PRECIO_* tambien valgan lo mismo (un
+  viaje creado en un environment se edita desde el otro; el cierre usa el
+  snapshot del viaje igual). LICENCIA_OPCIONAL se prende en los
   dos a la vez, y solo con el Paso A en production.
 - RADIO_CONFIRMACION_METROS esta en 200 en staging y production (el default de
   codigo es 50). El contrato del front (e2e/sim/CONTRATO-FINALIZAR.md) lo
@@ -2268,8 +2584,8 @@ MATCHING_TIMEOUT eliminado POR COMPLETO — no queda ningun rastro:
   cambios.
 - `e2e-staging`: needs deploy-staging, SOLO en push a develop. Antes de correr
   hace poll de GET /health cada 10 s, hasta 5 min, esperando que `capacidades`
-  incluya "viaje-interno" (solo existe en el deploy nuevo); si no aparece, falla
-  con "staging no tiene el deploy nuevo". Despues npm run test:e2e.
+  incluya "peajes-google" (la ultima capacidad; antes "viaje-interno"); si no
+  aparece, falla con "staging no tiene el deploy nuevo". Despues npm run test:e2e.
 - Por que /health y no una ruta nueva: organizaciones.routes hace
   router.use(verificarToken, ...), asi que en el codigo VIEJO cualquier
   /api/organizaciones/* sin token ya daba 401 — no distingue los deploys. Para
@@ -2487,6 +2803,26 @@ node scripts/test-cierre-viaje.js          (Tarea 5: finalizar de la PyME (antes
                                             RONDAS=N (carreras) y --restos
                                             [--borrar]. Google REAL: ~33 llamadas
                                             Pro por corrida)
+
+node scripts/test-precio-v2.js             (Precio v2: crear / editar / estimar-precio
+                                            / serie con datos de la Parte B y con
+                                            defaults, factura A de la PyME, lugar
+                                            con acceso, cierre en los 3 modos con y
+                                            sin GPS (3972 para el automatico),
+                                            cancelacion en curso, viaje v1 que
+                                            cierra con v1, vivo REST y socket en
+                                            MIXTO, feedback (upsert concurrente,
+                                            RONDAS=N), pendientes, dataset admin y
+                                            el chequeo RECURSIVO de todo lo que
+                                            recibe el chofer (3973 con el
+                                            marketplace prendido) y el CASO 18 de
+                                            peajes de Google (La Plata, Nunez,
+                                            PyME, estimar + crear = 1
+                                            llamada, serie = 1, editar, kill switch
+                                            en 3974). NO usa :3000 — levanta 3971.
+                                            Acepta numeros de caso y --restos
+                                            [--borrar]. Google REAL: ~60 llamadas
+                                            Pro y ~10 Enterprise por corrida)
 
 scripts/_server-efimero.js es el helper compartido que levanta src/app.js en un
 puerto propio con el env que se le pida. Lo usan el CASO 8 de test-jerarquia

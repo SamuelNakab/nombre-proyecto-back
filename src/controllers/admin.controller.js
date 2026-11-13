@@ -527,7 +527,7 @@ export async function cancelarViaje(req, res) {
     // Cancelado EN CURSO: se guarda lo medido hasta ahora, ANTES de limpiar
     // Redis (la distancia real sale del acumulado GPS). Nunca tira.
     if (ESTADOS_EN_CURSO.includes(estadoAnterior)) {
-      await guardarMedicionParcial(id_viaje, ahora);
+      await guardarMedicionParcial(id_viaje, ahora, { id_usuario: req.usuario.id_usuario });
     }
     await limpiarViajeActivo(id_viaje);
   }

@@ -231,6 +231,8 @@ export function tiemposParada(parada, { terminado = false } = {}) {
     manejo_estimado_min: horasAMinutos(parada.manejo_estimado_horas),
     peon_real_min: horasAMinutos(parada.peon_real_horas),
     manejo_real_min: horasAMinutos(parada.manejo_real_horas),
+    // Manejo SIN transito del tramo que llega (staticDuration de Routes).
+    manejo_sin_transito_min: horasAMinutos(parada.manejo_sin_transito_horas),
     diferencia_min:
       llegada_real && llegada_estimada
         ? Math.round((new Date(llegada_real).getTime() - new Date(llegada_estimada).getTime()) / 60000)

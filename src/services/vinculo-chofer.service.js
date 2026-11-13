@@ -164,7 +164,7 @@ export async function desvincularChofer({ id_organizacion, id_conductor, actor, 
       // Cancelado EN CURSO: se guarda lo medido hasta la desvinculacion, ANTES
       // de limpiar Redis. Nunca tira.
       if (ESTADOS_EN_CURSO.includes(estado)) {
-        await guardarMedicionParcial(id_viaje, ahora);
+        await guardarMedicionParcial(id_viaje, ahora, { id_usuario: actor.id_usuario ?? null });
       }
       // Idempotente: en los pre-inicio no hay nada, en los en curso corta el
       // emisor de ETA y borra todas las keys gps:{id}:*.

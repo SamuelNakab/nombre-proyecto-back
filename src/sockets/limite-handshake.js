@@ -53,9 +53,13 @@ export function ipDeHandshake(req, env = process.env) {
   return req?.socket?.remoteAddress ?? 'desconocida';
 }
 
+// Default 2: Railway pone DOS saltos de proxy delante de la app (con 1, req.ip
+// era la IP de un proxy de Railway y el rate limit por IP la compartia).
+export const TRUST_PROXY_DEFAULT = 2;
+
 export function saltosProxy(env = process.env) {
-  const n = Number(env.TRUST_PROXY ?? 1);
-  return Number.isInteger(n) && n >= 0 ? n : 1;
+  const n = Number(env.TRUST_PROXY ?? TRUST_PROXY_DEFAULT);
+  return Number.isInteger(n) && n >= 0 ? n : TRUST_PROXY_DEFAULT;
 }
 
 // io.use: va ANTES de autenticarSocket.

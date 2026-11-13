@@ -2,12 +2,35 @@
 
 Copia textual de `context/api-contracts/context.md` del repo del dashboard (26-10-2026), **corregida por
 el backend el 27-10-2026** con lo que reportó `HALLAZGOS.md` (radio, eventos de la última salida, payload
-de `viaje:estado_cambiado`), el pedido del front del 20-10-2026 (motivo, descripción, sin condiciones) y
-la Tarea 5 (cierre sin "Salir"). El contrato completo es `API.md` en la raíz del backend.
+de `viaje:estado_cambiado`), el pedido del front del 20-10-2026 (motivo, descripción, sin condiciones),
+la Tarea 5 (cierre sin "Salir") y el Precio v2 (el chofer no ve precios). El contrato completo es
+`API.md` en la raíz del backend.
 
 Si algo de acá no coincide con lo que hace el backend, la discrepancia se reporta; no se "arregla" el test
 para que pase. **Regla del backend: cualquier cambio en el ciclo del viaje interno actualiza este archivo
 y `sim-finalizar-viaje.mjs` en el mismo PR.**
+
+### Precio v2 (viajes de PyME)
+
+1. **Precio v2.** Todo viaje creado o editado desde este cambio trae `version_precio: 2`,
+   `precio_estimado` en pesos enteros (múltiplo de $1.000, con IVA si hay factura A y con peajes),
+   `precio_estimado_min` / `precio_estimado_max` (rango) y `desglose_estimado` con la forma v2
+   (`version: 2`, `subtotal_sin_iva`, `iva`, `peajes`, `total`, `bajo`, `alto`, ...). Al cerrar:
+   `precio_real` = `precio_medido` (pesos enteros) y `precio_medido_desglose`.
+2. **Datos opcionales nuevos** al crear / editar (todo opcional, el body de siempre sigue andando):
+   `tipo_servicio`, `ayudantes`, `factura_a`, `peajes_estimados` (total del viaje, ida y vuelta), carga, y
+   por parada `acceso` / `pisos` / `operacion`. Ver `API.md` → "Precio v2".
+3. **El chofer no ve precios.** `POST /api/choferes/viajes/:id/salir` de la última **ya no trae
+   `precio_real`**; el detalle / la lista del chofer y `GET /api/viajes/:id` no traen precios, tarifas ni
+   datos del creador; `viaje:finalizado` al chofer viene **sin `precio_real` ni `desglose`**;
+   `viaje:asignado` / `viaje:editado` / `serie:asignada` al chofer, sin `precio_estimado`;
+   `GET /api/viajes/:id/costo-acumulado` de un viaje de PyME → **403**.
+4. **A la PyME**: `viaje:finalizado` trae `precio_real`, `desglose` (v2), `version_precio` y
+   `precio_pagado_pendiente: true`; el detalle trae `precio_pagado` (`null` hasta que se carga) y
+   `precio_pagado_pendiente`. `costo:actualizar` y el `viaje:finalizado` con precio van **solo** a la sala
+   de la PyME.
+5. **Remito**: el PDF de un viaje de PyME **no lleva bloque de costo** (ni desglose ni TOTAL). El chofer lo
+   sigue recibiendo (`remito_url`).
 
 ### Pedido del front 20-10-2026 (viajes de PyME)
 
@@ -190,7 +213,8 @@ de esa parada.
 
 - Desde `CARGANDO` (parada 1) o `DESCARGANDO` (cualquier otra) → **`EN_RUTA`** si quedan paradas.
 - Desde la **última** parada → **`FINALIZADO`**: el cierre de siempre (precio real, remito, distancia
-  real) más los tiempos reales. Emite `viaje:finalizado`.
+  real) más los tiempos reales. Emite `viaje:finalizado`. La respuesta al chofer **no trae `precio_real`**
+  (Precio v2): el precio lo ve la PyME.
 - No valida proximidad: salir es irse.
 
 **Autenticación:** Requerida — rol `CONDUCTOR`, el chofer asignado.
@@ -215,7 +239,6 @@ de esa parada.
   "estado": "FINALIZADO",
   "salida_real": "2026-10-09T21:36:23.652Z",
   "viaje_finalizado": true,
-  "precio_real": 6.013888888888889,
   "remito_url": "https://pub-259e35cb295345b4b029cc3b28a349e8.r2.dev/remitos/883.pdf",
   "estimado": {
     "manejo_horas": 0.2297222222222222,
@@ -293,10 +316,11 @@ prevista cae después, la prevista + `CIERRE_EXTENSION_MINUTOS`), completo o inc
 ```
 `cerrado_por`: `CHOFER` | `ORGANIZACION` | `AUTOMATICO` (null mientras está abierto).
 
-**`viaje:finalizado`** (PyME + sala del viaje + chofer) suma `cerrado_por`, `incompleto`,
-`paradas_no_visitadas` (ids) y `fecha_corte_precio` a lo de siempre (`precio_real`, `remito_url`,
-`estimado`, `real`, `paradas`). En el flujo normal: `cerrado_por: "CHOFER"`, `incompleto: false`,
-`paradas_no_visitadas: []`.
+**`viaje:finalizado`** (PyME + chofer) suma `cerrado_por`, `incompleto`,
+`paradas_no_visitadas` (ids) y `fecha_corte_precio` a lo de siempre (`remito_url`, `estimado`, `real`,
+`paradas`). En el flujo normal: `cerrado_por: "CHOFER"`, `incompleto: false`, `paradas_no_visitadas: []`.
+Precio v2: a la **PyME** (solo su sala) con `precio_real`, `desglose` (v2), `version_precio` y
+`precio_pagado_pendiente: true`; al **chofer** sin `precio_real` ni `desglose`.
 
 ---
 
@@ -510,7 +534,8 @@ emiten con la forma `{ "error": "..." }` (no `{ "mensaje": "..." }`):
 - Guarda coordenada en Redis (historial de últimas 20)
 - Acumula distancia y tiempo
 - Arranca (si no estaba activo) el emisor periódico de ETA del viaje, que emite `eta:actualizar` cada 30 s al room
-- Emite `mapa:actualizar`, y cada ~60 s emite `costo:actualizar`
+- Emite `mapa:actualizar`, y cada ~60 s emite `costo:actualizar` (en un viaje de PyME solo a la sala de
+  la PyME, con el precio v2 en vivo)
 - Si el viaje está en `EN_RUTA`: verifica desvíos (y recalcula la ruta si corresponde) y paradas sospechosas
 
 ---
@@ -526,16 +551,16 @@ personal. Todos los payloads traen `id_viaje` e `id_organizacion`.
 
 | Evento | Quién lo recibe | Cuándo |
 |---|---|---|
-| `viaje:asignado` | PyME + chofer | Al crear, y al chofer nuevo al reasignar. Trae `motivo` y `descripcion`; **no** trae `condiciones_requeridas` |
+| `viaje:asignado` | PyME + chofer | Al crear, y al chofer nuevo al reasignar. Trae `motivo` y `descripcion`; **no** trae `condiciones_requeridas`. Precio v2: a la PyME con `precio_estimado` / `_min` / `_max`; al chofer **sin** precios |
 | `viaje:desasignado` | PyME + chofer anterior | Al reasignar |
-| `viaje:editado` | PyME + chofer | Al editar. `confirmacion_anulada: true` si estaba `CONFIRMADO` |
+| `viaje:editado` | PyME + chofer | Al editar. `confirmacion_anulada: true` si estaba `CONFIRMADO`. Al chofer sin precios (Precio v2) |
 | `viaje:confirmado` | PyME | El chofer confirma |
 | `viaje:rechazado` | PyME | El chofer rechaza |
-| `viaje:iniciado`, `viaje:estado_cambiado`, `viaje:finalizado` | PyME (y `finalizado` también al chofer) | Iniciar, salir, confirmar parada, cierre. `estado_cambiado` trae `estado_anterior`, `estado_nuevo` e `id_parada` (la última salida no lo emite); `finalizado` trae `estimado`, `real`, `paradas`, `cerrado_por`, `incompleto`, `paradas_no_visitadas` y `fecha_corte_precio` |
+| `viaje:iniciado`, `viaje:estado_cambiado`, `viaje:finalizado` | PyME (y `finalizado` también al chofer) | Iniciar, salir, confirmar parada, cierre. `estado_cambiado` trae `estado_anterior`, `estado_nuevo` e `id_parada` (la última salida no lo emite); `finalizado` trae `estimado`, `real`, `paradas`, `cerrado_por`, `incompleto`, `paradas_no_visitadas` y `fecha_corte_precio` (a la PyME además `precio_real`, `desglose`, `version_precio` y `precio_pagado_pendiente`; al chofer sin precio) |
 | `viaje:cancelado` | PyME + chofer | Cualquier cancelación. `causa`: `CHOFER` / `ORGANIZACION` / `ADMIN` / `DESVINCULACION` |
 | `viaje:vencido` | PyME + chofer | Pasó a `VENCIDO`. Trae `estado_anterior` |
-| `mapa:actualizar`, `costo:actualizar`, `eta:actualizar`, `alerta:desvio`, `alerta:parada`, `ruta:recalculada` | PyME | Tracking en vivo de sus viajes en curso |
-| `serie:asignada` (Paso 4) | PyME + chofer | Al crear una serie: **un** evento con todos sus viajes. Ver [Series](#websocket--serieasignada-y-seriecancelada) |
+| `mapa:actualizar`, `costo:actualizar`, `eta:actualizar`, `alerta:desvio`, `alerta:parada`, `ruta:recalculada` | PyME | Tracking en vivo de sus viajes en curso. `costo:actualizar`: `precio_acumulado`, `version_precio` y el desglose (v2) |
+| `serie:asignada` (Paso 4) | PyME + chofer | Al crear una serie: **un** evento con todos sus viajes. Ver [Series](#websocket--serieasignada-y-seriecancelada). Al chofer sin precios (Precio v2) |
 | `serie:cancelada` (Paso 4) | PyME | Al cancelar una serie (sus viajes no cambian) |
 | `parada:salida_detectada` (Tarea 5) | PyME + chofer | El GPS detectó que el chofer se fue de una parada (una vez por parada) |
 | `viaje:cierre_habilitado` (Tarea 5) | PyME | Se habilitó el cierre manual: `motivo` `TIEMPO` (pasó la hora prevista) o `GPS` (salida detectada) |

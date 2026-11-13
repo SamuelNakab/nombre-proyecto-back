@@ -53,7 +53,7 @@ export async function estimarRecorrido({ paradas, inicio, peonMinutos, calcularT
   let distancia_km = 0;
   let manejo_horas = 0;
   let llegadaMs = inicioMs;
-  let tramoQueLlega = { manejo: null, distancia: null };
+  let tramoQueLlega = { manejo: null, distancia: null, sinTransito: null };
 
   for (let i = 0; i < paradas.length; i++) {
     const salidaMs = llegadaMs + peonMs;
@@ -64,6 +64,7 @@ export async function estimarRecorrido({ paradas, inicio, peonMinutos, calcularT
       peon_estimado_horas: peonHoras,
       manejo_estimado_horas: tramoQueLlega.manejo,
       distancia_estimada_km: tramoQueLlega.distancia,
+      manejo_sin_transito_horas: tramoQueLlega.sinTransito,
     });
     if (i === paradas.length - 1) break;
 
@@ -91,7 +92,11 @@ export async function estimarRecorrido({ paradas, inicio, peonMinutos, calcularT
     distancia_km += tramo.distancia_km;
     manejo_horas += tramo.manejo_horas;
     polilineas.push(tramo.polilinea ?? []);
-    tramoQueLlega = { manejo: tramo.manejo_horas, distancia: tramo.distancia_km };
+    tramoQueLlega = {
+      manejo: tramo.manejo_horas,
+      distancia: tramo.distancia_km,
+      sinTransito: tramo.manejo_sin_transito_horas ?? null,
+    };
     llegadaMs = salidaPedidoMs + tramo.manejo_horas * HORA_MS;
   }
 
@@ -130,6 +135,7 @@ export function columnasEstimadasParada(estimada) {
     peon_estimado_horas: estimada.peon_estimado_horas,
     manejo_estimado_horas: estimada.manejo_estimado_horas,
     distancia_estimada_km: estimada.distancia_estimada_km,
+    manejo_sin_transito_horas: estimada.manejo_sin_transito_horas ?? null,
   };
 }
 

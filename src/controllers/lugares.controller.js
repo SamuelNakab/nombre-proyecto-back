@@ -7,6 +7,7 @@ import { responderErrorNegocio } from '../services/error-negocio.js';
 import { listarLugares, crearLugar, editarLugar, borrarLugar } from '../services/lugar.service.js';
 import { responder400 } from '../services/errores-validacion.js';
 import { idParam } from '../services/id-param.js';
+import { schemaAcceso, schemaPisos, faltanPisos, MENSAJE_PISOS } from '../services/viaje-validacion.js';
 
 const nombre = z
   .string({ error: 'nombre es requerido' })
@@ -21,9 +22,24 @@ const direccion = z
 const lat = z.number({ error: 'lat es requerido' }).min(-90, 'lat invalida').max(90, 'lat invalida');
 const lng = z.number({ error: 'lng es requerido' }).min(-180, 'lng invalida').max(180, 'lng invalida');
 
-const schemaCrear = z.object({ nombre, direccion, lat, lng });
+// Precio v2: acceso y pisos POR DEFECTO de las paradas que usen el lugar.
+// Opcionales; null = no declarado. pisos obligatorio con ESCALERA / ASCENSOR
+// (al editar se valida el estado resultante en el service).
+const acceso_por_defecto = schemaAcceso.nullable().optional();
+const pisos_por_defecto = schemaPisos.nullable().optional();
+
+const schemaCrear = z
+  .object({ nombre, direccion, lat, lng, acceso_por_defecto, pisos_por_defecto })
+  .refine((d) => !faltanPisos(d.acceso_por_defecto, d.pisos_por_defecto), { message: MENSAJE_PISOS });
 const schemaEditar = z
-  .object({ nombre: nombre.optional(), direccion: direccion.optional(), lat: lat.optional(), lng: lng.optional() })
+  .object({
+    nombre: nombre.optional(),
+    direccion: direccion.optional(),
+    lat: lat.optional(),
+    lng: lng.optional(),
+    acceso_por_defecto,
+    pisos_por_defecto,
+  })
   .refine((d) => Object.values(d).some((v) => v !== undefined), {
     message: 'Mandá al menos un campo para editar (nombre, direccion, lat o lng)',
   });

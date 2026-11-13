@@ -49,17 +49,44 @@ const paradaCoordenadas = z.object({
 // Paradas de la ruta LEGACY y de estimar-costo: solo coordenadas.
 export const schemaParadas = conTopeParadas(paradaCoordenadas);
 
+// ─── Precio v2: acceso de cada parada ────────────────────────────────────────
+
+export const ACCESOS = ['PLANTA_BAJA', 'ESCALERA', 'ASCENSOR'];
+export const OPERACIONES = ['CARGA', 'DESCARGA', 'CARGA_Y_DESCARGA'];
+export const PISOS_MAX = 60;
+export const ACCESOS_CON_PISOS = ['ESCALERA', 'ASCENSOR'];
+export const MENSAJE_PISOS = 'pisos es obligatorio si el acceso es ESCALERA o ASCENSOR';
+
+export const schemaAcceso = z.enum(ACCESOS);
+export const schemaPisos = z.number().int().min(0).max(PISOS_MAX);
+
+// Opcionales: null o ausente = no declarado (el calculo usa PLANTA_BAJA).
+const camposAccesoParada = {
+  acceso: schemaAcceso.nullable().optional(),
+  pisos: schemaPisos.nullable().optional(),
+  operacion: z.enum(OPERACIONES).nullable().optional(),
+};
+
+// pisos obligatorio con ESCALERA / ASCENSOR (en la parada; con { id_lugar } y
+// sin acceso, el acceso y los pisos se copian del lugar).
+export function faltanPisos(acceso, pisos) {
+  return ACCESOS_CON_PISOS.includes(acceso) && (pisos === undefined || pisos === null);
+}
+
 // Paradas del ciclo INTERNO y de las series (Paso 4): cada una es un lugar
 // guardado { id_lugar } O coordenadas { lat, lng, direccion? }, nunca las dos
-// cosas (no hay forma razonable de decidir cual gana).
+// cosas (no hay forma razonable de decidir cual gana). Precio v2: acceso, pisos
+// y operacion opcionales en las dos formas.
 const paradaInterna = z
   .object({
     id_lugar: z.number().int('id_lugar invalido').positive('id_lugar invalido').max(ID_MAX, 'id_lugar invalido').optional(),
     lat: z.number().optional(),
     lng: z.number().optional(),
     direccion: z.string().min(1).optional(),
+    ...camposAccesoParada,
   })
   .superRefine((p, ctx) => {
+    if (faltanPisos(p.acceso, p.pisos)) ctx.addIssue({ code: 'custom', message: MENSAJE_PISOS });
     const tieneCoordenadas = p.lat !== undefined || p.lng !== undefined || p.direccion !== undefined;
     if (p.id_lugar !== undefined) {
       if (tieneCoordenadas) {
@@ -73,6 +100,42 @@ const paradaInterna = z
   });
 
 export const schemaParadasInternas = conTopeParadas(paradaInterna);
+
+// ─── Precio v2: datos que declara la PyME (viaje y serie) ────────────────────
+
+// Todo OPCIONAL (el front actual no lo manda). Ausente o null = no declarado: se
+// guarda null y el calculo usa el default (el snapshot registra el valor usado).
+// En editar, null borra lo declarado. Las reglas que dependen del env (ayudantes
+// por servicio, escalera) van en validarDatosPrecio (precio-entradas.js), sobre
+// el estado resultante.
+export const TIPOS_SERVICIO = ['LIVIANO', 'EQUIPO', 'CAMION'];
+export const TIPOS_CARGA = ['GENERAL', 'REFRIGERADA', 'PELIGROSA', 'FRAGIL'];
+export const LIMITES_DATOS = {
+  ayudantes: 1000,
+  peajes_estimados: 10_000_000,
+  bultos: 10_000,
+  peso_kg: 45_000,
+  volumen_m3: 120,
+  pallets: 60,
+  valor_declarado: 2_000_000_000,
+};
+
+const entero = (min, max) => z.number().int().min(min).max(max);
+const positivoHasta = (max) => z.number().positive().max(max);
+
+export const camposDatosPrecio = {
+  tipo_servicio: z.enum(TIPOS_SERVICIO).nullable().optional(),
+  ayudantes: entero(0, LIMITES_DATOS.ayudantes).nullable().optional(),
+  factura_a: z.boolean().nullable().optional(),
+  // TOTAL de peajes del viaje (ida y vuelta), en pesos enteros.
+  peajes_estimados: entero(0, LIMITES_DATOS.peajes_estimados).nullable().optional(),
+  tipo_carga: z.enum(TIPOS_CARGA).nullable().optional(),
+  bultos: entero(1, LIMITES_DATOS.bultos).nullable().optional(),
+  peso_kg: positivoHasta(LIMITES_DATOS.peso_kg).nullable().optional(),
+  volumen_m3: positivoHasta(LIMITES_DATOS.volumen_m3).nullable().optional(),
+  pallets: entero(0, LIMITES_DATOS.pallets).nullable().optional(),
+  valor_declarado: entero(0, LIMITES_DATOS.valor_declarado).nullable().optional(),
+};
 
 // Condiciones requeridas: SOLO de la ruta legacy (POST /api/viajes). El ciclo
 // interno y las series ya no las piden ni las validan (pedido del front
@@ -178,14 +241,36 @@ export const schemaFechaProgramada = z.string().superRefine((val, ctx) => {
 // viaja nunca en la fila de la parada, asi que ningun serializador que spreadee
 // la fila cruda se lo puede mostrar al chofer. Una parada con coordenadas queda
 // igual, con id_lugar null.
+//
+// Precio v2: acceso / pisos / operacion. Con { id_lugar } y SIN acceso, el acceso
+// y los pisos se COPIAN del lugar (acceso_por_defecto / pisos_por_defecto); si la
+// parada manda acceso, gana el de la parada. null = no declarado.
 export function snapshotParadas(paradas, lugaresPorId) {
   return paradas.map((p) => {
+    const operacion = p.operacion ?? null;
     if (p.id_lugar === undefined || p.id_lugar === null) {
-      return { lat: p.lat, lng: p.lng, ...(p.direccion ? { direccion: p.direccion } : {}), id_lugar: null };
+      return {
+        lat: p.lat,
+        lng: p.lng,
+        ...(p.direccion ? { direccion: p.direccion } : {}),
+        id_lugar: null,
+        acceso: p.acceso ?? null,
+        pisos: p.pisos ?? null,
+        operacion,
+      };
     }
     const lugar = lugaresPorId.get(p.id_lugar);
     if (!lugar) throw new Error(`snapshotParadas: falta el lugar ${p.id_lugar}`);
-    return { lat: lugar.latitud, lng: lugar.longitud, direccion: lugar.direccion, id_lugar: lugar.id_lugar };
+    const delLugar = p.acceso === undefined || p.acceso === null;
+    return {
+      lat: lugar.latitud,
+      lng: lugar.longitud,
+      direccion: lugar.direccion,
+      id_lugar: lugar.id_lugar,
+      acceso: delLugar ? (lugar.acceso_por_defecto ?? null) : p.acceso,
+      pisos: delLugar ? (lugar.pisos_por_defecto ?? null) : (p.pisos ?? null),
+      operacion,
+    };
   });
 }
 
@@ -198,5 +283,9 @@ export function paradasParaCrear(paradas) {
     longitud: p.lng,
     direccion: p.direccion ?? `${p.lat},${p.lng}`,
     id_lugar: p.id_lugar ?? null,
+    // Precio v2 (null en la ruta legacy, que no los acepta).
+    acceso: p.acceso ?? null,
+    pisos: p.pisos ?? null,
+    operacion: p.operacion ?? null,
   }));
 }

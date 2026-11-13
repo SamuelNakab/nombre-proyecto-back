@@ -161,6 +161,65 @@ enum EstadoSerie {
   BORRADA
 }
 
+// ── Precio v2 (viajes internos) ──
+// Enums NUEVOS, usados solo en columnas nuevas (la DB esta compartida: no se
+// toca ningun enum existente).
+
+// Tipo de servicio que declara la PyME. Si no lo declara se guarda null y el
+// calculo usa LIVIANO (el snapshot registra el valor usado).
+enum TipoServicio {
+  LIVIANO
+  EQUIPO
+  CAMION
+}
+
+// Acceso a una parada. null = no declarado (el calculo usa PLANTA_BAJA).
+enum AccesoParada {
+  PLANTA_BAJA
+  ESCALERA
+  ASCENSOR
+}
+
+enum OperacionParada {
+  CARGA
+  DESCARGA
+  CARGA_Y_DESCARGA
+}
+
+// Datos de la carga: NO entran en la formula; se guardan para recalibrar.
+enum TipoCarga {
+  GENERAL
+  REFRIGERADA
+  PELIGROSA
+  FRAGIL
+}
+
+// De donde salieron los peajes del calculo. GOOGLE esta RESERVADO: el calculo
+// de peajes de Routes factura Enterprise y no se implemento, pero el valor se
+// crea ahora porque agregarlo despues a un enum con la DB compartida rompe al
+// Prisma del deploy viejo.
+enum FuentePeajes {
+  PYME
+  GOOGLE
+  NINGUNA
+}
+
+// Por que se calculo un precio (historial_precio_viaje).
+enum MotivoCalculoPrecio {
+  CREAR
+  EDITAR
+  CIERRE
+  CANCELACION_EN_CURSO
+}
+
+// Como pago la PyME el flete (feedback del precio pagado). No se llama
+// MetodoPago porque ese nombre ya es un modelo.
+enum MetodoPagoFlete {
+  EFECTIVO
+  TRANSFERENCIA
+  OTRO
+}
+
 // ─────────────────────────────────────────────
 // USUARIO BASE
 // ─────────────────────────────────────────────
@@ -217,14 +276,14 @@ model Cliente {
 // ─────────────────────────────────────────────
 
 model Conductor {
-  id_conductor          Int      @id @default(autoincrement())
-  id_usuario            Int      @unique
+  id_conductor          Int       @id @default(autoincrement())
+  id_usuario            Int       @unique
   // Opcionales desde el pedido del front 20-10-2026 (Paso A): la base acepta
   // NULL, pero el registro las sigue exigiendo mientras LICENCIA_OPCIONAL no
   // sea true (Paso B). Ver "Licencia opcional" en CLAUDE.md.
   nro_licencia          String?
   licencia_vencimiento  DateTime?
-  calificacion_promedio Float    @default(0)
+  calificacion_promedio Float     @default(0)
 
   usuario               Usuario             @relation(fields: [id_usuario], references: [id_usuario])
   conductor_empresas    ConductorEmpresa[]
@@ -248,14 +307,18 @@ model Conductor {
 // ─────────────────────────────────────────────
 
 model Organizacion {
-  id_organizacion Int                @id @default(autoincrement())
-  nombre          String
-  cuit            String
-  razon_social    String?
-  direccion       String?
-  estado          EstadoOrganizacion @default(TRIAL)
-  creado_en       DateTime           @default(now())
-  actualizado_en  DateTime           @updatedAt
+  id_organizacion       Int                @id @default(autoincrement())
+  nombre                String
+  cuit                  String
+  razon_social          String?
+  direccion             String?
+  estado                EstadoOrganizacion @default(TRIAL)
+  // Precio v2: factura A por defecto de los viajes de la PyME cuando el viaje
+  // no la declara. null = no configurado (el calculo usa false). Editable por
+  // un RESPONSABLE.
+  factura_a_por_defecto Boolean?
+  creado_en             DateTime           @default(now())
+  actualizado_en        DateTime           @updatedAt
 
   miembros     MiembroOrganizacion[]
   invitaciones Invitacion[]
@@ -279,19 +342,23 @@ model Organizacion {
 // ─────────────────────────────────────────────
 
 model Lugar {
-  id_lugar            Int       @id @default(autoincrement())
+  id_lugar            Int           @id @default(autoincrement())
   id_organizacion     Int
   nombre              String
   direccion           String
   latitud             Float
   longitud            Float
-  activo              Boolean   @default(true)
+  // Precio v2: acceso y pisos por defecto. Una parada que usa este lugar y no
+  // manda acceso los COPIA (snapshot). null = no declarado.
+  acceso_por_defecto  AccesoParada?
+  pisos_por_defecto   Int?
+  activo              Boolean       @default(true)
   id_creador          Int
   fecha_baja          DateTime?
   // Sin FK, mismo criterio que miembros_organizacion.baja_por_id_usuario.
   baja_por_id_usuario Int?
-  creado_en           DateTime  @default(now())
-  actualizado_en      DateTime  @updatedAt
+  creado_en           DateTime      @default(now())
+  actualizado_en      DateTime      @updatedAt
 
   organizacion Organizacion @relation(fields: [id_organizacion], references: [id_organizacion])
   creador      Usuario      @relation(fields: [id_creador], references: [id_usuario])
@@ -331,6 +398,18 @@ model SerieViaje {
   descripcion         String?
   // Para que es cada viaje (1 a 120 caracteres). Se copia a cada viaje generado.
   motivo              String?
+  // ── Precio v2: lo que declaro la PyME (null = no declarado). Se copia a cada
+  // viaje generado. La plantilla `paradas` lleva acceso / pisos / operacion.
+  tipo_servicio       TipoServicio?
+  ayudantes           Int?
+  factura_a           Boolean?
+  peajes_estimados    Int?
+  tipo_carga          TipoCarga?
+  bultos              Int?
+  peso_kg             Float?
+  volumen_m3          Float?
+  pallets             Int?
+  valor_declarado     Int?
   estado              EstadoSerie     @default(ACTIVA)
   fecha_baja          DateTime?
   // Sin FK, mismo criterio que miembros_organizacion.baja_por_id_usuario.
@@ -588,10 +667,10 @@ model Viaje {
   tarifa_km               Float?
   distancia_provincia     Float?
   tiempo_capital          Float?
-  // Duracion total estimada de la ruta (Google Distance Matrix), en HORAS.
-  // Es el mismo tiempo_horas que costo.service usa para estimar el precio: se
-  // persiste al crear el viaje para no tener que volver a pedirlo a Google en
-  // cada lectura del detalle. La API lo expone convertido a MINUTOS enteros
+  // Duracion TOTAL estimada del viaje, en HORAS: manejo con transito (Routes
+  // API) + peon en cada parada (ver estimacion.service.js). NO es input del
+  // precio: el precio v1 usa solo el manejo y el v2 el manejo + minutos por
+  // parada (precio-entradas.js). La API lo expone en MINUTOS enteros
   // (duracion_estimada) — ver duracion.service.js.
   duracion_estimada_horas Float?
   fecha_programada        DateTime
@@ -664,17 +743,53 @@ model Viaje {
   // ── Serie (Paso 4) ──
   // La serie que lo genero. Nullable: los viajes sueltos no tienen. Editar,
   // reasignar o cancelar el viaje NO toca la serie ni a los otros viajes.
-  id_serie              Int?
+  id_serie Int?
 
   // ── Cierre sin "Salir" (Tarea 5) ──
   // Nullable: legacy y viajes anteriores no las tienen.
   // cerrado_por: quien cerro un FINALIZADO interno (ver CierreViaje).
   // fecha_corte_precio: el instante en que termino la medicion del precio real
   // (cierre-plan.js). En el flujo normal es la salida de la ultima parada.
-  cerrado_por           CierreViaje?
-  fecha_corte_precio    DateTime?
+  cerrado_por        CierreViaje?
+  fecha_corte_precio DateTime?
 
-  cliente             Cliente               @relation(fields: [id_cliente], references: [id_cliente])
+  // ── Precio v2 (viajes internos) ──
+  // Todas nullable: los viajes legacy y los creados por el codigo viejo no las
+  // tienen. version_precio null = v1 (se estima, se muestra en vivo y se cierra
+  // con la formula vieja); 2 = v2. Un viaje se cierra siempre con la version con
+  // la que se estimo. precio_parametros es el SNAPSHOT de parametros y entradas
+  // del estimado: el medido y el vivo lo usan en vez del env actual.
+  // precio_estimado y precio_real siguen escribiendose (contrato): en v2 son el
+  // total estimado y el total medido. Montos en pesos enteros.
+  version_precio           Int?
+  precio_parametros        Json?
+  precio_estimado_desglose Json?
+  precio_estimado_min      Int?
+  precio_estimado_max      Int?
+  precio_medido            Int?
+  precio_medido_desglose   Json?
+  // Lo que DECLARO la PyME (null = no declarado; el valor USADO esta en el
+  // snapshot). peajes_estimados es el TOTAL del viaje (ida y vuelta) en pesos.
+  tipo_servicio            TipoServicio?
+  ayudantes                Int?
+  factura_a                Boolean?
+  peajes_estimados         Int?
+  fuente_peajes            FuentePeajes?
+  // Carga: no entra en la formula, se guarda para recalibrar.
+  tipo_carga               TipoCarga?
+  bultos                   Int?
+  peso_kg                  Float?
+  volumen_m3               Float?
+  pallets                  Int?
+  valor_declarado          Int?
+  // Calidad del GPS al cierre (o al cancelar en curso): Redis se borra al
+  // cerrar, por eso se persiste.
+  gps_puntos               Int?
+  gps_mayor_hueco_segundos Int?
+  // Copia del vehiculo al confirmar (el vehiculo se puede editar despues).
+  vehiculo_snapshot        Json?
+
+  cliente             Cliente                @relation(fields: [id_cliente], references: [id_cliente])
   organizacion        Organizacion?          @relation(fields: [id_organizacion], references: [id_organizacion])
   creador             Usuario?               @relation("ViajesCreados", fields: [id_creador], references: [id_usuario])
   conductor           Conductor?             @relation(fields: [id_conductor], references: [id_conductor])
@@ -689,6 +804,9 @@ model Viaje {
   // La FK vive en historial_estado_viaje.
   historial_estados   HistorialEstadoViaje[]
   serie               SerieViaje?            @relation(fields: [id_serie], references: [id_serie], onDelete: SetNull)
+  // Back-relations (precio v2), NO columnas: las FKs viven en las tablas nuevas.
+  historial_precios   HistorialPrecioViaje[]
+  precio_pagado       PrecioPagadoViaje?
 
   @@index([id_organizacion, estado])
   @@index([id_serie])
@@ -760,7 +878,7 @@ model Parada {
   // latitud y longitud son una COPIA (snapshot): editar o borrar el lugar
   // despues no cambia el viaje. El NOMBRE del lugar no se copia: la PyME lo ve
   // por join y el chofer nunca (ver vista-parada.js).
-  id_lugar              Int?
+  id_lugar Int?
 
   // ── Cierre sin "Salir" (Tarea 5) ──
   // salida_detectada: hora del PRIMER ping GPS afuera de la parada (a mas de
@@ -771,14 +889,82 @@ model Parada {
   // no_visitada: true si el cierre automatico llego sin que el chofer llegara a
   // esta parada. Columna y no valor de EstadoParada: agregar un valor a un enum
   // con la DB compartida rompe al Prisma del deploy viejo.
-  salida_detectada      DateTime?
-  origen_salida         OrigenSalida?
-  no_visitada           Boolean?
+  salida_detectada DateTime?
+  origen_salida    OrigenSalida?
+  no_visitada      Boolean?
+
+  // ── Precio v2 ──
+  // acceso / pisos / operacion: lo que declaro la PyME (null = no declarado;
+  // el calculo usa PLANTA_BAJA). pisos es obligatorio con ESCALERA / ASCENSOR.
+  acceso                    AccesoParada?
+  pisos                     Int?
+  operacion                 OperacionParada?
+  // Distancia GPS del tramo que TERMINA en esta parada (salida de la anterior
+  // -> llegada a esta). Una sola escritura, al confirmar la llegada.
+  distancia_real_km         Float?
+  // Manejo SIN transito del tramo que llega a esta parada (staticDuration de
+  // Routes, en la misma llamada del estimado). null en la parada 1.
+  manejo_sin_transito_horas Float?
 
   viaje Viaje  @relation(fields: [id_viaje], references: [id_viaje])
   lugar Lugar? @relation(fields: [id_lugar], references: [id_lugar], onDelete: SetNull)
 
   @@map("paradas")
+}
+
+// ─────────────────────────────────────────────
+// HISTORIAL DE PRECIOS DEL VIAJE (precio v2)
+// Una fila por cada CALCULO de precio de un viaje interno (crear, editar,
+// cierre, cancelacion en curso). NO una por cada costo en vivo. Se escribe
+// FUERA de la tx del cambio que la origina y nunca tira (precio.service.js).
+// id_usuario sin FK, mismo criterio que historial_estado_viaje. ON DELETE
+// CASCADE: el codigo viejo borra viajes sin conocer esta tabla.
+// ─────────────────────────────────────────────
+
+model HistorialPrecioViaje {
+  id_historial_precio Int                 @id @default(autoincrement())
+  id_viaje            Int
+  version             Int
+  motivo              MotivoCalculoPrecio
+  total               Int
+  minimo              Int?
+  maximo              Int?
+  desglose            Json
+  parametros          Json
+  fecha               DateTime            @default(now())
+  id_usuario          Int?
+
+  viaje Viaje @relation(fields: [id_viaje], references: [id_viaje], onDelete: Cascade)
+
+  @@index([id_viaje, fecha])
+  @@map("historial_precio_viaje")
+}
+
+// ─────────────────────────────────────────────
+// PRECIO PAGADO (feedback de la PyME, precio v2)
+// 1:1 con el viaje (unique en id_viaje): el upsert es un INSERT ... ON CONFLICT
+// (precio-pagado.service.js), dos PUT simultaneos nunca crean dos filas.
+// Montos en pesos enteros. ediciones = cuantas veces se actualizo despues de
+// crearse. id_usuario sin FK (el ultimo que lo escribio).
+// ─────────────────────────────────────────────
+
+model PrecioPagadoViaje {
+  id_precio_pagado Int              @id @default(autoincrement())
+  id_viaje         Int              @unique
+  monto            Int
+  incluye_iva      Boolean
+  monto_peajes     Int?
+  metodo_pago      MetodoPagoFlete?
+  ayudantes_reales Int?
+  comentario       String?
+  id_usuario       Int
+  creado_en        DateTime         @default(now())
+  actualizado_en   DateTime         @updatedAt
+  ediciones        Int              @default(0)
+
+  viaje Viaje @relation(fields: [id_viaje], references: [id_viaje], onDelete: Cascade)
+
+  @@map("precios_pagados_viaje")
 }
 
 // ─────────────────────────────────────────────

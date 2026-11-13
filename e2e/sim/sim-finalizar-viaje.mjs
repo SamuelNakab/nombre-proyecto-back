@@ -288,6 +288,14 @@ async function recorrido() {
   const [p1, p2, p3] = viaje.paradas.sort((a, b) => a.orden - b.orden);
   console.log(`  viaje ${bold(id)} con paradas ${p1.id_parada}, ${p2.id_parada}, ${p3.id_parada}`);
   check("la respuesta trae motivo y descripción, y no condiciones_requeridas", viaje.motivo === MOTIVO && viaje.descripcion === DESCRIPCION && !("condiciones_requeridas" in viaje));
+  // Precio v2: el body de siempre (sin datos de la Parte B) crea un viaje v2 con
+  // los defaults, precio en pesos enteros multiplo de 1000 y rango.
+  check(
+    "precio v2: version_precio 2, precio_estimado multiplo de 1000 con rango, desglose_estimado v2",
+    viaje.version_precio === 2 && Number.isInteger(viaje.precio_estimado) && viaje.precio_estimado % 1000 === 0 &&
+      viaje.precio_estimado_min < viaje.precio_estimado && viaje.precio_estimado_max > viaje.precio_estimado && viaje.desglose_estimado?.version === 2,
+    JSON.stringify({ v: viaje.version_precio, total: viaje.precio_estimado, min: viaje.precio_estimado_min, max: viaje.precio_estimado_max }),
+  );
 
   // Un cliente viejo todavía manda condiciones: se ignoran sin error. Este
   // segundo viaje sirve después para el 409 de "otro viaje en curso".
@@ -390,7 +398,8 @@ async function recorrido() {
   r = await api(tChofer, "POST", `/api/choferes/viajes/${id}/salir`);
   const fin = r.data ?? {};
   check(bold("salir de la última → FINALIZADO, viaje_finalizado true"), r.status === 200 && fin.estado === "FINALIZADO" && fin.viaje_finalizado === true, JSON.stringify(fin));
-  check("trae precio_real", typeof fin.precio_real === "number");
+  // Precio v2 (Parte E): el chofer NO ve precios de un viaje de PyME.
+  check("NO trae precio_real (el chofer no ve precios de viajes de PyME)", !("precio_real" in fin), JSON.stringify(Object.keys(fin)));
   check("trae remito_url", typeof fin.remito_url === "string" && fin.remito_url.length > 0);
   check("trae estimado y real", fin.estimado != null && fin.real != null);
   check("real.distancia_km sale del GPS simulado", typeof fin.real?.distancia_km === "number", `real=${JSON.stringify(fin.real)}`);
@@ -412,6 +421,17 @@ async function recorrido() {
   r = await api(tPyme, "GET", `${rutaViajes}/${id}`);
   const det = r.data ?? {};
   check("detalle de la PyME → FINALIZADO, cerrado por el CHOFER, completo", det.estado === "FINALIZADO" && det.cierre?.cerrado_por === "CHOFER" && det.cierre?.incompleto === false, JSON.stringify(det.cierre));
+  check(
+    "la PyME ve el precio medido v2 (precio_real = precio_medido, entero) y precio_pagado_pendiente true",
+    det.version_precio === 2 && Number.isInteger(det.precio_real) && det.precio_real === det.precio_medido && det.precio_medido_desglose?.version === 2 && det.precio_pagado === null && det.precio_pagado_pendiente === true,
+    JSON.stringify({ version: det.version_precio, precio_real: det.precio_real, precio_medido: det.precio_medido, pendiente: det.precio_pagado_pendiente }),
+  );
+  r = await api(tChofer, "GET", `/api/choferes/viajes/${id}`);
+  check(
+    "el detalle del chofer no trae precios, tarifas ni datos del creador",
+    r.status === 200 && !Object.keys(r.data ?? {}).some((k) => /precio|tarifa|peaje/.test(k) && k !== "fecha_corte_precio") && !("creador" in (r.data ?? {})) && !("id_creador" in (r.data ?? {})),
+    JSON.stringify(Object.keys(r.data ?? {}).filter((k) => /precio|tarifa|peaje|creador/.test(k))),
+  );
   const paradas = det.paradas ?? [];
   check(
     "las 3 paradas tienen llegada_real y salida_real",
@@ -431,12 +451,22 @@ async function recorrido() {
   const f = finalizados[0]?.data ?? {};
   check("viaje:finalizado trae estimado, real y paradas", f.estimado && f.real && f.paradas);
   check(
+    "viaje:finalizado a la PyME trae precio_real, desglose v2, version_precio 2 y precio_pagado_pendiente true",
+    typeof f.precio_real === "number" && f.desglose?.version === 2 && f.version_precio === 2 && f.precio_pagado_pendiente === true,
+    JSON.stringify({ precio_real: f.precio_real, version: f.version_precio, desglose: f.desglose?.version }),
+  );
+  check(
     "viaje:finalizado trae cerrado_por CHOFER, incompleto false, paradas_no_visitadas [] y fecha_corte_precio",
     f.cerrado_por === "CHOFER" && f.incompleto === false && Array.isArray(f.paradas_no_visitadas) && f.paradas_no_visitadas.length === 0 && Boolean(f.fecha_corte_precio),
     JSON.stringify({ cerrado_por: f.cerrado_por, incompleto: f.incompleto, paradas_no_visitadas: f.paradas_no_visitadas, fecha_corte_precio: f.fecha_corte_precio }),
   );
   const alChofer = await esperarEvento(eventosChofer, (e) => e.evento === "viaje:finalizado" && e.data?.id_viaje === id);
   check("viaje:finalizado también le llega al chofer, con cerrado_por CHOFER", alChofer?.data?.cerrado_por === "CHOFER");
+  check(
+    "viaje:finalizado del chofer SIN precio_real ni desglose (si con remito_url)",
+    alChofer && !("precio_real" in alChofer.data) && !("desglose" in alChofer.data) && typeof alChofer.data.remito_url === "string",
+    JSON.stringify(Object.keys(alChofer?.data ?? {})),
+  );
 
   const estados = eventosPyme
     .filter((e) => e.evento === "viaje:estado_cambiado" && e.data?.id_viaje === id)

@@ -1,5 +1,5 @@
 import prisma from '../config/prisma.js';
-import { obtenerAcumulado, limpiarGPS, medicionesHasta, ultimoPing } from './gps.service.js';
+import { obtenerAcumulado, limpiarGPS, medicionesHasta, ultimoPing, calidadGpsViaje } from './gps.service.js';
 import { generarRemito } from './remito.service.js';
 import { detenerEmisorEta } from './eta-emisor.js';
 import { cancelarAvisoVencimiento } from './vencimiento.service.js';
@@ -12,12 +12,13 @@ import {
   bloqueTiempos,
   paradasConTiempos,
 } from './duracion.service.js';
-import { salasDeViaje, emitirViajeInterno } from '../sockets/salas.js';
+import { salasDeViaje, emitirViajeInternoDividido } from '../sockets/salas.js';
 import { marcarViajeCerrado } from './cancelacion.service.js';
 import { escribirRealesInterno } from './medicion-real.service.js';
 import { tiemposRealesDesdeHistorial } from './tiempos-reales.js';
 import { OPCIONES_TX } from './organizacion.service.js';
 import { precioDesdeMediciones } from './precio-real.js';
+import { precioMedido, filaHistorial, registrarHistorialPrecio, SELECT_PRECIO } from './precio.service.js';
 import { planCierre } from './cierre-plan.js';
 import { configCierre } from './cierre-fechas.js';
 import { cancelarTimersCierre } from './timers-cierre.js';
@@ -81,7 +82,30 @@ export async function cerrarViaje(id_viaje, io, actor = {}, { ahora = new Date()
   });
   if (r.count === 0) return null;
 
-  return despuesDelCierre({ io, viaje, actor, fechaHistorial: ahora, precio, mediciones, extraEvento: {} });
+  return despuesDelCierre({
+    io,
+    viaje,
+    actor,
+    fechaHistorial: ahora,
+    precio_real: precio.precio_real,
+    desglose: desgloseV1Evento(precio, mediciones, viaje),
+    extraEvento: {},
+  });
+}
+
+// El desglose de siempre de viaje:finalizado (v1: legacy y viajes internos con
+// version_precio null).
+function desgloseV1Evento(precio, mediciones, viaje) {
+  return {
+    precio_por_tiempo: precio.precio_por_tiempo,
+    precio_por_distancia: precio.precio_por_distancia,
+    tiempo_horas: mediciones.tiempo_horas,
+    distancia_km: mediciones.distancia_km,
+    tiempo_capital: precio.tiempo_capital,
+    distancia_provincia: precio.distancia_provincia,
+    tarifa_hora: viaje.tarifa_hora,
+    tarifa_km: viaje.tarifa_km,
+  };
 }
 
 // ─── INTERNO (Tarea 5: un cierre, tres modos) ────────────────────────────────
@@ -93,8 +117,10 @@ export async function cerrarViaje(id_viaje, io, actor = {}, { ahora = new Date()
 //                 llego a la ultima y que el cierre manual esta habilitado).
 //   AUTOMATICO    fin del dia (timer, barrido de arranque, chequeo perezoso).
 // Que se escribe en cada parada y en que instante se corta el precio lo decide
-// planCierre (puro); el precio lo calcula precioDesdeMediciones con lo medido
-// HASTA ese instante (el precio no sigue creciendo con el GPS).
+// planCierre (puro); el precio lo calcula precioMedido (precio.service: v2 con el
+// snapshot si version_precio es 2, v1 si es null) con lo medido HASTA ese
+// instante (el precio no sigue creciendo con el GPS). Un cierre incompleto usa
+// el fallback de km PARCIAL.
 //
 // UNA transaccion: FINALIZADO (updateMany con el estado leido en el WHERE), la
 // salida de la parada abierta (si hay), las paradas no visitadas y los reales.
@@ -105,13 +131,8 @@ export async function cerrarViajeInterno({ io, id_viaje, modo, actor = {}, ahora
   const viaje = await prisma.viaje.findUnique({
     where: { id_viaje },
     select: {
-      id_viaje: true,
-      id_organizacion: true,
+      ...SELECT_PRECIO,
       id_conductor: true,
-      estado: true,
-      zona: true,
-      tarifa_hora: true,
-      tarifa_km: true,
       conductor: { select: { id_usuario: true } },
       paradas: {
         select: {
@@ -124,6 +145,7 @@ export async function cerrarViajeInterno({ io, id_viaje, modo, actor = {}, ahora
           salida_detectada: true,
           peon_estimado_horas: true,
           manejo_estimado_horas: true,
+          distancia_estimada_km: true,
         },
       },
     },
@@ -143,9 +165,10 @@ export async function cerrarViajeInterno({ io, id_viaje, modo, actor = {}, ahora
     return null;
   }
 
-  // Lo medido hasta el corte, leido ANTES de limpiar Redis.
+  // Lo medido hasta el corte y la calidad del GPS, leidos ANTES de limpiar Redis.
   const mediciones = await medicionesHasta(id_viaje, plan.corte);
-  const precio = precioDesdeMediciones(viaje, mediciones);
+  const precio = precioMedido(viaje, mediciones, { corte: plan.corte, incompleto: plan.incompleto });
+  const calidad = await calidadGpsViaje(id_viaje);
 
   try {
     await prisma.$transaction(async (tx) => {
@@ -158,11 +181,11 @@ export async function cerrarViajeInterno({ io, id_viaje, modo, actor = {}, ahora
         data: {
           estado: 'FINALIZADO',
           cerrado_por: modo,
-          precio_real: precio.precio_real,
-          tiempo_capital: precio.tiempo_capital,
-          distancia_provincia: precio.distancia_provincia,
+          // precio_real siempre (contrato); v2 suma precio_medido y su desglose.
+          ...precio.columnas,
           distancia_real_km: mediciones.sin_pings ? null : mediciones.distancia_km,
           fecha_corte_precio: plan.corte,
+          ...calidad,
         },
       });
       if (r.count === 0) throw new CierrePerdido();
@@ -207,6 +230,10 @@ export async function cerrarViajeInterno({ io, id_viaje, modo, actor = {}, ahora
     throw err;
   }
 
+  await registrarHistorialPrecio(
+    filaHistorial({ id_viaje, motivo: 'CIERRE', id_usuario: actor.id_usuario ?? null }, precio)
+  );
+
   const resultado = await despuesDelCierre({
     io,
     viaje,
@@ -214,8 +241,10 @@ export async function cerrarViajeInterno({ io, id_viaje, modo, actor = {}, ahora
     // CHOFER: el mismo instante que la salida de la ultima parada (como el resto
     // del ciclo por parada). PyME / automatico: el momento del cierre.
     fechaHistorial: modo === 'CHOFER' ? plan.salida.fecha : ahora,
-    precio,
-    mediciones,
+    precio_real: precio.columnas.precio_real,
+    // v1: el desglose de siempre; v2: el desglose de la formula v2.
+    desglose: precio.version === 1 ? desgloseV1Evento(precio.precio_v1, mediciones, viaje) : precio.desglose,
+    version_precio: precio.version,
     extraEvento: {
       cerrado_por: modo,
       incompleto: plan.incompleto,
@@ -241,8 +270,9 @@ async function despuesDelCierre({
   viaje,
   actor,
   fechaHistorial,
-  precio,
-  mediciones,
+  precio_real,
+  desglose,
+  version_precio = null,
   extraEvento,
   id_usuario_chofer = null,
 }) {
@@ -288,19 +318,8 @@ async function despuesDelCierre({
     diferencia_min: p.diferencia_min,
   }));
 
-  const desglose = {
-    precio_por_tiempo: precio.precio_por_tiempo,
-    precio_por_distancia: precio.precio_por_distancia,
-    tiempo_horas: mediciones.tiempo_horas,
-    distancia_km: mediciones.distancia_km,
-    tiempo_capital: precio.tiempo_capital,
-    distancia_provincia: precio.distancia_provincia,
-    tarifa_hora: viaje.tarifa_hora,
-    tarifa_km: viaje.tarifa_km,
-  };
-
   const cuerpo = {
-    precio_real: precio.precio_real,
+    precio_real,
     desglose,
     remito_url,
     ...metricas,
@@ -308,21 +327,26 @@ async function despuesDelCierre({
     paradas,
     ...extraEvento,
   };
-  const evento = { id_viaje, ...cuerpo };
   if (io) {
-    // Canal 6/6 de las metricas por etapa. viaje:{id} y, si es de una PyME,
-    // organizacion:{id}. Desde el Paso 3 tambien los bloques estimado / real y
-    // los tiempos de cada parada. Desde la Tarea 5, en un viaje interno tambien
-    // al chofer (lo puede cerrar la PyME o el automatico) con cerrado_por.
+    // Canal 6/6 de las metricas por etapa. Desde el Paso 3 tambien los bloques
+    // estimado / real y los tiempos de cada parada.
     if (viaje.id_organizacion !== null) {
-      emitirViajeInterno(
+      // Viaje INTERNO (precio v2, Parte E): el payload con precio SOLO a la sala
+      // de la PyME (+ version_precio y el aviso de que falta cargar el precio
+      // pagado). El chofer lo recibe SIN precio_real ni desglose (lo puede
+      // cerrar la PyME o el automatico: por eso le llega, con cerrado_por). Nada
+      // a viaje:{id}: en un viaje interno nadie entra a esa sala.
+      // eslint-disable-next-line no-unused-vars
+      const { precio_real: _precio, desglose: _desglose, ...sinPrecio } = cuerpo;
+      emitirViajeInternoDividido(
         io,
-        { id_viaje, id_organizacion: viaje.id_organizacion, id_usuario_chofer },
+        { id_organizacion: viaje.id_organizacion, id_usuario_chofer },
         'viaje:finalizado',
-        evento
+        { id_viaje, ...cuerpo, version_precio, precio_pagado_pendiente: true },
+        { id_viaje, ...sinPrecio }
       );
     } else {
-      io.to(salasDeViaje(viaje)).emit('viaje:finalizado', evento);
+      io.to(salasDeViaje(viaje)).emit('viaje:finalizado', { id_viaje, ...cuerpo });
     }
   }
 

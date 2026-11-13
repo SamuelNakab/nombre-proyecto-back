@@ -17,7 +17,8 @@ import {
   ESTADOS_TERMINALES,
   ESTADOS_EN_PARADA_INTERNO,
 } from '../services/estado-viaje.service.js';
-import { salasDeViaje } from './salas.js';
+import { salasDeViaje, salaOrganizacion } from './salas.js';
+import { precioEnVivo } from '../services/precio.service.js';
 import { relimpiarSiCerrado } from '../services/cancelacion.service.js';
 import { reportarError } from '../config/sentry.js';
 
@@ -176,38 +177,16 @@ export function registrarHandlersGPS(socket, io) {
       });
 
       if (timestamp % 60000 < 16000) {
-        const hora = new Date().getHours();
-        const es_hora_pico = (hora >= 7 && hora <= 10) || (hora >= 17 && hora <= 20);
-
-        let precio_acumulado = 0;
-        let precio_por_tiempo = null;
-        let precio_por_distancia = null;
-
-        if (viaje.zona === 'CABA') {
-          precio_por_tiempo = acumulado.tiempo_horas * (viaje.tarifa_hora || 0);
-          precio_acumulado = precio_por_tiempo;
-        } else if (viaje.zona === 'PROVINCIA') {
-          precio_por_distancia = acumulado.distancia_km * (viaje.tarifa_km || 0);
-          precio_acumulado = precio_por_distancia;
-        } else {
-          precio_por_tiempo = acumulado.tiempo_horas * (viaje.tarifa_hora || 0);
-          precio_por_distancia = acumulado.distancia_km * (viaje.tarifa_km || 0);
-          precio_acumulado = precio_por_tiempo + precio_por_distancia;
-        }
-
-        io.to(salas).emit('costo:actualizar', {
-          id_viaje,
-          precio_acumulado,
-          desglose: {
-            precio_por_tiempo,
-            precio_por_distancia,
-            tiempo_horas: acumulado.tiempo_horas,
-            distancia_km: acumulado.distancia_km,
-            tarifa_hora: viaje.tarifa_hora,
-            tarifa_km: viaje.tarifa_km,
-            es_hora_pico,
-          },
-        });
+        // La MISMA funcion que GET costo-acumulado (precio.service): v1 o v2
+        // segun version_precio. Antes la formula estaba inline aca y en MIXTO
+        // cobraba el tiempo total Y la distancia total. Sin queries: la fila y
+        // las paradas vienen del findUnique de arriba y el acumulado se acaba de
+        // escribir.
+        const costo = precioEnVivo(viaje, acumulado, new Date());
+        // Viaje interno: SOLO a la sala de la PyME (el chofer no ve precios y
+        // nadie entra a viaje:{id} de un interno). Legacy: viaje:{id}.
+        const salasCosto = viaje.id_organizacion !== null ? [salaOrganizacion(viaje.id_organizacion)] : salas;
+        io.to(salasCosto).emit('costo:actualizar', { id_viaje, ...costo });
       }
 
       // La ruta planeada se calcula al crear el viaje. Fallback para viajes

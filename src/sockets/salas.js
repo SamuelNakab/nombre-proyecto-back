@@ -42,6 +42,17 @@ export async function sincronizarSalaOrganizacion(io, id_usuario, id_organizacio
 // Eventos del ciclo INTERNO: a la sala de la PyME, a la sala personal del chofer
 // (por id_usuario, NO por id_conductor) y, si viene id_viaje, al room del viaje.
 // Sin io (scripts) no hace nada.
+// Eventos con PRECIO de un viaje interno (precio v2, Parte E): el payload
+// completo va SOLO a la sala de la PyME y el chofer recibe otro sin precios por
+// su sala personal. A viaje:{id} no se manda nada: en un viaje interno nadie
+// entra a esa sala (solo la usan el pool del marketplace, el cliente legacy y el
+// gerente, siempre con viajes legacy). Sin io (scripts) no hace nada.
+export function emitirViajeInternoDividido(io, { id_organizacion, id_usuario_chofer }, evento, payloadPyme, payloadChofer) {
+  if (!io) return;
+  if (id_organizacion != null) io.to(salaOrganizacion(id_organizacion)).emit(evento, payloadPyme);
+  if (id_usuario_chofer != null && payloadChofer) io.to(salaUsuario(id_usuario_chofer)).emit(evento, payloadChofer);
+}
+
 export function emitirViajeInterno(io, { id_viaje, id_organizacion, id_usuario_chofer }, evento, payload) {
   if (!io) return;
   const salas = [];

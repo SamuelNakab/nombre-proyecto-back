@@ -1268,7 +1268,7 @@
                   "const j = pm.response.json();",
                   "pm.test(\"FINALIZADO\", () => pm.expect(j.estado).to.eql(\"FINALIZADO\"));",
                   "pm.test(\"viaje_finalizado true\", () => pm.expect(j.viaje_finalizado).to.eql(true));",
-                  "pm.test(\"precio_real numérico\", () => pm.expect(j.precio_real).to.be.a(\"number\"));",
+                  "pm.test(\"sin precio_real (el chofer no ve precios de viajes de PyME)\", () => pm.expect(j).to.not.have.property(\"precio_real\"));",
                   "pm.test(\"remito_url\", () => pm.expect(j.remito_url).to.be.a(\"string\"));",
                   "pm.test(\"estimado y real\", () => { pm.expect(j.estimado).to.be.an(\"object\"); pm.expect(j.real).to.be.an(\"object\"); });"
                 ]

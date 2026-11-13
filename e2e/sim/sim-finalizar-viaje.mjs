@@ -296,6 +296,15 @@ async function recorrido() {
       viaje.precio_estimado_min < viaje.precio_estimado && viaje.precio_estimado_max > viaje.precio_estimado && viaje.desglose_estimado?.version === 2,
     JSON.stringify({ v: viaje.version_precio, total: viaje.precio_estimado, min: viaje.precio_estimado_min, max: viaje.precio_estimado_max }),
   );
+  // Peajes de Google (aditivo): desglose_estimado.peajes sigue siendo el entero
+  // usado y suma peajes_detalle; el viaje trae peajes_google_ida (entero o null).
+  const pd = viaje.desglose_estimado?.peajes_detalle;
+  check(
+    "peajes: desglose_estimado.peajes_detalle con fuente PYME / GOOGLE / NINGUNA y usados = peajes; peajes_google_ida en el viaje",
+    pd && ["PYME", "GOOGLE", "NINGUNA"].includes(pd.fuente) && pd.usados === viaje.desglose_estimado.peajes &&
+      "peajes_google_ida" in viaje && (viaje.peajes_google_ida === null || Number.isInteger(viaje.peajes_google_ida)),
+    JSON.stringify({ peajes_detalle: pd, peajes_google_ida: viaje.peajes_google_ida }),
+  );
 
   // Un cliente viejo todavía manda condiciones: se ignoran sin error. Este
   // segundo viaje sirve después para el 409 de "otro viaje en curso".
@@ -431,6 +440,12 @@ async function recorrido() {
     "el detalle del chofer no trae precios, tarifas ni datos del creador",
     r.status === 200 && !Object.keys(r.data ?? {}).some((k) => /precio|tarifa|peaje/.test(k) && k !== "fecha_corte_precio") && !("creador" in (r.data ?? {})) && !("id_creador" in (r.data ?? {})),
     JSON.stringify(Object.keys(r.data ?? {}).filter((k) => /precio|tarifa|peaje|creador/.test(k))),
+  );
+  check(
+    "las paradas del chofer no traen peajes ni el lugar guardado (lista blanca)",
+    r.status === 200 && (r.data?.paradas ?? []).length === 3 &&
+      r.data.paradas.every((p) => !Object.keys(p).some((k) => /peaje|precio|lugar/.test(k))),
+    JSON.stringify((r.data?.paradas ?? []).flatMap((p) => Object.keys(p).filter((k) => /peaje|precio|lugar/.test(k)))),
   );
   const paradas = det.paradas ?? [];
   check(

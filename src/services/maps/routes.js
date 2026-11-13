@@ -19,6 +19,7 @@ import {
   segundosAHoras,
   sinRuta,
 } from './comun.js';
+import { parsearPeajes } from './peajes.js';
 
 const URL_ROUTES = 'https://routes.googleapis.com/directions/v2:computeRoutes';
 
@@ -113,6 +114,36 @@ export function leerEta(cuerpo) {
     distancia_metros: Math.round((ruta.distanceMeters ?? 0)),
   };
 }
+
+// ─── Peajes de un viaje completo (Enterprise) ───────────────────────────────
+// UNA llamada por calculo: origen = primera parada, destino = ultima, el resto
+// como intermedios (un leg por tramo). extraComputations TOLLS factura Compute
+// Routes ENTERPRISE (el SKU mas alto: TRAFFIC_AWARE o > 10 intermedios no lo
+// suben mas). TRAFFIC_AWARE + departureTime: la tarifa depende de la hora (pico /
+// valle, verificado: Belgrano -> La Plata ARS 6483,84 a las 08:00 y 5187,06 a
+// las 14:00) y asi la ruta coincide con la de los tramos del estimado. FieldMask
+// minima: solo los tollInfo.
+
+export function pedidoPeajes({ puntos, salida, ahora, apiKey }) {
+  const intermedios = puntos.slice(1, -1);
+  const body = {
+    origin: waypoint(puntos[0]),
+    destination: waypoint(puntos[puntos.length - 1]),
+    ...(intermedios.length ? { intermediates: intermedios.map(waypoint) } : {}),
+    routingPreference: 'TRAFFIC_AWARE',
+    extraComputations: ['TOLLS'],
+    routeModifiers: { tollPasses: ['AR_TELEPASE'] },
+  };
+  if (salida && salida.getTime() > ahora.getTime() + MARGEN_SALIDA_MS) {
+    body.departureTime = salida.toISOString();
+  }
+  return {
+    sku: 'ENTERPRISE',
+    ...pedido(apiKey, 'routes.travelAdvisory.tollInfo,routes.legs.travelAdvisory.tollInfo', body),
+  };
+}
+
+export const leerPeajes = (cuerpo) => parsearPeajes(primeraRuta(cuerpo));
 
 // ─── Ruta de N puntos: desvio y fallback de gps.socket (Essentials) ─────────
 

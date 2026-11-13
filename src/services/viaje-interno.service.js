@@ -33,6 +33,7 @@ import { paradaVistaChofer, paradaVistaPyme } from './vista-parada.js';
 import {
   estimarPrecioInterno,
   precioV2DesdeRecorrido,
+  peajesGoogleDeViaje,
   columnasPrecioV2,
   exigirDatosPrecio,
   facturaAPorDefecto,
@@ -505,9 +506,11 @@ export async function crearViajeInterno({ io, id_organizacion, id_usuario, datos
   exigirDatosPrecio({ ...declarados, paradas });
 
   // Precio v2, duracion (manejo + peon) y ruta: UNA estimacion. Fuera de la tx y
-  // ANTES de escribir nada: llama a Google. Si Google falla, ErrorMaps (503, o
-  // 400 si no hay ruta posible) y no se crea nada.
-  const { zona, recorrido, precio } = await estimarPrecioInterno({
+  // ANTES de escribir nada: llama a Google. Si los tramos fallan, ErrorMaps (503,
+  // o 400 si no hay ruta posible) y no se crea nada. Los peajes (UNA llamada
+  // Enterprise, en paralelo, o el cache de un estimar-precio previo) nunca
+  // bloquean: si fallan, el viaje se crea sin peajes de Google.
+  const { zona, recorrido, precio, peajes } = await estimarPrecioInterno({
     paradas,
     fecha_programada,
     declarados,
@@ -531,7 +534,7 @@ export async function crearViajeInterno({ io, id_organizacion, id_usuario, datos
         descripcion,
         ...columnasPrecioV2(precio, zona, declarados),
         ...columnasEstimadasViaje(recorrido.totales),
-        paradas: { create: conEstimacionPorParada(paradasParaCrear(paradas), recorrido) },
+        paradas: { create: conEstimacionPorParada(paradasParaCrear(paradas), recorrido, peajes.tramos) },
       },
       select: { id_viaje: true },
     });
@@ -1388,14 +1391,19 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
   // o si el viaje no tiene estimados guardados; si no, el precio sale de los
   // estimados de la fila. Todo ANTES de la tx: si Google falla, ErrorMaps y no
   // se modifica nada. La duracion y la ruta solo cambian con Google.
+  // PEAJES de Google: se vuelven a pedir SOLO si cambian paradas o fecha (UNA
+  // llamada Enterprise o el cache; nunca bloquea). Si no, salen de la fila
+  // (peajes_google_ida / _incompleto): un cambio de tipo_servicio recalcula el
+  // monto con el multiplicador nuevo sin llamar a Google.
+  const cambiaRecorrido = Boolean(datos.paradas || datos.fecha_programada);
   const necesitaGoogle =
-    Boolean(datos.paradas || datos.fecha_programada) ||
-    viaje.manejo_estimado_horas == null ||
-    viaje.distancia_estimada_km == null;
+    cambiaRecorrido || viaje.manejo_estimado_horas == null || viaje.distancia_estimada_km == null;
   const recalcular = necesitaGoogle || cambiaDeclarado || !esV2(viaje);
   let costo = {};
   let recorrido = null;
   let precio = null;
+  // Solo con peajes NUEVOS de Google se reescriben los tramos de las paradas.
+  let tramosPeajes = null;
   if (recalcular) {
     const facturaAOrganizacion = await facturaAPorDefecto(id_organizacion);
     let zona;
@@ -1405,8 +1413,10 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
         fecha_programada: fecha_programada.toISOString(),
         declarados,
         facturaAOrganizacion,
+        ...(cambiaRecorrido ? {} : { peajesGoogle: peajesGoogleDeViaje(viaje) }),
       });
       ({ zona, recorrido, precio } = estimacion);
+      if (cambiaRecorrido) tramosPeajes = estimacion.peajes.tramos ?? [];
     } else {
       zona = clasificarZona(paradas);
       precio = precioV2DesdeRecorrido({
@@ -1414,6 +1424,7 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
         totales: { manejo_horas: viaje.manejo_estimado_horas, distancia_km: viaje.distancia_estimada_km },
         declarados,
         facturaAOrganizacion,
+        peajesGoogle: peajesGoogleDeViaje(viaje),
       });
     }
     costo = {
@@ -1444,7 +1455,7 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
     if (paradasNuevas) {
       await tx.parada.deleteMany({ where: { id_viaje } });
       await tx.parada.createMany({
-        data: conEstimacionPorParada(paradasParaCrear(paradasNuevas), recorrido).map((p) => ({
+        data: conEstimacionPorParada(paradasParaCrear(paradasNuevas), recorrido, tramosPeajes).map((p) => ({
           ...p,
           id_viaje,
         })),
@@ -1458,7 +1469,10 @@ export async function editarViaje({ io, id_organizacion, id_usuario, id_viaje, d
       for (const [i, p] of actuales.entries()) {
         await tx.parada.update({
           where: { id_parada: p.id_parada },
-          data: columnasEstimadasParada(recorrido.paradas[i]),
+          data: {
+            ...columnasEstimadasParada(recorrido.paradas[i]),
+            ...(tramosPeajes ? { peajes_google_tramo: tramosPeajes[i] ?? null } : {}),
+          },
         });
       }
     }

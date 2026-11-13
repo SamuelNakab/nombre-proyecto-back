@@ -64,8 +64,12 @@ export const COLUMNAS_DATASET = [
   'distancia_real_km',
   'gps_puntos',
   'gps_mayor_hueco_segundos',
-  // Peajes
+  // Peajes (peajes_google = el monto de Google YA con vuelta y multiplicador,
+  // comparable con peajes_pyme; peajes_google_ida = el crudo de Routes)
   'peajes_google',
+  'peajes_google_ida',
+  'peajes_google_incompleto',
+  'peajes_google_error',
   'peajes_pyme',
   'peajes_usados',
   'fuente_peajes',
@@ -146,8 +150,10 @@ export function filaDataset(v) {
     distancia_real_km: v.distancia_real_km,
     gps_puntos: v.gps_puntos,
     gps_mayor_hueco_segundos: v.gps_mayor_hueco_segundos,
-    // Peajes de Google: no implementados (el calculo factura Enterprise).
-    peajes_google: null,
+    peajes_google: e.peajes_google_total ?? null,
+    peajes_google_ida: v.peajes_google_ida ?? null,
+    peajes_google_incompleto: v.peajes_google_incompleto ?? null,
+    peajes_google_error: e.peajes_google_error ?? null,
     peajes_pyme: v.peajes_estimados,
     peajes_usados: e.peajes ?? null,
     fuente_peajes: v.fuente_peajes ?? e.fuente_peajes ?? null,

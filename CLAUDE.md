@@ -76,7 +76,11 @@ elegibles) queda DORMIDO detras de MARKETPLACE_HABILITADO. MVP: CABA + GBA.
   estimar-precio, historial de precios, calidad del GPS, distancia por tramo,
   feedback del precio pagado y dataset admin, el chofer sin precios ni datos
   personales (lista blanca), remito interno sin precio y TRUST_PROXY default 2
-  COMPLETO. Peajes de Google NO (factura Enterprise). Ver "Precio v2".
+  COMPLETO. Ver "Precio v2".
+- PEAJES DE GOOGLE en el precio v2 (UNA llamada Enterprise por calculo, cache
+  en Redis, una por serie, nunca bloquea, kill switch PEAJES_GOOGLE_HABILITADO,
+  multiplicador por servicio, PyME > Google > 0) y las paradas del chofer por
+  LISTA BLANCA COMPLETO. Ver "Precio v2 — Peajes de Google".
 
 ## Stack
 - Node.js 22, ES Modules (NUNCA require()). Async/await siempre.
@@ -157,6 +161,10 @@ elegibles) queda DORMIDO detras de MARKETPLACE_HABILITADO. MVP: CABA + GBA.
   unique en id_viaje), ambas con FK a viajes ON DELETE CASCADE (el codigo viejo
   borra viajes sin conocerlas). Revisado con el mismo migrate diff: solo CREATE
   TYPE, ADD COLUMN, CREATE TABLE / INDEX y FKs de las tablas nuevas.
+- Peajes de Google: 2 columnas NULLABLE en viajes (peajes_google_ida INTEGER,
+  peajes_google_incompleto BOOLEAN) y 1 en paradas (peajes_google_tramo
+  INTEGER). Sin enums (FuentePeajes.GOOGLE ya existia), indices ni FKs.
+  Revisado con el mismo migrate diff: solo ADD COLUMN.
 - OJO con relajar un NOT NULL mientras la DB esta compartida: es compatible
   para ESCRIBIR, pero el Prisma VIEJO (production antes del merge a main) TIRA
   al LEER una fila con NULL en esa columna (p. ej. GET /api/admin/usuarios, que
@@ -1363,15 +1371,97 @@ precio-pagado-reglas.js + precio-pagado.service.js + precio-pagado.controller.js
 - POST /api/organizaciones/:id/viajes/estimar-precio: el mismo calculo, sin
   escribir; requireMiembro + limitarMaps; SUSPENDIDA -> 403 (no gasta Google).
 
-### Peajes de Google: NO implementados
-El calculo de peajes (extraComputations TOLLS) factura Compute Routes ENTERPRISE
-(routes/usage-and-billing: "Toll calculation" es un disparador Enterprise; se
-cobra el SKU mas alto). Queda solo lo declarado por la PyME. FuentePeajes.GOOGLE
-esta RESERVADO en el enum (agregar un valor despues, con la DB compartida,
-romperia al Prisma viejo); las columnas peajes_google* NO se crearon (sumarlas es
-aditivo). PRECIO_PEAJES_FACTOR_VUELTA queda en la config sin uso. Llamada real
-(12-11-2026, Belgrano -> La Plata con AR_TELEPASE): ARS 5187,06 de ida.
-staticDuration SI se pide (la FieldMask no es disparador de SKU): sigue Pro.
+### Precio v2 — Peajes de Google
+Se calculan con Google aceptando el SKU Enterprise (extraComputations TOLLS es
+disparador Enterprise; se cobra UN SKU por pedido, el mas alto, asi que
+TRAFFIC_AWARE o > 10 intermedios no lo suben mas). staticDuration de los tramos
+sigue Pro (la FieldMask no es disparador de SKU).
+
+Archivos: maps/peajes.js (PURO: parseo), maps/routes.js (pedidoPeajes /
+leerPeajes), maps/index.js (calcularPeajes, operacion "peajes", SKU ENTERPRISE),
+peajes.service.js (kill switch, cache, nunca tira), precio-entradas.js
+(montoPeajesGoogle / entradasPeajes, PURAS), precio-v2.js (detallePeajes).
+
+- UNA llamada por calculo, aparte de los tramos (que no cambiaron): origen =
+  parada 1, destino = la ultima, el resto intermedios; TRAFFIC_AWARE +
+  departureTime = salida estimada del ORIGEN (salidaDelOrigen de
+  estimacion.service, la misma del primer tramo; si es pasada o inminente no se
+  manda); tollPasses AR_TELEPASE; FieldMask SOLO routes.travelAdvisory.tollInfo,
+  routes.legs.travelAdvisory.tollInfo.
+- VERIFICADO (13-11-2026, Belgrano -> La Plata, 3 llamadas): la tarifa DEPENDE
+  DE LA HORA (ARS 6483,84 de ida el lunes a las 08:00, 5187,06 a las 14:00; sin
+  departureTime Google cotiza "ahora"); la ruta fue la misma en las tres. Por eso
+  quedan departureTime y la franja horaria en la clave del cache; TRAFFIC_AWARE
+  no cuesta nada extra y alinea la ruta con la de los tramos.
+- Parseo (estimatedPrice = Money { currencyCode, units string, nanos }; units y
+  nanos se omiten en 0): pesos enteros con redondeo normal, solo ARS (otra
+  moneda = desconocida -> incompleto), tollInfo sin estimatedPrice = tarifa
+  desconocida (incompleto, se suma lo conocido), sin tollInfo = sin peajes (0).
+  tramos[i] = el leg que TERMINA en la parada i (null en la 1; leg con tollInfo
+  sin ningun ARS -> null).
+- Monto usado = aPesos(ida x PRECIO_PEAJES_FACTOR_VUELTA x
+  PRECIO_PEAJES_MULTIPLICADOR_<servicio efectivo>). Prioridad PyME > Google > 0
+  (elegirPeajes). Google que respondio "sin peajes" = 0 con fuente GOOGLE; sin
+  dato (falla, kill switch, legacy) = NINGUNA. Se llama a Google AUNQUE la PyME
+  declare (decision de Samuel: comparar lo declarado, Google y lo pagado).
+- NUNCA bloquea (a diferencia de los tramos, que dan 503): si falla -> fuente
+  NINGUNA (o PYME), peajes_google_error true en el snapshot / desglose, log
+  "[peajes] no se pudieron calcular ..." y warning a Sentry a lo sumo 1 por
+  minuto. Va EN PARALELO con los tramos (Promise.all en estimarPrecioInterno): no
+  suma latencia; si los tramos fallan, la llamada de peajes ya salio (queda en
+  el cache para el reintento).
+- Kill switch PEAJES_GOOGLE_HABILITADO (default true; tipo BOOLEANO nuevo en
+  config/precio.js; aviso al arrancar si esta apagado). Con MAPS_PROVIDER=legacy
+  tampoco se calcula (error false).
+- CACHE (Redis, clave peajes:<sha256>): coordenadas en orden con 5 decimales +
+  franja "YYYY-MM-DDTHH" de la salida en hora argentina; valor = el CRUDO
+  { ida, incompleto, tramos }; TTL PRECIO_PEAJES_CACHE_SEGUNDOS (0 = sin cache).
+  Solo exitos. redisListo + conTimeout 500 ms; Redis caido -> sin cache. Log
+  "[peajes] cache hit". Sin single-flight: dos estimaciones simultaneas con el
+  cache vacio hacen 2 llamadas (aceptado).
+- Cuando: crear, estimar-precio y serie (UNA promesa con la salida de la PRIMERA
+  ocurrencia, compartida por todas las estimarPrecioInterno). Editar: solo si
+  cambian paradas o fecha (reescribe peajes_google_tramo de las paradas); si no,
+  peajesGoogleDeViaje (columnas + el error del snapshot anterior) y un cambio de
+  tipo_servicio recalcula el monto con el multiplicador nuevo SIN llamar. Un viaje
+  sin estimados (pre Paso 3) que se edita sin cambiar paradas ni fecha llama a
+  Google para los tramos pero NO para los peajes. Cierre, medido y vivo usan el
+  snapshot (entradasMedido spreadea snapshot.entradas): nunca se recalculan.
+- Datos: viajes.peajes_google_ida (crudo de ida, sin factores) y
+  peajes_google_incompleto; paradas.peajes_google_tramo. Factor y multiplicador
+  van en el snapshot (parametros y entradas: peajes_pyme, peajes_google_ida,
+  peajes_google_total, peajes_factor_vuelta, peajes_multiplicador,
+  peajes_google_incompleto, peajes_google_error). desglose.peajes sigue siendo el
+  ENTERO usado (contrato) y se suma desglose.peajes_detalle { google_ida,
+  factor_vuelta, multiplicador, google_total, pyme, usados, fuente, incompleto,
+  error } (nulls en un snapshot anterior). estimar-precio: peajes.google =
+  google_total (comparable con pyme) + google_ida, factor_vuelta, multiplicador,
+  incompleto, error (google_incompleto queda como alias). Dataset admin:
+  peajes_google (total con factores), peajes_google_ida, peajes_google_incompleto,
+  peajes_google_error.
+- El chofer NO recibe nada de peajes: las columnas de Viaje van en OCULTAS_CHOFER
+  y paradaVistaChofer (vista-parada.js) paso de lista negra por spread a LISTA
+  BLANCA (VISIBLES_CHOFER_PARADA / OCULTAS_CHOFER_PARADA, mas
+  CALCULADOS_CHOFER_PARADA = lo que suma tiemposParada). vista-parada.test.js
+  recorre Prisma.ParadaScalarFieldEnum y FALLA con una columna sin clasificar, y
+  verifica que el payload del chofer quedo IDENTICO al del spread viejo salvo
+  peajes_google_tramo.
+- /health suma la capacidad 'peajes-google' (el poll de e2e-staging la espera:
+  el simulador chequea peajes_detalle en la respuesta de crear).
+- Llamadas por operacion (n paradas): estimar / crear / editar con paradas o
+  fecha = n-1 Pro + 1 Enterprise (0 con acierto de cache); serie de N = N(n-1)
+  Pro + 1 Enterprise; editar sin paradas ni fecha, cierre, vivo, reasignar = 0
+  Enterprise.
+
+GUARDS VERIFICADOS REVIRTIENDOLOS (test-precio-v2.js CASO 18 y unitarios):
+| Guard | Caso que se pone en rojo sin el |
+|-------|---------------------------------|
+| lista blanca de paradaVistaChofer (volver al spread o peajes_google_tramo en VISIBLES) | vista-parada.test + 17b |
+| OCULTAS_CHOFER con peajes_google_ida / _incompleto | vista-chofer.test |
+| cache de peajes | 18c / 18d (llamadas 1 y 2 en vez de 0 y 1) |
+| una promesa de peajes por serie | 18e (3 llamadas) |
+| prioridad PyME > Google | 18c |
+| kill switch | 18g |
 
 ### Datos para recalibrar
 - Viaje: precio_estimado_desglose, _min, _max, precio_medido(_desglose),
@@ -1465,8 +1555,12 @@ GUARDS VERIFICADOS REVIRTIENDOLOS (test-precio-v2.js):
 - TRUST_PROXY default 2: verificar las IPs de rl:general:* en staging.
 
 ### PENDIENTES
-- Peajes de Google si se acepta el SKU Enterprise (USD 15 / 1000 vs 10 de Pro;
-  cupo gratis 1000 vs 5000). Las columnas y el factor de vuelta ya estan pensados.
+- Calibrar PRECIO_PEAJES_MULTIPLICADOR_* contra monto_peajes pagado (Google
+  cotiza un auto; 1 / 1 / 2 es una suposicion).
+- Peajes: el codigo VIEJO (production antes del merge a main) que edite un viaje
+  con peajes de Google lo recalcula sin ellos (fuente NINGUNA) y deja
+  peajes_google_ida desactualizado; el cierre viejo usa snapshot.entradas.peajes
+  (sin problema). Achicar la ventana develop -> main.
 - Usar metodo_cobro / parametros_cobro del vinculo (sigue pendiente del Paso 1).
 - Los datos personales de la auditoria (legacy).
 - Hacer atomico el acumulado GPS (Lua) si los pings se vuelven mas frecuentes.
@@ -2394,6 +2488,15 @@ CORS_ORIGINS                      (Tarea 6: origenes web permitidos, por coma,
 TRUST_PROXY=2                     (saltos de proxy: `trust proxy` y la IP del
                                    handshake. Default 2 desde el Precio v2
                                    (Railway necesita 2). Al arrancar)
+PEAJES_GOOGLE_HABILITADO=true     (Precio v2: kill switch de los peajes de
+                                   Google. true / 1 o false / 0; otra cosa ->
+                                   default + warning. Se lee en cada calculo)
+PRECIO_PEAJES_FACTOR_VUELTA=2     (monto de Google = ida x FACTOR x
+PRECIO_PEAJES_MULTIPLICADOR_LIVIANO=1  MULTIPLICADOR del servicio. En el
+PRECIO_PEAJES_MULTIPLICADOR_EQUIPO=1   snapshot del viaje)
+PRECIO_PEAJES_MULTIPLICADOR_CAMION=2
+PRECIO_PEAJES_CACHE_SEGUNDOS=900  (cache en Redis del crudo de Google; 0 = sin
+                                   cache)
 PRECIO_* / FEEDBACK_PRECIO_*      (Precio v2: los 27 numeros y del
                                    feedback, con su default en config/precio.js
                                    y en .env.example. Finito >= 0 se usa (el 0
@@ -2481,8 +2584,8 @@ MATCHING_TIMEOUT eliminado POR COMPLETO — no queda ningun rastro:
   cambios.
 - `e2e-staging`: needs deploy-staging, SOLO en push a develop. Antes de correr
   hace poll de GET /health cada 10 s, hasta 5 min, esperando que `capacidades`
-  incluya "viaje-interno" (solo existe en el deploy nuevo); si no aparece, falla
-  con "staging no tiene el deploy nuevo". Despues npm run test:e2e.
+  incluya "peajes-google" (la ultima capacidad; antes "viaje-interno"); si no
+  aparece, falla con "staging no tiene el deploy nuevo". Despues npm run test:e2e.
 - Por que /health y no una ruta nueva: organizaciones.routes hace
   router.use(verificarToken, ...), asi que en el codigo VIEJO cualquier
   /api/organizaciones/* sin token ya daba 401 — no distingue los deploys. Para
@@ -2712,10 +2815,14 @@ node scripts/test-precio-v2.js             (Precio v2: crear / editar / estimar-
                                             RONDAS=N), pendientes, dataset admin y
                                             el chequeo RECURSIVO de todo lo que
                                             recibe el chofer (3973 con el
-                                            marketplace prendido). NO usa :3000 —
-                                            levanta 3971. Acepta numeros de caso y
-                                            --restos [--borrar]. Google REAL: ~40
-                                            llamadas por corrida)
+                                            marketplace prendido) y el CASO 18 de
+                                            peajes de Google (La Plata, Nunez,
+                                            PyME, estimar + crear = 1
+                                            llamada, serie = 1, editar, kill switch
+                                            en 3974). NO usa :3000 — levanta 3971.
+                                            Acepta numeros de caso y --restos
+                                            [--borrar]. Google REAL: ~60 llamadas
+                                            Pro y ~10 Enterprise por corrida)
 
 scripts/_server-efimero.js es el helper compartido que levanta src/app.js en un
 puerto propio con el env que se le pida. Lo usan el CASO 8 de test-jerarquia

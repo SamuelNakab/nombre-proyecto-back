@@ -29,6 +29,18 @@ export function tiempoPeonMinutos() {
 
 const HORA_MS = 3_600_000;
 
+// Desde cuando corre la linea de tiempo del estimado: fecha_programada; si falta
+// o ya paso, "ahora".
+const inicioEfectivoMs = (inicio, ahoraMs) =>
+  inicio instanceof Date && inicio.getTime() > ahoraMs ? inicio.getTime() : ahoraMs;
+
+// Salida estimada del ORIGEN (inicio + peon de la parada 1): la hora con la que
+// sale el primer tramo. La usa tambien el calculo de peajes (peajes.service),
+// asi el departureTime de los peajes es el mismo que el del primer tramo.
+export function salidaDelOrigen({ inicio, peonMinutos, ahora = new Date() }) {
+  return new Date(inicioEfectivoMs(inicio, ahora.getTime()) + (peonMinutos / 60) * HORA_MS);
+}
+
 // paradas: [{ lat, lng } | { latitud, longitud }, ...] (>= 2), en orden.
 // inicio: fecha_programada (Date). Si falta o ya paso, se arranca "ahora".
 // Devuelve:
@@ -44,7 +56,7 @@ export async function estimarRecorrido({ paradas, inicio, peonMinutos, calcularT
   }
 
   const ahoraMs = ahora.getTime();
-  const inicioMs = inicio instanceof Date && inicio.getTime() > ahoraMs ? inicio.getTime() : ahoraMs;
+  const inicioMs = inicioEfectivoMs(inicio, ahoraMs);
   const peonHoras = peonMinutos / 60;
   const peonMs = peonHoras * HORA_MS;
 
@@ -140,6 +152,12 @@ export function columnasEstimadasParada(estimada) {
 }
 
 // Filas de Parada ya mapeadas (paradasParaCrear) + su estimacion, por indice.
-export function conEstimacionPorParada(filas, recorrido) {
-  return filas.map((fila, i) => ({ ...fila, ...columnasEstimadasParada(recorrido.paradas[i]) }));
+// tramosPeajes: los tramos de obtenerPeajesGoogle (peaje de ida del leg que llega
+// a cada parada; null en la 1) o null si no hubo dato de Google.
+export function conEstimacionPorParada(filas, recorrido, tramosPeajes = null) {
+  return filas.map((fila, i) => ({
+    ...fila,
+    ...columnasEstimadasParada(recorrido.paradas[i]),
+    peajes_google_tramo: tramosPeajes?.[i] ?? null,
+  }));
 }

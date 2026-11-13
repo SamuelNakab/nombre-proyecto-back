@@ -82,6 +82,8 @@ export const OCULTAS_CHOFER = [
   'precio_medido_desglose',
   'peajes_estimados',
   'fuente_peajes',
+  'peajes_google_ida',
+  'peajes_google_incompleto',
   // Ids internos de OTROS usuarios (el creador de la PyME, el admin).
   'id_cliente',
   'id_creador',

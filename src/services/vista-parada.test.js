@@ -1,5 +1,49 @@
 import { describe, it, expect } from 'vitest';
-import { paradaVistaChofer, paradaVistaPyme } from './vista-parada.js';
+import { Prisma } from '@prisma/client';
+import {
+  paradaVistaChofer,
+  paradaVistaPyme,
+  VISIBLES_CHOFER_PARADA,
+  OCULTAS_CHOFER_PARADA,
+  CALCULADOS_CHOFER_PARADA,
+} from './vista-parada.js';
+import { tiemposParada } from './duracion.service.js';
+
+describe('vista del chofer: clasificacion de TODAS las columnas de Parada', () => {
+  const columnas = Object.keys(Prisma.ParadaScalarFieldEnum);
+
+  it('cada columna escalar esta en VISIBLES o en OCULTAS (una nueva sin clasificar rompe este test)', () => {
+    const sinClasificar = columnas.filter(
+      (c) => !VISIBLES_CHOFER_PARADA.includes(c) && !OCULTAS_CHOFER_PARADA.includes(c)
+    );
+    expect(sinClasificar).toEqual([]);
+  });
+
+  it('ninguna columna esta en las dos listas ni sobra', () => {
+    expect(VISIBLES_CHOFER_PARADA.filter((c) => OCULTAS_CHOFER_PARADA.includes(c))).toEqual([]);
+    expect([...VISIBLES_CHOFER_PARADA, ...OCULTAS_CHOFER_PARADA].filter((c) => !columnas.includes(c))).toEqual([]);
+  });
+
+  it('ningun peaje, precio ni lugar es visible', () => {
+    expect(VISIBLES_CHOFER_PARADA.filter((c) => /peaje|precio|tarifa|lugar/.test(c))).toEqual([]);
+    expect(OCULTAS_CHOFER_PARADA).toContain('peajes_google_tramo');
+  });
+
+  it('los calculados son exactamente los que suma tiemposParada', () => {
+    expect(Object.keys(tiemposParada({})).sort()).toEqual([...CALCULADOS_CHOFER_PARADA].sort());
+  });
+
+  it('una parada COMPLETA da las mismas claves que el spread viejo, menos peajes_google_tramo', () => {
+    const completa = Object.fromEntries(columnas.map((c) => [c, `v-${c}`]));
+    const conTiempos = { ...completa, ...tiemposParada({}), lugar: { nombre: 'x' } };
+    // El spread de antes: todo menos id_lugar y lugar.
+    // eslint-disable-next-line no-unused-vars
+    const { id_lugar, lugar, ...viejo } = conTiempos;
+    const nuevo = paradaVistaChofer(conTiempos);
+    expect(Object.keys(nuevo).sort()).toEqual(Object.keys(viejo).filter((k) => k !== 'peajes_google_tramo').sort());
+    expect(nuevo).not.toHaveProperty('peajes_google_tramo');
+  });
+});
 
 // Una parada tal como la trae INCLUDE_VIAJE_INTERNO (con el lugar guardado).
 const NOMBRE = 'Deposito Secreto Pilar';

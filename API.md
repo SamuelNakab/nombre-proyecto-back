@@ -6389,6 +6389,7 @@ subtotal sin IVA, el IVA y los peajes van separados en el desglose (`subtotal_si
   "paradas_extra": 0, "monto_paradas_extra": 0,
   "subtotal_sin_iva": 135000, "factura_a": false, "iva": 0,
   "peajes": 0, "fuente_peajes": "NINGUNA",
+  "peajes_detalle": { "google_ida": null, "factor_vuelta": 2, "multiplicador": 1, "google_total": null, "pyme": null, "usados": 0, "fuente": "NINGUNA", "incompleto": null, "error": false },
   "ajuste_redondeo": 0, "total": 135000, "bajo": 108000, "alto": 176000,
   "parametros": { "minimo": 84000, "minimo_horas": 2, "hora": 37500, "hora_ayudante": 12000, "km_ida": 4500, "...": "..." },
   "entradas": { "km_ida": 4.32, "horas": 0.70, "servicio": "LIVIANO", "ayudantes": 1, "provincia": false, "escalera": true, "fuente_km": "GPS", "...": "..." }
@@ -6401,6 +6402,49 @@ En el medido, `entradas` suma `fuente_km`, `km_gps`, `pings`, `referencia_km`, `
 **Compatibilidad**: en v2 `zona` se sigue calculando; `tarifa_hora` = precio hora del servicio y
 `tarifa_km` = precio por km del snapshot; `tiempo_capital` y `distancia_provincia` quedan `null`
 (también al cerrar). No hay hora pico en v2.
+
+### Peajes: Google y lo que declara la PyME
+
+Los peajes se calculan **automáticamente con Google** (Routes API, `extraComputations: TOLLS`,
+pase `AR_TELEPASE`). Es **una sola llamada por cálculo**, aparte de las llamadas por tramo, con
+origen = primera parada, destino = última y el resto como intermedias. Sale a la hora de salida
+estimada del origen: **la tarifa depende de la franja horaria** (Belgrano → La Plata: ARS 6.483,84
+de ida a las 08:00 y 5.187,06 a las 14:00).
+
+- **Monto de Google** = peaje de **ida** × `PRECIO_PEAJES_FACTOR_VUELTA` (2) ×
+  `PRECIO_PEAJES_MULTIPLICADOR_<SERVICIO>` (LIVIANO 1, EQUIPO 1, CAMION 2), redondeado a pesos.
+  Google cotiza un auto; el multiplicador lleva a la categoría del vehículo.
+- **Prioridad**: lo declarado por la PyME (`peajes_estimados`, total del viaje) **gana siempre**,
+  después Google, si no 0. `fuente_peajes`: `PYME` | `GOOGLE` | `NINGUNA`. Google se pide igual
+  aunque la PyME declare (queda el dato para comparar).
+  - Google respondió que la ruta no tiene peajes → 0 con fuente `GOOGLE`.
+  - Un peaje con tarifa desconocida (u otra moneda que ARS) → se usa lo conocido e `incompleto: true`.
+  - Si la llamada de peajes **falla** (timeout, error, cuota) **no bloquea** (no hay 503): el viaje
+    se crea o estima sin peajes de Google, `fuente` `NINGUNA` (o `PYME`) y `error: true`.
+  - Con `PEAJES_GOOGLE_HABILITADO=false` o `MAPS_PROVIDER=legacy` no se llama: `NINGUNA`, `error: false`.
+- **Cuándo se calculan**: crear, crear serie (**una** llamada por serie, con la primera ocurrencia;
+  el resultado se copia a todos sus viajes) y estimar-precio. Editar llama a Google solo si cambian
+  las paradas o la fecha; si cambia el tipo de servicio se recalcula el monto con el multiplicador
+  nuevo **sin llamar**. Cierre, medido y vivo usan los peajes del snapshot (no se recalculan con la
+  ruta real).
+- **Cache**: el resultado crudo de Google se guarda en Redis por `PRECIO_PEAJES_CACHE_SEGUNDOS`
+  (900), por paradas (5 decimales) + franja de 1 hora (hora argentina) de la salida. Así
+  `estimar-precio` y crear el mismo viaje con la misma fecha hacen **una** sola llamada.
+
+Campos nuevos (la PyME y el admin; **el chofer nunca los recibe**):
+- Viaje: `peajes_google_ida` (entero, pesos: el crudo de **ida** de Google, sin factores; `null` si
+  no se calculó) y `peajes_google_incompleto` (boolean o `null`).
+- Parada: `peajes_google_tramo` (peaje de ida del tramo que **llega** a esa parada; `null` en la
+  primera, si no se calculó o si la tarifa del tramo es desconocida).
+- Desglose (estimado, medido, `desglose_estimado` de crear, `costo-acumulado`, `viaje:finalizado` a
+  la PyME): `peajes` sigue siendo el **entero** usado y se suma `peajes_detalle`:
+
+```json
+{ "google_ida": 5187, "factor_vuelta": 2, "multiplicador": 1, "google_total": 10374, "pyme": null, "usados": 10374, "fuente": "GOOGLE", "incompleto": false, "error": false }
+```
+
+Ejemplo (Belgrano → La Plata, LIVIANO, mañana 14:00, sin factura A): 68,2 km de ida → régimen
+DISTANCIA 307.080; peajes 5.187 × 2 × 1 = 10.374; total **$317.000**.
 
 ### Datos que declara la PyME (crear y editar viaje, crear serie, estimar-precio)
 
@@ -6437,7 +6481,7 @@ Errores nuevos (400):
 
 Editar valida el **estado resultante** (lo guardado + lo que llega) y recalcula el precio si
 cambian paradas, fecha o cualquiera de estos datos. Si solo cambian estos datos no se llama a
-Google (se usan los estimados guardados). La regla de reconfirmación no cambia (CONFIRMADO →
+Google (se usan los estimados y los peajes de Google guardados). La regla de reconfirmación no cambia (CONFIRMADO →
 ASIGNADO).
 
 Otros campos nuevos:
@@ -6462,14 +6506,15 @@ Respuesta 200:
   "zona": "CABA",
   "total": 136000, "bajo": 109000, "alto": 177000,
   "desglose": { "version": 2, "...": "..." },
-  "peajes": { "pyme": 1200, "google": null, "google_incompleto": null, "usados": 1200, "fuente": "PYME" },
+  "peajes": { "pyme": 1200, "google": 10374, "google_ida": 5187, "factor_vuelta": 2, "multiplicador": 1, "google_total": 10374, "google_incompleto": false, "incompleto": false, "error": false, "usados": 1200, "fuente": "PYME" },
   "estimado": { "manejo_horas": 0.2, "peon_horas": 1, "total_horas": 1.2, "distancia_km": 4.3, "horas_precio": 0.7, "inicio_estimado": "...", "fin_estimado": "..." },
   "tramos": [{ "orden": 2, "manejo_estimado_min": 12, "manejo_sin_transito_min": 11, "distancia_estimada_km": 4.3, "...": "..." }]
 }
 ```
 
-Los peajes de Google **no se calculan** (`google: null`): el cálculo de peajes de Routes factura
-el SKU Enterprise. Solo cuentan los que declara la PyME.
+`peajes.google` es el monto de Google **ya con vuelta y multiplicador** (comparable con `pyme`);
+`google_ida` es el crudo de ida. `google_incompleto` queda como alias de `incompleto`. Ver
+[Peajes](#peajes-google-y-lo-que-declara-la-pyme).
 
 ### Columnas nuevas del viaje y de la parada
 
@@ -6552,8 +6597,9 @@ parámetros. Query: `page`, `limit` (hasta 1000, default 200), `desde` / `hasta`
 viaje) y `formato=csv` (descarga `text/csv`, una página por pedido; `X-Total-Count` con el total).
 JSON: `{ total, page, limit, viajes: [fila] }`. Columnas: las de `COLUMNAS_DATASET` en
 `src/controllers/admin-precios.controller.js` (`id_viaje`, `servicio`, `km_estimado`, `km_medido`,
-`fuente_km`, `peajes_pyme`, `peajes_pagados`, `estimado_total`, `medido_total`, `pagado_monto`,
-`parametros`, ...).
+`fuente_km`, `peajes_google` (con vuelta y multiplicador), `peajes_google_ida`,
+`peajes_google_incompleto`, `peajes_google_error`, `peajes_pyme`, `fuente_peajes`, `peajes_pagados`,
+`estimado_total`, `medido_total`, `pagado_monto`, `parametros`, ...).
 
 ### El chofer no ve precios (ni datos personales de la PyME)
 
@@ -6564,7 +6610,8 @@ de otros usuarios. La PyME y el admin siguen recibiendo todo.
   `precio_real`, `tarifa_hora`, `tarifa_km`, `tiempo_capital`, `distancia_provincia`,
   `id_creador`, `id_cliente`, `cancelado_por_admin_id`, `creador` ni `historial_estados[].id_usuario`;
   nunca trae las columnas nuevas de precio (`version_precio`, `precio_*`, `peajes_estimados`,
-  `fuente_peajes`) ni el feedback. Sí trae lo operativo nuevo: `tipo_servicio`, `ayudantes`,
+  `fuente_peajes`, `peajes_google_ida`, `peajes_google_incompleto`) ni el feedback. Las paradas
+  también van por **lista blanca**: nunca traen `id_lugar` ni `peajes_google_tramo`. Sí trae lo operativo nuevo: `tipo_servicio`, `ayudantes`,
   `factura_a`, la carga, `vehiculo_snapshot` y `acceso` / `pisos` / `operacion` por parada.
 - `GET /api/viajes/:id` de un viaje interno: **la misma forma** que `GET /api/choferes/viajes/:id`.
   Ya no trae `cliente` (la fila completa del usuario que creó el viaje), `empresa`, `calificacion`
@@ -6594,6 +6641,7 @@ generados no se regeneran. El remito del marketplace no cambia.
 | Web | `tiempo_capital` / `distancia_provincia` en v2: `null` | Leve |
 | Web | Remito sin bloque de costo | Sí (visual) |
 | Web | Campos y endpoints nuevos (Parte B, estimar-precio, precio pagado, `factura_a_por_defecto`, lugares) | No (aditivos) |
+| Web | Peajes de Google: `peajes.google` de estimar-precio con valor, `peajes_detalle` en el desglose, `peajes_google_ida` / `_incompleto` en el viaje y `peajes_google_tramo` en la parada; `fuente_peajes` puede ser `GOOGLE` | No (aditivos; `precio_estimado` ahora incluye los peajes de Google) |
 | Mobile | Detalle / lista del chofer, `GET /api/viajes/:id`, `salir` de la última, `viaje:asignado` / `editado` / `serie:asignada` / `finalizado`: sin precios ni datos del creador | **Sí**, si la app muestra precio o el creador |
 | Mobile | `GET /api/viajes/:id/costo-acumulado` de un viaje interno → 403 | **Sí** |
 | Mobile | Campos operativos nuevos (servicio, ayudantes, carga, acceso por parada) | No (aditivos) |

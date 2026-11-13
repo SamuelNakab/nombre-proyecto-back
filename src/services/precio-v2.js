@@ -64,6 +64,22 @@ function parametrosUsados(p, servicio) {
   };
 }
 
+// Detalle de los peajes para el desglose (Precio v2 + peajes de Google). Sale de
+// las entradas: un snapshot anterior a los peajes de Google da nulls.
+export function detallePeajes(e, usados) {
+  return {
+    google_ida: e.peajes_google_ida ?? null,
+    factor_vuelta: e.peajes_factor_vuelta ?? null,
+    multiplicador: e.peajes_multiplicador ?? null,
+    google_total: e.peajes_google_total ?? null,
+    pyme: e.peajes_pyme ?? null,
+    usados,
+    fuente: e.fuente_peajes ?? null,
+    incompleto: e.peajes_google_incompleto ?? null,
+    error: e.peajes_google_error ?? null,
+  };
+}
+
 // entradas: { km_ida, horas, servicio, ayudantes, provincia, paradas_extra,
 //             escalera, factura_a, peajes, fuente_peajes, ...otras (se copian) }
 // parametros: los valores de config/precio.js (o los del snapshot).
@@ -129,6 +145,7 @@ export function calcularPrecioV2(entradas, parametros) {
       iva,
       peajes,
       fuente_peajes: entradas.fuente_peajes ?? null,
+      peajes_detalle: detallePeajes(entradas, peajes),
       ajuste_redondeo: total - sin_redondear,
       total,
       bajo,

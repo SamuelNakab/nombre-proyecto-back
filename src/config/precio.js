@@ -7,6 +7,8 @@
 //   - vacia, invalida o negativa             -> default + warning al arrancar
 //   - tipo 'positivo' (horas minimas, fraccion, redondeo): tiene que ser > 0
 //   - tipo 'entero' (cantidades y dias): tiene que ser un entero >= 0
+//   - tipo 'booleano' (kill switch): true / 1 o false / 0 (sin distinguir
+//     mayusculas); cualquier otra cosa -> default + warning
 //
 // Se lee en cada calculo (convencion del repo: nada se cachea) y el warning sale
 // una vez al arrancar (advertirConfigPrecio, en app.js). Un viaje v2 guarda en
@@ -20,6 +22,7 @@
 const NUMERO = 'numero';
 const POSITIVO = 'positivo';
 const ENTERO = 'entero';
+const BOOLEANO = 'booleano';
 
 export const DEFINICION_PRECIO = {
   PRECIO_MINIMO_LIVIANO: [84000, NUMERO],
@@ -46,12 +49,27 @@ export const DEFINICION_PRECIO = {
   PRECIO_RANGO_ALTO_PORCENTAJE: [30, NUMERO],
   PRECIO_GPS_MIN_PUNTOS: [10, ENTERO],
   PRECIO_GPS_DISTANCIA_MIN_PORCENTAJE: [50, NUMERO],
-  // Sin uso mientras no haya peajes de Google (Enterprise): queda en la config
-  // y en el snapshot para el dia que se activen.
+  // Peajes de Google (Routes TOLLS, SKU Enterprise, ver peajes.service.js):
+  // monto usado = peaje de ida x FACTOR_VUELTA x MULTIPLICADOR_<SERVICIO>
+  // (Google cotiza un auto: el multiplicador lleva a la categoria del vehiculo).
   PRECIO_PEAJES_FACTOR_VUELTA: [2, NUMERO],
+  PRECIO_PEAJES_MULTIPLICADOR_LIVIANO: [1, NUMERO],
+  PRECIO_PEAJES_MULTIPLICADOR_EQUIPO: [1, NUMERO],
+  PRECIO_PEAJES_MULTIPLICADOR_CAMION: [2, NUMERO],
+  // Cache en Redis del resultado CRUDO de Google; 0 = sin cache.
+  PRECIO_PEAJES_CACHE_SEGUNDOS: [900, ENTERO],
+  // Kill switch: false -> no se llama a Google (fuente NINGUNA salvo la PyME).
+  PEAJES_GOOGLE_HABILITADO: [true, BOOLEANO],
   FEEDBACK_PRECIO_EDICION_DIAS: [30, ENTERO],
   FEEDBACK_PRECIO_MONTO_MAX: [100000000, ENTERO],
 };
+
+function leerBooleano(texto) {
+  const t = texto.toLowerCase();
+  if (t === 'true' || t === '1') return true;
+  if (t === 'false' || t === '0') return false;
+  return null;
+}
 
 function valido(n, tipo) {
   if (!Number.isFinite(n) || n < 0) return false;
@@ -71,6 +89,12 @@ export function leerConfigPrecio(env = process.env) {
       continue;
     }
     const texto = String(raw).trim();
+    if (tipo === BOOLEANO) {
+      const b = leerBooleano(texto);
+      valores[nombre] = b ?? defecto;
+      if (b === null) invalidas.push({ nombre, valor: raw, defecto });
+      continue;
+    }
     const n = texto === '' ? NaN : Number(texto);
     if (valido(n, tipo)) {
       valores[nombre] = n;
@@ -85,11 +109,15 @@ export function leerConfigPrecio(env = process.env) {
 // Los parametros vigentes (sin warnings).
 export const configPrecio = (env = process.env) => leerConfigPrecio(env).valores;
 
-// Al arrancar: un warning por cada variable invalida. Devuelve las invalidas.
+// Al arrancar: un warning por cada variable invalida (y un aviso si los peajes de
+// Google estan apagados). Devuelve las invalidas.
 export function advertirConfigPrecio(env = process.env, log = console.warn) {
-  const { invalidas } = leerConfigPrecio(env);
+  const { valores, invalidas } = leerConfigPrecio(env);
   for (const { nombre, valor, defecto } of invalidas) {
     log(`[precio] ${nombre}=${JSON.stringify(valor)} invalido: se usa el default ${defecto}`);
+  }
+  if (!valores.PEAJES_GOOGLE_HABILITADO) {
+    log('[peajes] PEAJES_GOOGLE_HABILITADO=false: no se calculan peajes con Google');
   }
   return invalidas;
 }

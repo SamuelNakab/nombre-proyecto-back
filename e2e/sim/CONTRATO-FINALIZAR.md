@@ -31,6 +31,15 @@ y `sim-finalizar-viaje.mjs` en el mismo PR.**
    de la PyME.
 5. **Remito**: el PDF de un viaje de PyME **no lleva bloque de costo** (ni desglose ni TOTAL). El chofer lo
    sigue recibiendo (`remito_url`).
+6. **Peajes de Google** (aditivo). El precio suma los peajes que calcula Google (una llamada por viaje; si
+   falla, el viaje se crea igual sin ellos). Lo declarado en `peajes_estimados` sigue ganando.
+   `desglose_estimado.peajes` sigue siendo el **entero** usado y se suma `desglose_estimado.peajes_detalle`
+   `{ google_ida, factor_vuelta, multiplicador, google_total, pyme, usados, fuente, incompleto, error }`
+   (`fuente`: `PYME` | `GOOGLE` | `NINGUNA`). La respuesta de crear (y el detalle de la PyME) trae
+   `peajes_google_ida` (entero o `null`) y `peajes_google_incompleto`, y cada parada
+   `peajes_google_tramo`. **El chofer no recibe nada de eso**: sus paradas van por lista blanca (sin
+   `peajes_google_tramo` ni `id_lugar`). `estimar-precio`: `peajes.google` ahora tiene valor. Ver `API.md`
+   → "Peajes: Google y lo que declara la PyME".
 
 ### Pedido del front 20-10-2026 (viajes de PyME)
 

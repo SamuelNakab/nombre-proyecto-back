@@ -59,7 +59,9 @@ app.use(cors(corsConfig.express));
 // ruta nueva no sirve de sonda: todo /api/organizaciones/* da 401 sin token
 // tambien en el codigo viejo). Para una capacidad futura: sumar el string aca y
 // buscarlo en el poll de ci.yml.
-const CAPACIDADES = ['viaje-interno'];
+// 'peajes-google': peajes de Google en el precio v2 (el simulador del front los
+// chequea en la respuesta de crear).
+const CAPACIDADES = ['viaje-interno', 'peajes-google'];
 
 // /health NO toca la base (UptimeRobot lo consulta cada 5 minutos y Neon tiene que
 // poder dormirse) y queda FUERA del rate limit. `version` = commit corto del deploy

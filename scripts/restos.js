@@ -48,6 +48,7 @@ export const PATRONES = [
   '-cie-', // test-cierre-viaje
   'maps-', // test-maps
   '-seg-', // test-seguridad
+  '-pv2-', // test-precio-v2
 ];
 // Dominio de las cuentas del simulador del front (e2e/sim). Sirve de patron para
 // contar lo que quede despues de borrar.

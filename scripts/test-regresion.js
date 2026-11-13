@@ -30,6 +30,7 @@ const SUITES = [
   { archivo: 'test-maps.js', timeoutMin: 10 },
   { archivo: 'test-lugares-series.js', timeoutMin: 25 },
   { archivo: 'test-cierre-viaje.js', timeoutMin: 15 },
+  { archivo: 'test-precio-v2.js', timeoutMin: 20 },
   { archivo: 'test-fase5.js', timeoutMin: 5 },
   { archivo: 'test-cancelacion-conductor.js', timeoutMin: 5 },
   { archivo: 'test-cancelacion-cliente.js', timeoutMin: 5 },

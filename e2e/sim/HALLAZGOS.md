@@ -10,7 +10,8 @@ de 1 s en llegar por socket. El script ahora lo espera hasta 5 s (2702 pasó ent
 - Confirmar la **última** parada → `200 { estado: "DESCARGANDO", viaje_finalizado: false }`. La PyME
   también lo ve en `DESCARGANDO`.
 - `salir` de la última → `200 { estado: "FINALIZADO", viaje_finalizado: true, precio_real, remito_url,
-  estimado, real }`. `real.distancia_km` sale del GPS simulado.
+  estimado, real }`. `real.distancia_km` sale del GPS simulado. (Desde el Precio v2, sin `precio_real`:
+  el chofer no ve precios de viajes de PyME.)
 - `salir` otra vez → `400 "No se puede salir de una parada en un viaje en estado FINALIZADO"`.
 - Confirmar la última otra vez → `400 "La parada ya fue confirmada"`.
 - Mensajes de error textuales iguales al contrato: "toca \"Salir\"", "No estas en ninguna parada",

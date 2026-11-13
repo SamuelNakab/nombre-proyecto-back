@@ -93,7 +93,8 @@ async function llamar(operacion, datos) {
   }
 }
 
-// { origen, destino, salida: Date, ahora?: Date } -> { distancia_km, manejo_horas, polilinea }
+// { origen, destino, salida: Date, ahora?: Date }
+//   -> { distancia_km, manejo_horas, manejo_sin_transito_horas, polilinea }
 export function calcularTramo({ origen, destino, salida, ahora = new Date() }) {
   return llamar('tramo', { origen, destino, salida, ahora });
 }

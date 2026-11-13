@@ -226,6 +226,7 @@ describe('tiemposParada', () => {
       manejo_estimado_min: 40,
       peon_real_min: 18,
       manejo_real_min: null,
+      manejo_sin_transito_min: null,
       diferencia_min: 7,
     });
   });

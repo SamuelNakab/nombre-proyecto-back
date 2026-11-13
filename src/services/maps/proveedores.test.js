@@ -18,7 +18,7 @@ describe('routes.js — pedidos', () => {
     expect(p.url).not.toContain('K');
     expect(p.init.headers['X-Goog-Api-Key']).toBe('K');
     expect(p.init.headers['X-Goog-FieldMask']).toBe(
-      'routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline'
+      'routes.duration,routes.staticDuration,routes.distanceMeters,routes.polyline.encodedPolyline'
     );
     expect(body.routingPreference).toBe('TRAFFIC_AWARE');
     expect(body.departureTime).toBe(salida.toISOString());
@@ -57,6 +57,12 @@ describe('routes.js — respuestas', () => {
     expect(r.manejo_horas).toBeCloseTo(658 / 3600, 10);
     expect(r.distancia_km).toBeCloseTo(2.418, 10);
     expect(r.polilinea[0]).toEqual([-120.2, 38.5]);
+    expect(r.manejo_sin_transito_horas).toBeNull();
+  });
+
+  it('tramo: staticDuration = manejo sin transito', () => {
+    const r = routes.leerTramo({ routes: [{ duration: '5057s', staticDuration: '4883s', distanceMeters: 68270 }] });
+    expect(r.manejo_sin_transito_horas).toBeCloseTo(4883 / 3600, 10);
   });
 
   it('distanceMeters omitido (0 en proto3) -> 0 km', () => {
@@ -92,6 +98,7 @@ describe('legacy.js (rollback)', () => {
       ],
     });
     expect(r.manejo_horas).toBeCloseTo(720 / 3600, 10);
+    expect(r.manejo_sin_transito_horas).toBeCloseTo(500 / 3600, 10);
     expect(r.distancia_km).toBe(3);
   });
 
@@ -159,7 +166,7 @@ describe('index.js — errores de la capa', () => {
     const antes = estadisticasMaps().por_sku.PRO ?? 0;
     vi.stubGlobal('fetch', vi.fn(async () => respuesta(200, { routes: [{ duration: '60s', distanceMeters: 1000 }] })));
     const r = await tramo();
-    expect(r).toEqual({ distancia_km: 1, manejo_horas: 60 / 3600, polilinea: [] });
+    expect(r).toEqual({ distancia_km: 1, manejo_horas: 60 / 3600, manejo_sin_transito_horas: null, polilinea: [] });
     expect(estadisticasMaps().por_sku.PRO).toBe(antes + 1);
   });
 

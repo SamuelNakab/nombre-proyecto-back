@@ -17,6 +17,7 @@ import {
   schemaFechaProgramada,
   schemaMotivo,
   schemaDescripcion,
+  camposDatosPrecio,
 } from '../services/viaje-validacion.js';
 import {
   ESTADOS_INTERNOS,
@@ -38,6 +39,7 @@ import {
   finalizarViajeOrganizacion,
   reasignarViaje as reasignarViajeSrv,
   editarViaje as editarViajeSrv,
+  estimarPrecioOrganizacion,
 } from '../services/viaje-interno.service.js';
 import { io } from '../sockets/index.js';
 import { responder400 } from '../services/errores-validacion.js';
@@ -63,6 +65,18 @@ const schemaCrear = z.object({
   fecha_programada: schemaFechaProgramada,
   motivo: schemaMotivo,
   descripcion: schemaDescripcion,
+  // Precio v2 (Parte B): todo opcional; ausente o null = no declarado.
+  ...camposDatosPrecio,
+});
+
+// POST /api/organizaciones/:id/viajes/estimar-precio: el mismo body que crear
+// (acepta id_lugar y los datos de la Parte B). id_conductor, motivo y
+// descripcion no hacen falta (si llegan se ignoran); fecha_programada es
+// opcional (sin fecha se estima saliendo ahora).
+const schemaEstimarPrecio = z.object({
+  paradas: schemaParadasInternas,
+  fecha_programada: schemaFechaProgramada.optional(),
+  ...camposDatosPrecio,
 });
 
 // motivo y descripcion opcionales en el body, pero si llegan, con las mismas
@@ -76,13 +90,16 @@ const schemaEditar = z
     fecha_programada: schemaFechaProgramada.optional(),
     motivo: schemaMotivo.optional(),
     descripcion: schemaDescripcion.optional(),
+    // Precio v2 (Parte B): null borra lo declarado.
+    ...camposDatosPrecio,
   })
   .refine(
     (d) =>
       d.paradas !== undefined ||
       d.fecha_programada !== undefined ||
       d.motivo !== undefined ||
-      d.descripcion !== undefined,
+      d.descripcion !== undefined ||
+      Object.keys(camposDatosPrecio).some((c) => d[c] !== undefined),
     { message: 'Mandá al menos un campo para editar (paradas, fecha_programada, motivo o descripcion)' }
   );
 
@@ -133,6 +150,13 @@ export const crearViaje = manejar(async (req, res) => {
     datos: parsed.data,
   });
   return res.status(201).json(viaje);
+});
+
+// POST /api/organizaciones/:id/viajes/estimar-precio — no crea nada.
+export const estimarPrecio = manejar(async (req, res) => {
+  const parsed = schemaEstimarPrecio.safeParse(req.body ?? {});
+  if (!parsed.success) return responder400(res, parsed);
+  return res.status(200).json(await estimarPrecioOrganizacion({ id_organizacion: req.id_organizacion, datos: parsed.data }));
 });
 
 // GET /api/organizaciones/:id/viajes?estado=&grupo=

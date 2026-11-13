@@ -70,7 +70,14 @@ export function pedidoTramo({ origen, destino, salida, ahora, apiKey }) {
   }
   return {
     sku: 'PRO',
-    ...pedido(apiKey, 'routes.duration,routes.distanceMeters,routes.polyline.encodedPolyline', body),
+    // routes.staticDuration (manejo SIN transito) va en la misma llamada: la
+    // FieldMask no es un disparador de SKU (los disparadores son features como
+    // TRAFFIC_AWARE o TOLLS), asi que sigue siendo Pro.
+    ...pedido(
+      apiKey,
+      'routes.duration,routes.staticDuration,routes.distanceMeters,routes.polyline.encodedPolyline',
+      body
+    ),
   };
 }
 
@@ -80,6 +87,8 @@ export function leerTramo(cuerpo) {
   return {
     distancia_km: distanciaDe(ruta),
     manejo_horas: segundosAHoras(duracionASegundos(ruta.duration)),
+    // null si Google no lo devolvio (no se inventa).
+    manejo_sin_transito_horas: ruta.staticDuration ? segundosAHoras(duracionASegundos(ruta.staticDuration)) : null,
     polilinea: encoded ? decodificarPolilinea(encoded) : [],
   };
 }

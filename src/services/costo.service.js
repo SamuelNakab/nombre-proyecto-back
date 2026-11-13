@@ -1,7 +1,7 @@
 import { obtenerTarifas } from './tarifa.service.js';
 import { clasificarZona, repartirPorZona } from './zona.service.js';
 import { obtenerAcumulado } from './gps.service.js';
-import { precioDesdeMediciones } from './precio-real.js';
+import { precioEnVivo } from './precio.service.js';
 import { calcularTramo } from './maps/index.js';
 import { estimarRecorrido, tiempoPeonMinutos } from './estimacion.service.js';
 import { horasAMinutos } from './duracion.service.js';
@@ -100,43 +100,11 @@ export function serializarEstimacion({ zona, precio_estimado, desglose, recorrid
 }
 
 // Precio ACUMULADO de un viaje en curso, a partir del acumulado GPS en Redis.
-// Estaba inline en GET /api/viajes/:id/costo-acumulado; se extrajo para que la
-// ruta de la PyME (GET /api/organizaciones/:id/viajes/:idViaje/costo-acumulado)
-// use el MISMO calculo. El viaje tiene que traer id_viaje, zona, tarifa_hora,
-// tarifa_km y paradas (latitud, longitud).
+// Lo usan GET /api/viajes/:id/costo-acumulado (legacy) y
+// GET /api/organizaciones/:id/viajes/:idViaje/costo-acumulado (PyME), con el
+// MISMO calculo que el evento costo:actualizar: precioEnVivo (precio.service),
+// que elige v1 o v2 por version_precio. El viaje trae SELECT_PRECIO y las
+// paradas con SELECT_PARADAS_PRECIO.
 export async function calcularCostoAcumulado(viaje) {
-  const acumulado = await obtenerAcumulado(viaje.id_viaje);
-  if (!acumulado) {
-    return { precio_acumulado: 0, desglose: null };
-  }
-
-  // La MISMA formula que el cierre (precio-real.js): en MIXTO se prorratea en
-  // vez de cobrar el tiempo total Y la distancia total.
-  const {
-    precio_real: precio_acumulado,
-    precio_por_tiempo,
-    precio_por_distancia,
-    tiempo_capital,
-    distancia_provincia,
-    fraccion_caba,
-  } = precioDesdeMediciones(viaje, acumulado);
-
-  const hora = new Date().getHours();
-  const es_hora_pico = (hora >= 7 && hora <= 10) || (hora >= 17 && hora <= 20);
-
-  return {
-    precio_acumulado,
-    desglose: {
-      precio_por_tiempo,
-      precio_por_distancia,
-      tiempo_horas: acumulado.tiempo_horas,
-      distancia_km: acumulado.distancia_km,
-      tiempo_capital,
-      distancia_provincia,
-      fraccion_caba,
-      tarifa_hora: viaje.tarifa_hora,
-      tarifa_km: viaje.tarifa_km,
-      es_hora_pico,
-    },
-  };
+  return precioEnVivo(viaje, await obtenerAcumulado(viaje.id_viaje));
 }

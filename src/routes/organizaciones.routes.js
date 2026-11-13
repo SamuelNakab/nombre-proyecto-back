@@ -29,7 +29,9 @@ import {
   finalizarViajePyme,
   costoAcumulado,
   remito,
+  estimarPrecio,
 } from '../controllers/viajes-internos.controller.js';
+import * as precioPagado from '../controllers/precio-pagado.controller.js';
 import * as lugares from '../controllers/lugares.controller.js';
 import * as series from '../controllers/series.controller.js';
 import { limitarMaps, limitarSeries, limitarInvitaciones } from '../middlewares/rate-limit.middleware.js';
@@ -62,6 +64,11 @@ router.delete('/:id/choferes/:idConductor', requireMiembro, desvincularChofer);
 // Viajes INTERNOS de la PyME (Paso 2). Cualquier miembro activo. Scoping por
 // req.id_organizacion: un viaje de otra PyME da 404.
 router.post('/:id/viajes', requireMiembro, limitarMaps, crearViaje);
+// Precio v2: el mismo calculo que crear, sin crear nada (llama a Google: MAPS).
+router.post('/:id/viajes/estimar-precio', requireMiembro, limitarMaps, estimarPrecio);
+// Feedback del precio pagado (precio v2, Parte D). pendientes va ANTES de
+// /:idViaje para que "precio-pagado" nunca se lea como un id.
+router.get('/:id/viajes/precio-pagado/pendientes', requireMiembro, precioPagado.pendientes);
 router.get('/:id/viajes', requireMiembro, listarViajes);
 router.get('/:id/viajes/:idViaje', requireMiembro, obtenerViaje);
 router.put('/:id/viajes/:idViaje', requireMiembro, limitarMaps, editarViaje);
@@ -72,6 +79,8 @@ router.post('/:id/viajes/:idViaje/cancelar', requireMiembro, cancelarViajePyme);
 router.post('/:id/viajes/:idViaje/finalizar', requireMiembro, finalizarViajePyme);
 router.get('/:id/viajes/:idViaje/costo-acumulado', requireMiembro, costoAcumulado);
 router.get('/:id/viajes/:idViaje/remito', requireMiembro, remito);
+router.get('/:id/viajes/:idViaje/precio-pagado', requireMiembro, precioPagado.obtener);
+router.put('/:id/viajes/:idViaje/precio-pagado', requireMiembro, precioPagado.guardar);
 
 // Lugares guardados (Paso 4). Cualquier miembro activo. Un lugar de otra PyME da
 // 404. Borrar es soft delete.

@@ -117,6 +117,7 @@ export function serializarOrganizacion(org, mi_rol) {
     razon_social: org.razon_social,
     direccion: org.direccion,
     estado: org.estado,
+    factura_a_por_defecto: org.factura_a_por_defecto ?? null,
     creado_en: org.creado_en,
     actualizado_en: org.actualizado_en,
     mi_rol,
@@ -166,6 +167,7 @@ export async function editarOrganizacion({ id_organizacion, id_usuario, datos })
   if (datos.razon_social !== undefined) data.razon_social = datos.razon_social;
   if (datos.direccion !== undefined) data.direccion = datos.direccion;
   if (datos.cuit !== undefined) data.cuit = validarCuitONegocio(datos.cuit);
+  if (datos.factura_a_por_defecto !== undefined) data.factura_a_por_defecto = datos.factura_a_por_defecto;
 
   const org = await prisma.$transaction(async (tx) => {
     await bloquearOrganizacion(tx, id_organizacion);

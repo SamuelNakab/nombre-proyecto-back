@@ -36,7 +36,8 @@ const enUnaHora = () => Math.floor(Date.now() / 1000) + 3600;
 
 const socketCon = ({ token = 'tok-a', ip = '200.1.1.1' } = {}) => ({
   handshake: { auth: { token } },
-  request: { headers: { 'x-forwarded-for': `10.0.0.1, ${ip}` }, socket: { remoteAddress: '127.0.0.1' } },
+  // Cliente + el proxy de Railway que agrega su IP (TRUST_PROXY default 2).
+  request: { headers: { 'x-forwarded-for': `${ip}, 10.0.0.1` }, socket: { remoteAddress: '127.0.0.1' } },
   data: {},
 });
 
@@ -52,6 +53,8 @@ beforeEach(() => {
   fake.status = 'ready';
   vaciarCacheSocket();
   delete process.env.RATE_LIMIT_HABILITADO;
+  // El .env local puede traer TRUST_PROXY: los tests usan el default de codigo.
+  delete process.env.TRUST_PROXY;
   process.env.RATE_LIMIT_SOCKET_IP_MAX = '3';
   process.env.RATE_LIMIT_SOCKET_USUARIO_MAX = '2';
   firebase.verifyIdToken.mockImplementation(async (t) => {
@@ -73,8 +76,10 @@ describe('limite por IP', () => {
     // Otra IP no se ve afectada.
     expect(await correr(limitarHandshakeIp, socketCon({ ip: '200.2.2.2' }))).toBe('ok');
   });
-  it('la IP es la de trust proxy (ultimo valor de X-Forwarded-For)', () => {
+  it('la IP es la de trust proxy (default 2 saltos: el anteultimo valor de X-Forwarded-For)', () => {
     expect(ipDeHandshake(socketCon().request, {})).toBe('200.1.1.1');
+    expect(ipDeHandshake(socketCon().request, { TRUST_PROXY: '1' })).toBe('10.0.0.1');
+    expect(ipDeHandshake(socketCon().request, { TRUST_PROXY: 'basura' })).toBe('200.1.1.1');
     expect(ipDeHandshake(socketCon().request, { TRUST_PROXY: '0' })).toBe('127.0.0.1');
     expect(ipDeHandshake({ headers: {}, socket: { remoteAddress: '::1' } }, {})).toBe('::1');
   });

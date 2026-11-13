@@ -1,4 +1,5 @@
 import { describe, it, expect, afterEach } from 'vitest';
+import { z } from 'zod';
 import {
   maxParadasPorViaje,
   MAX_PARADAS_DEFAULT,
@@ -10,6 +11,7 @@ import {
   schemaDescripcion,
   faltantesContenido,
   mensajeFaltantes,
+  camposDatosPrecio,
 } from './viaje-validacion.js';
 
 // El tope se lee de process.env en cada validacion: los tests lo setean y lo
@@ -117,8 +119,8 @@ describe('snapshot de un lugar en la parada', () => {
   it('copia direccion y coordenadas del lugar y guarda id_lugar; el nombre NO viaja', () => {
     const r = snapshotParadas([{ id_lugar: 7 }, { lat: -34.6, lng: -58.4, direccion: 'Av. X 123' }], porId);
     expect(r).toEqual([
-      { lat: -34.45, lng: -58.91, direccion: 'Ruta 8 km 50, Pilar', id_lugar: 7 },
-      { lat: -34.6, lng: -58.4, direccion: 'Av. X 123', id_lugar: null },
+      { lat: -34.45, lng: -58.91, direccion: 'Ruta 8 km 50, Pilar', id_lugar: 7, acceso: null, pisos: null, operacion: null },
+      { lat: -34.6, lng: -58.4, direccion: 'Av. X 123', id_lugar: null, acceso: null, pisos: null, operacion: null },
     ]);
     expect(JSON.stringify(r)).not.toContain('Deposito Pilar');
   });
@@ -128,7 +130,7 @@ describe('snapshot de un lugar en la parada', () => {
     const r = snapshotParadas([{ id_lugar: 7 }], new Map([[7, lugarMutable]]));
     lugarMutable.direccion = 'Otra direccion';
     lugarMutable.latitud = 0;
-    expect(r[0]).toEqual({ lat: -34.45, lng: -58.91, direccion: 'Ruta 8 km 50, Pilar', id_lugar: 7 });
+    expect(r[0]).toEqual({ lat: -34.45, lng: -58.91, direccion: 'Ruta 8 km 50, Pilar', id_lugar: 7, acceso: null, pisos: null, operacion: null });
   });
 
   it('tira si falta el lugar (el servicio valida antes y da 400)', () => {
@@ -138,9 +140,45 @@ describe('snapshot de un lugar en la parada', () => {
   it('paradasParaCrear lleva id_lugar a la fila (null para coordenadas)', () => {
     const filas = paradasParaCrear(snapshotParadas([{ id_lugar: 7 }, { lat: -34.6, lng: -58.4 }], porId));
     expect(filas).toEqual([
-      { orden: 1, latitud: -34.45, longitud: -58.91, direccion: 'Ruta 8 km 50, Pilar', id_lugar: 7 },
-      { orden: 2, latitud: -34.6, longitud: -58.4, direccion: '-34.6,-58.4', id_lugar: null },
+      { orden: 1, latitud: -34.45, longitud: -58.91, direccion: 'Ruta 8 km 50, Pilar', id_lugar: 7, acceso: null, pisos: null, operacion: null },
+      { orden: 2, latitud: -34.6, longitud: -58.4, direccion: '-34.6,-58.4', id_lugar: null, acceso: null, pisos: null, operacion: null },
     ]);
+  });
+
+  it('precio v2: sin acceso en la parada, copia acceso y pisos del lugar (snapshot)', () => {
+    const conAcceso = new Map([[7, { ...lugar, acceso_por_defecto: 'ESCALERA', pisos_por_defecto: 3 }]]);
+    const [r] = snapshotParadas([{ id_lugar: 7, operacion: 'CARGA' }], conAcceso);
+    expect(r).toMatchObject({ acceso: 'ESCALERA', pisos: 3, operacion: 'CARGA' });
+  });
+
+  it('precio v2: si la parada manda acceso, gana el de la parada', () => {
+    const conAcceso = new Map([[7, { ...lugar, acceso_por_defecto: 'ESCALERA', pisos_por_defecto: 3 }]]);
+    const [r] = snapshotParadas([{ id_lugar: 7, acceso: 'PLANTA_BAJA' }], conAcceso);
+    expect(r).toMatchObject({ acceso: 'PLANTA_BAJA', pisos: null });
+  });
+});
+
+describe('precio v2: validacion de paradas y datos declarados', () => {
+  const base = [{ lat: -34.6, lng: -58.4 }, { lat: -34.61, lng: -58.41 }];
+  it('pisos obligatorio con ESCALERA o ASCENSOR', () => {
+    const r = schemaParadasInternas.safeParse([{ ...base[0], acceso: 'ESCALERA' }, base[1]]);
+    expect(r.success).toBe(false);
+    expect(r.error.issues[0].message).toBe('pisos es obligatorio si el acceso es ESCALERA o ASCENSOR');
+    expect(schemaParadasInternas.safeParse([{ ...base[0], acceso: 'ASCENSOR', pisos: 0 }, base[1]]).success).toBe(true);
+    expect(schemaParadasInternas.safeParse([{ id_lugar: 4, acceso: 'PLANTA_BAJA' }, base[1]]).success).toBe(true);
+  });
+  it('acceso y operacion validos', () => {
+    expect(schemaParadasInternas.safeParse([{ ...base[0], acceso: 'TECHO' }, base[1]]).success).toBe(false);
+    expect(schemaParadasInternas.safeParse([{ ...base[0], operacion: 'CARGA_Y_DESCARGA' }, base[1]]).success).toBe(true);
+  });
+  it('datos declarados: opcionales, null vale y limites', () => {
+    const s = z.object(camposDatosPrecio);
+    expect(s.safeParse({}).success).toBe(true);
+    expect(s.safeParse({ tipo_servicio: null, factura_a: null }).success).toBe(true);
+    expect(s.safeParse({ tipo_servicio: 'EQUIPO', ayudantes: 2, peajes_estimados: 0, pallets: 0 }).success).toBe(true);
+    for (const malo of [{ tipo_servicio: 'MOTO' }, { ayudantes: -1 }, { ayudantes: 1.5 }, { bultos: 0 }, { peso_kg: 0 }, { volumen_m3: 500 }, { valor_declarado: 3e9 }, { factura_a: 'si' }]) {
+      expect(s.safeParse(malo).success).toBe(false);
+    }
   });
 });
 

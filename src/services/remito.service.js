@@ -61,6 +61,29 @@ function formatPeso(n) {
   return '$' + Number(n).toFixed(2);
 }
 
+// Bloque de COSTO del remito. PURA.
+//   - Viaje INTERNO (de PyME), v1 o v2: null. El remito es un comprobante de
+//     ENTREGA y no lleva precio: un solo PDF que tambien recibe el chofer, que
+//     no ve precios de viajes de PyME. La PyME ve el precio y el desglose en la
+//     app (detalle, viaje:finalizado). Los PDFs ya generados no se tocan.
+//   - Viaje LEGACY (marketplace): el bloque de siempre (tiempo / distancia por
+//     zona y TOTAL = precio_real).
+export function bloqueCosto(viaje) {
+  if (viaje.id_organizacion != null) return null;
+  const lineas = [];
+  if (viaje.zona === 'CABA' || viaje.zona === 'MIXTO') {
+    const t = viaje.tiempo_capital ?? 0;
+    const tarifa = viaje.tarifa_hora ?? 0;
+    lineas.push(`Tiempo:      ${t.toFixed(2)} h  ×  ${formatPeso(tarifa)}/h  =  ${formatPeso(t * tarifa)}`);
+  }
+  if (viaje.zona === 'PROVINCIA' || viaje.zona === 'MIXTO') {
+    const d = viaje.distancia_provincia ?? 0;
+    const tarifa = viaje.tarifa_km ?? 0;
+    lineas.push(`Distancia:   ${d.toFixed(2)} km  ×  ${formatPeso(tarifa)}/km  =  ${formatPeso(d * tarifa)}`);
+  }
+  return { lineas, total: `TOTAL:   ${formatPeso(viaje.precio_real)}` };
+}
+
 async function generarPDF(viaje) {
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ margin: 50, size: 'A4' });
@@ -134,31 +157,21 @@ async function generarPDF(viaje) {
     }
     doc.moveDown(0.5);
 
-    // ── Desglose de costo ──
-    doc.moveTo(50, doc.y).lineTo(50 + W, doc.y).stroke();
-    doc.moveDown(0.5);
-    doc.fontSize(11).font('Helvetica-Bold').text('DESGLOSE DE COSTO');
-    doc.moveDown(0.3);
-    doc.fontSize(10).font('Helvetica');
+    // ── Desglose de costo (solo legacy: ver bloqueCosto) ──
+    const costo = bloqueCosto(viaje);
+    if (costo) {
+      doc.moveTo(50, doc.y).lineTo(50 + W, doc.y).stroke();
+      doc.moveDown(0.5);
+      doc.fontSize(11).font('Helvetica-Bold').text('DESGLOSE DE COSTO');
+      doc.moveDown(0.3);
+      doc.fontSize(10).font('Helvetica');
+      for (const linea of costo.lineas) doc.text(linea);
 
-    if (viaje.zona === 'CABA' || viaje.zona === 'MIXTO') {
-      const t = viaje.tiempo_capital ?? 0;
-      const tarifa = viaje.tarifa_hora ?? 0;
-      doc.text(`Tiempo:      ${t.toFixed(2)} h  ×  ${formatPeso(tarifa)}/h  =  ${formatPeso(t * tarifa)}`);
+      doc.moveDown(0.5);
+      doc.moveTo(50, doc.y).lineTo(50 + W, doc.y).stroke();
+      doc.moveDown(0.3);
+      doc.fontSize(12).font('Helvetica-Bold').text(costo.total, { align: 'right' });
     }
-    if (viaje.zona === 'PROVINCIA' || viaje.zona === 'MIXTO') {
-      const d = viaje.distancia_provincia ?? 0;
-      const tarifa = viaje.tarifa_km ?? 0;
-      doc.text(`Distancia:   ${d.toFixed(2)} km  ×  ${formatPeso(tarifa)}/km  =  ${formatPeso(d * tarifa)}`);
-    }
-
-    doc.moveDown(0.5);
-    doc.moveTo(50, doc.y).lineTo(50 + W, doc.y).stroke();
-    doc.moveDown(0.3);
-    doc.fontSize(12).font('Helvetica-Bold').text(
-      `TOTAL:   ${formatPeso(viaje.precio_real)}`,
-      { align: 'right' }
-    );
 
     doc.end();
   });

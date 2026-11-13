@@ -7,12 +7,15 @@ ninguna app.
 
 Lo que verifica (el contrato está en `CONTRATO-FINALIZAR.md`):
 - **Paso 3**: confirmar la última parada deja el viaje en `DESCARGANDO`; recién
-  `POST /api/choferes/viajes/:id/salir` de la última lo pasa a `FINALIZADO` (con `precio_real`,
-  `remito_url`, `estimado` y `real`).
+  `POST /api/choferes/viajes/:id/salir` de la última lo pasa a `FINALIZADO` (con `remito_url`, `estimado`
+  y `real`; sin `precio_real` desde el Precio v2).
 - **Pedido del front 20-10-2026**: `motivo` y `descripcion` obligatorios (400 si faltan), sin
   condiciones (las de un cliente viejo se ignoran), `motivo` en las lecturas de la PyME y del chofer.
 - **Tarea 5**: la PyME no puede finalizar antes de la hora prevista (409), el chofer no puede iniciar un
   segundo viaje en curso (409), `viaje:finalizado` con `cerrado_por: "CHOFER"`.
+- **Precio v2**: el viaje creado es `version_precio: 2` con precio entero y rango; la PyME ve
+  el precio medido y `precio_pagado_pendiente`; el chofer no recibe precios (`salir`, su detalle,
+  `viaje:finalizado`).
 
 ## 1. Script con GPS por socket (la prueba principal)
 

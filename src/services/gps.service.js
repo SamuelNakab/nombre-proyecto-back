@@ -1,6 +1,6 @@
 import * as turf from '@turf/turf';
 import redis from '../config/redis.js';
-import { medicionEn, PUNTOS_MUESTREO_MS } from './mediciones-gps.js';
+import { medicionEn, pingsEn, avanzarAcumulado, calidadGps, PUNTOS_MUESTREO_MS } from './mediciones-gps.js';
 
 export async function guardarCoordenada(id_viaje, lat, lng, timestamp) {
   const payload = JSON.stringify({ lat, lng, timestamp });
@@ -22,38 +22,24 @@ export async function obtenerAcumulado(id_viaje) {
   return raw ? JSON.parse(raw) : null;
 }
 
+const distanciaKm = (a, b) => turf.distance(a, b, { units: 'kilometers' });
+
+// El calculo es avanzarAcumulado (mediciones-gps.js, PURO): ignora los pings con
+// timestamp <= al ultimo procesado (ignorado: true, no escribe nada) y cuenta
+// pings y el mayor hueco entre pings.
 export async function actualizarAcumulado(id_viaje, lat, lng, timestamp) {
   const raw = await redis.get(`gps:${id_viaje}:acumulado`);
-
-  if (!raw) {
-    const inicial = {
-      tiempo_horas: 0,
-      distancia_km: 0,
-      ultima_lat: lat,
-      ultima_lng: lng,
-      ultima_actualizacion: timestamp,
-    };
-    await redis.set(`gps:${id_viaje}:acumulado`, JSON.stringify(inicial), 'EX', 86400);
-    return { tiempo_horas: 0, distancia_km: 0, es_primer_ping: true };
+  const r = avanzarAcumulado(raw ? JSON.parse(raw) : null, { lat, lng, timestamp }, distanciaKm);
+  if (!r.ignorado) {
+    await redis.set(`gps:${id_viaje}:acumulado`, JSON.stringify(r.nuevo), 'EX', 86400);
   }
-
-  const acumulado = JSON.parse(raw);
-  const distancia_delta = turf.distance(
-    [acumulado.ultima_lng, acumulado.ultima_lat],
-    [lng, lat],
-    { units: 'kilometers' }
-  );
-  const tiempo_delta = (timestamp - acumulado.ultima_actualizacion) / 3600000;
-
-  const nuevo = {
-    tiempo_horas: acumulado.tiempo_horas + tiempo_delta,
-    distancia_km: acumulado.distancia_km + distancia_delta,
-    ultima_lat: lat,
-    ultima_lng: lng,
-    ultima_actualizacion: timestamp,
+  return {
+    ...r.nuevo,
+    distancia_delta: r.distancia_delta,
+    tiempo_delta: r.tiempo_delta,
+    es_primer_ping: r.es_primer_ping,
+    ignorado: r.ignorado,
   };
-  await redis.set(`gps:${id_viaje}:acumulado`, JSON.stringify(nuevo), 'EX', 86400);
-  return { ...nuevo, distancia_delta, tiempo_delta, es_primer_ping: false };
 }
 
 export function calcularVelocidad(lat_ant, lng_ant, ts_ant, lat_nueva, lng_nueva, ts_nuevo) {
@@ -90,19 +76,34 @@ export async function registrarPuntoMedicion(id_viaje, timestamp, acumulado) {
   const key = keyPuntos(id_viaje);
   const ultimo = await redis.zrevrange(key, 0, 0, 'WITHSCORES');
   if (ultimo.length === 2 && timestamp - Number(ultimo[1]) < PUNTOS_MUESTREO_MS) return false;
-  const punto = { ts: timestamp, tiempo_horas: acumulado.tiempo_horas, distancia_km: acumulado.distancia_km };
+  const punto = {
+    ts: timestamp,
+    tiempo_horas: acumulado.tiempo_horas,
+    distancia_km: acumulado.distancia_km,
+    // Pings aceptados hasta este punto: el precio medido cortado antes del
+    // ultimo ping necesita saber cuantos hubo hasta el corte.
+    pings: acumulado.pings ?? 0,
+  };
   await redis.multi().zadd(key, timestamp, JSON.stringify(punto)).expire(key, 86400).exec();
   return true;
 }
 
-// { tiempo_horas, distancia_km, sin_pings } medidos hasta `instante`.
+// { tiempo_horas, distancia_km, sin_pings, pings } medidos hasta `instante`.
+// `pings` = pings aceptados hasta ese instante (precio v2).
 export async function medicionesHasta(id_viaje, instante) {
   const acumulado = await obtenerAcumulado(id_viaje);
   if (!acumulado || new Date(instante).getTime() >= acumulado.ultima_actualizacion) {
-    return medicionEn([], acumulado, instante);
+    return { ...medicionEn([], acumulado, instante), pings: pingsEn([], acumulado, instante) };
   }
   const crudos = await redis.zrangebyscore(keyPuntos(id_viaje), '-inf', new Date(instante).getTime());
-  return medicionEn(crudos.map((c) => JSON.parse(c)), acumulado, instante);
+  const puntos = crudos.map((c) => JSON.parse(c));
+  return { ...medicionEn(puntos, acumulado, instante), pings: pingsEn(puntos, acumulado, instante) };
+}
+
+// Calidad del GPS del viaje (pings aceptados y mayor hueco), leida ANTES de
+// limpiar Redis, para persistir al cerrar o al cancelar en curso.
+export async function calidadGpsViaje(id_viaje) {
+  return calidadGps(await obtenerAcumulado(id_viaje));
 }
 
 // Timestamp (Date) del ultimo ping del viaje, o null.

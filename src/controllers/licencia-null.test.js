@@ -10,13 +10,20 @@ const prismaMock = vi.hoisted(() => ({
   usuario: { count: vi.fn(), findMany: vi.fn(), findUnique: vi.fn() },
   conductor: { findUnique: vi.fn() },
   vinculoChofer: { findMany: vi.fn() },
-  viaje: { findUnique: vi.fn() },
+  viaje: { findUnique: vi.fn(), findFirst: vi.fn() },
 }));
 
 vi.mock('../config/prisma.js', () => ({ default: prismaMock }));
 vi.mock('../config/firebase.js', () => ({ default: {} }));
 vi.mock('../config/redis.js', () => ({ default: { get: vi.fn(), del: vi.fn(), on: vi.fn() } }));
 vi.mock('../sockets/index.js', () => ({ io: null }));
+// GET /api/viajes/:id de un viaje interno delega en el detalle del chofer, que
+// antes corre los chequeos perezosos (vencimiento / cierre): fuera del alcance
+// de este test.
+vi.mock('../services/cierre-automatico.service.js', async (orig) => ({
+  ...(await orig()),
+  ponerAlDia: vi.fn(async () => {}),
+}));
 vi.mock('../services/ruta.service.js', () => ({
   obtenerRutaPlaneada: vi.fn(async () => null),
   guardarRutaPlaneada: vi.fn(),
@@ -99,8 +106,8 @@ describe('lecturas con un conductor sin licencia', () => {
     expect(choferes[0]).toMatchObject({ id_conductor: 7, vehiculos: [] });
   });
 
-  it('GET /api/viajes/:id (chofer de un viaje interno) -> 200, licencia null y sin condiciones_req', async () => {
-    prismaMock.viaje.findUnique.mockResolvedValue({
+  it('GET /api/viajes/:id (chofer de un viaje interno) -> 200, la misma vista del chofer, sin datos personales ni licencia', async () => {
+    const fila = {
       id_viaje: 10,
       id_organizacion: 1,
       estado: 'ASIGNADO',
@@ -121,13 +128,34 @@ describe('lecturas con un conductor sin licencia', () => {
       empresa: null,
       calificacion: null,
       historial_estados: [],
+    };
+    prismaMock.viaje.findUnique.mockResolvedValue(fila);
+    prismaMock.conductor.findUnique.mockResolvedValue({ id_conductor: 7 });
+    // Lo que trae INCLUDE_VIAJE_INTERNO (el detalle del chofer).
+    prismaMock.viaje.findFirst.mockResolvedValue({
+      ...fila,
+      id_conductor: 7,
+      precio_estimado: 84000,
+      tarifa_hora: 37500,
+      id_creador: 99,
+      id_cliente: 5,
+      manejo_estimado_horas: 0.5,
+      manejo_real_horas: null,
+      cierre: undefined,
+      organizacion: { id_organizacion: 1, nombre: 'PyME', cuit: '30999999995' },
+      creador: { id_usuario: 99, nombre: 'Ana', apellido: 'B' },
+      conductor: { id_conductor: 7, usuario: { id_usuario: 70, nombre: 'Chofer', apellido: 'Sin Licencia', telefono: '1' } },
     });
     const res = respuesta();
     await obtenerViaje({ params: { id: '10' }, usuario: USUARIO }, res);
     expect(res.statusCode).toBe(200);
-    expect(res.body.conductor).toMatchObject({ nro_licencia: null, licencia_vencimiento: null });
-    expect(res.body).not.toHaveProperty('condiciones_req');
+    expect(res.body.conductor).toEqual({ id_conductor: 7, id_usuario: 70, nombre: 'Chofer', apellido: 'Sin Licencia', telefono: '1' });
+    for (const k of ['condiciones_req', 'cliente', 'creador', 'id_creador', 'id_cliente', 'precio_estimado', 'tarifa_hora']) {
+      expect(res.body).not.toHaveProperty(k);
+    }
+    expect(JSON.stringify(res.body)).not.toMatch(/email|nro_licencia|firebase_uid/);
     expect(res.body.motivo).toBe('Reparto');
+    expect(res.body.organizacion.nombre).toBe('PyME');
   });
 });
 

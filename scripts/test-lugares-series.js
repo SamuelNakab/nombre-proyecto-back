@@ -926,7 +926,10 @@ async function casosSeries(ctx, leerLog) {
     );
     const lista = await listarSeries(P1, A, '?estado=CANCELADA');
     const enLista = lista.data.find?.((s) => s.id_serie === ctx.serieDiaria);
-    paso('CASO 18f: lista con filtro y resumen por estado', lista.status === 200 && enLista?.resumen_viajes.total === 30 && JSON.stringify(enLista.resumen_viajes.por_estado) === JSON.stringify(porEstado) && lista.data.every((s) => s.estado === 'CANCELADA'), JSON.stringify(enLista?.resumen_viajes));
+    // Comparacion SIN depender del orden de las claves: el server cuenta sobre los
+    // viajes en el orden fisico de la tabla y el test en orden de fecha.
+    const ordenado = (o) => JSON.stringify(Object.entries(o ?? {}).sort(([a], [b]) => a.localeCompare(b)));
+    paso('CASO 18f: lista con filtro y resumen por estado', lista.status === 200 && enLista?.resumen_viajes.total === 30 && ordenado(enLista.resumen_viajes.por_estado) === ordenado(porEstado) && lista.data.every((s) => s.estado === 'CANCELADA'), `${JSON.stringify(enLista?.resumen_viajes)} vs ${JSON.stringify(porEstado)}`);
   }
 
   // CASO 19 ------------------------------------------------------------------

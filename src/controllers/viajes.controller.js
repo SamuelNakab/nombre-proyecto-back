@@ -27,7 +27,11 @@ import {
   INCLUDE_HISTORIAL,
 } from '../services/historial-estado.service.js';
 import { distanciaMetros } from '../services/parada.service.js';
-import { confirmarParadaInterna, exigirViajeAbiertoChofer } from '../services/viaje-interno.service.js';
+import {
+  confirmarParadaInterna,
+  exigirViajeAbiertoChofer,
+  obtenerViajeChofer,
+} from '../services/viaje-interno.service.js';
 import { paradaVistaChofer } from '../services/vista-parada.js';
 import {
   esViajeVencido,
@@ -284,6 +288,19 @@ export async function obtenerViaje(req, res) {
 
   if (!acceso) {
     return res.status(403).json({ error: 'Sin acceso a este viaje' });
+  }
+
+  // Viaje INTERNO: el unico que llega hasta aca es el chofer asignado, y recibe
+  // EXACTAMENTE lo mismo que GET /api/choferes/viajes/:id (mismo serializador,
+  // lista blanca de vista-chofer.js): sin precios, peajes ni tarifas y sin datos
+  // personales del creador de la PyME (antes este endpoint devolvia la fila
+  // completa de su Usuario).
+  if (viaje.id_organizacion !== null) {
+    try {
+      return res.status(200).json(await obtenerViajeChofer(io, req.usuario.id_usuario, id_viaje));
+    } catch (err) {
+      return responderErrorNegocio(res, err);
+    }
   }
 
   // null si el viaje ya termino (Redis limpio) o si la ruta nunca se calculo.
@@ -730,6 +747,12 @@ export async function obtenerCostoAcumulado(req, res) {
   // BUSCANDO_CONDUCTOR no tiene costo acumulado.
   if (!puedeVerViaje(viaje, req.usuario)) {
     return res.status(403).json({ error: 'Sin acceso a este viaje' });
+  }
+  // Viaje INTERNO: el unico que pasa puedeVerViaje es el chofer asignado, y el
+  // chofer no ve precios de un viaje de PyME (la PyME usa
+  // GET /api/organizaciones/:id/viajes/:idViaje/costo-acumulado).
+  if (viaje.id_organizacion !== null) {
+    return res.status(403).json({ error: 'El precio de un viaje de PyME no esta disponible para el chofer' });
   }
 
   return res.status(200).json(await calcularCostoAcumulado(viaje));

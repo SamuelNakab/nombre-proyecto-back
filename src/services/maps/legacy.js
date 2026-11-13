@@ -66,6 +66,8 @@ export function leerTramo(cuerpo) {
   return {
     distancia_km: metrosAKm(leg.distance?.value ?? 0),
     manejo_horas: segundosAHoras(segundos),
+    // Directions: leg.duration es la duracion sin transito.
+    manejo_sin_transito_horas: typeof leg.duration?.value === 'number' ? segundosAHoras(leg.duration.value) : null,
     polilinea: encoded ? decodificarPolilinea(encoded) : [],
   };
 }

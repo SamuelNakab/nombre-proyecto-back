@@ -18,8 +18,9 @@ import { reportarError } from '../config/sentry.js';
 import { ErrorNegocio } from './error-negocio.js';
 import { calcularPrecioV2, VERSION_V2 } from './precio-v2.js';
 import { entradasEstimado, entradasMedido, validarDatosPrecio, CAMPOS_DECLARADOS } from './precio-entradas.js';
-import { estimarRecorrido, tiempoPeonMinutos } from './estimacion.service.js';
+import { estimarRecorrido, tiempoPeonMinutos, salidaDelOrigen } from './estimacion.service.js';
 import { calcularTramo } from './maps/index.js';
+import { obtenerPeajesGoogle } from './peajes.service.js';
 import { clasificarZona } from './zona.service.js';
 import { precioDesdeMediciones } from './precio-real.js';
 import { horasAMinutos } from './duracion.service.js';
@@ -46,9 +47,17 @@ export async function facturaAPorDefecto(id_organizacion) {
 // ─── Estimado ────────────────────────────────────────────────────────────────
 
 // Precio v2 a partir de un recorrido ya estimado (sin llamar a Google): crear,
-// editar sin cambios de paradas / fecha, series. Devuelve { total, bajo, alto,
-// desglose, snapshot }.
-export function precioV2DesdeRecorrido({ paradas, totales, declarados, facturaAOrganizacion, parametros = configPrecio() }) {
+// editar sin cambios de paradas / fecha, series. peajesGoogle: { ida,
+// incompleto, error } (de obtenerPeajesGoogle o de la fila del viaje) o null.
+// Devuelve { total, bajo, alto, desglose, snapshot }.
+export function precioV2DesdeRecorrido({
+  paradas,
+  totales,
+  declarados,
+  facturaAOrganizacion,
+  peajesGoogle = null,
+  parametros = configPrecio(),
+}) {
   const { entradas, snapshot } = entradasEstimado(
     {
       paradas,
@@ -56,25 +65,59 @@ export function precioV2DesdeRecorrido({ paradas, totales, declarados, facturaAO
       distancia_km: totales.distancia_km,
       declarados,
       facturaAOrganizacion,
+      peajesGoogle,
     },
     parametros
   );
   return { ...calcularPrecioV2(entradas, parametros), snapshot };
 }
 
+// Peajes de Google para una estimacion: UNA llamada Enterprise (o el cache), con
+// la salida estimada del origen. Nunca tira (ver peajes.service).
+export function peajesDeEstimacion({ paradas, fecha_programada, ahora = new Date() }) {
+  const salida = salidaDelOrigen({ inicio: new Date(fecha_programada), peonMinutos: tiempoPeonMinutos(), ahora });
+  return obtenerPeajesGoogle({ paradas, salida, ahora });
+}
+
 // Estimacion COMPLETA (Google): recorrido (manejo con transito + peon, ver
-// estimacion.service) + precio v2. Tira ErrorMaps si Google falla: va SIEMPRE
-// antes de cualquier transaccion.
-export async function estimarPrecioInterno({ paradas, fecha_programada, declarados, facturaAOrganizacion }) {
+// estimacion.service) + peajes + precio v2. Tira ErrorMaps si fallan los TRAMOS
+// (va SIEMPRE antes de cualquier transaccion); los peajes NUNCA tiran.
+// Los peajes van EN PARALELO con los tramos (no suman latencia). peajesGoogle:
+// un resultado (o una PROMESA, la misma para toda una serie) ya pedido; si no
+// viene, se piden aca.
+// Devuelve { zona, recorrido, precio, peajes } (peajes: lo de obtenerPeajesGoogle,
+// con los tramos por parada).
+export async function estimarPrecioInterno({ paradas, fecha_programada, declarados, facturaAOrganizacion, peajesGoogle }) {
   const zona = clasificarZona(paradas);
-  const recorrido = await estimarRecorrido({
+  const ahora = new Date();
+  const [recorrido, peajes] = await Promise.all([
+    estimarRecorrido({
+      paradas,
+      inicio: new Date(fecha_programada),
+      peonMinutos: tiempoPeonMinutos(),
+      calcularTramo,
+      ahora,
+    }),
+    peajesGoogle ?? peajesDeEstimacion({ paradas, fecha_programada, ahora }),
+  ]);
+  const precio = precioV2DesdeRecorrido({
     paradas,
-    inicio: new Date(fecha_programada),
-    peonMinutos: tiempoPeonMinutos(),
-    calcularTramo,
+    totales: recorrido.totales,
+    declarados,
+    facturaAOrganizacion,
+    peajesGoogle: peajes,
   });
-  const precio = precioV2DesdeRecorrido({ paradas, totales: recorrido.totales, declarados, facturaAOrganizacion });
-  return { zona, recorrido, precio };
+  return { zona, recorrido, precio, peajes };
+}
+
+// Los peajes de Google guardados en un viaje (editar sin llamar a Google): el
+// crudo de las columnas y el `error` del snapshot anterior.
+export function peajesGoogleDeViaje(viaje) {
+  return {
+    ida: viaje.peajes_google_ida ?? null,
+    incompleto: viaje.peajes_google_incompleto ?? null,
+    error: Boolean(viaje.precio_parametros?.entradas?.peajes_google_error),
+  };
 }
 
 // Columnas del viaje para un precio v2 estimado. Compatibilidad con el codigo
@@ -97,6 +140,9 @@ export function columnasPrecioV2(precio, zona, declarados) {
     precio_estimado_desglose: precio.desglose,
     precio_parametros: precio.snapshot,
     fuente_peajes: precio.snapshot.entradas.fuente_peajes,
+    // Peajes de Google: el crudo de ida (sin factores) y si vino incompleto.
+    peajes_google_ida: precio.snapshot.entradas.peajes_google_ida ?? null,
+    peajes_google_incompleto: precio.snapshot.entradas.peajes_google_incompleto ?? null,
   };
   for (const c of CAMPOS_DECLARADOS) out[c] = declarados[c] ?? null;
   return out;
@@ -112,11 +158,19 @@ export function serializarEstimacionPrecio({ zona, recorrido, precio }) {
     bajo: precio.bajo,
     alto: precio.alto,
     desglose: precio.desglose,
+    // google = el monto de Google YA con vuelta y multiplicador (comparable con
+    // pyme, que es el total del viaje); google_ida = el crudo de ida.
     peajes: {
       pyme: precio.snapshot.declarados.peajes_estimados,
-      // Peajes de Google: no implementados (el calculo factura Enterprise).
-      google: null,
-      google_incompleto: null,
+      google: e.peajes_google_total,
+      google_ida: e.peajes_google_ida,
+      factor_vuelta: e.peajes_factor_vuelta,
+      multiplicador: e.peajes_multiplicador,
+      google_total: e.peajes_google_total,
+      // Alias de `incompleto` (nombre anterior, se mantiene).
+      google_incompleto: e.peajes_google_incompleto,
+      incompleto: e.peajes_google_incompleto,
+      error: e.peajes_google_error,
       usados: e.peajes,
       fuente: e.fuente_peajes,
     },

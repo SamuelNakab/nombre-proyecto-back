@@ -6,8 +6,13 @@
 //   - 3972: cierre automatico por timer (CIERRE_FIN_DIA_SEGUNDOS_TEST).
 //   - 3973: MARKETPLACE_HABILITADO=true, para que el socket del chofer pase por
 //     TODOS los caminos que unen salas (pool del marketplace, viaje:aceptar).
-// USA GOOGLE DE VERDAD (Routes, Pro): cada estimacion gasta (paradas - 1)
-// llamadas; el total sale al final.
+//   - 3974: PEAJES_GOOGLE_HABILITADO=false (kill switch de los peajes).
+// USA GOOGLE DE VERDAD (Routes): cada estimacion gasta (paradas - 1) llamadas
+// Pro y UNA Enterprise de peajes (salvo acierto de cache); el total sale al
+// final. Las llamadas de peajes se cuentan con las lineas "[maps] routes
+// peajes" y "[peajes] cache hit" del log del server. Las coordenadas del CASO
+// 18 llevan un corrimiento por corrida (5to decimal) para no pegarle al cache
+// de una corrida anterior (las claves peajes:* vencen solas, TTL 900 s).
 //
 // Casos:
 //   1. Crear con defaults: v2, snapshot, rango, desglose, tarifas de compat,
@@ -35,6 +40,11 @@
 //  16. Dataset admin (JSON y CSV).
 //  17. El chofer no recibe precios ni datos personales por NINGUN canal (chequeo
 //      recursivo de todo lo que recibio + server 3973 con el marketplace prendido).
+//  18. Peajes de Google: Belgrano -> La Plata (> 0, GOOGLE, tramo en la parada),
+//      Belgrano -> Nunez (0; San Cristobal va por autopista), la PyME reemplaza el monto, estimar +
+//      crear = 1 llamada, serie = 1 llamada, editar (servicio sin llamar, fecha
+//      con llamada, motivo sin llamar), kill switch (3974) y un viaje con peajes
+//      recorrido por el chofer (para el chequeo recursivo del 17).
 //
 // PROTOCOLO DE REVERSION (guard -> caso que se pone en rojo):
 //   - ON CONFLICT del upsert de precio pagado (cambiarlo por find + create)  -> 15e
@@ -43,6 +53,12 @@
 //   - version_precio en el cierre (precioMedido)                             -> 13a
 //   - llegada_real null en el updateMany de confirmar (distancia por tramo)  -> 8d
 //   - emitirViajeInternoDividido (payload con precio solo a la PyME)          -> 17c / 14c
+//   - lista blanca de paradaVistaChofer (peajes_google_tramo en VISIBLES o
+//     volver al spread)                                                      -> 17b (+ vista-parada.test)
+//   - cache de peajes (no leerlo)                                            -> 18c / 18d
+//   - una promesa de peajes por serie (pedirlos en cada ocurrencia)          -> 18e
+//   - prioridad PyME > Google (elegirPeajes)                                 -> 18c
+//   - kill switch (PEAJES_GOOGLE_HABILITADO)                                 -> 18g
 //
 // Acepta numeros de caso (el setup corre siempre), RONDAS=N y --restos [--borrar].
 // LIMPIEZA: borra TODO lo que crea (_limpieza.js) y al final verifica que no
@@ -62,6 +78,7 @@ import { precioDesdeMediciones } from '../src/services/precio-real.js';
 const PUERTO = 3971;
 const PUERTO_TIMER = 3972;
 const PUERTO_MARKET = 3973;
+const PUERTO_SIN_PEAJES = 3974;
 const RONDAS = Number(process.env.RONDAS) > 0 ? Number(process.env.RONDAS) : 5;
 const FIN_DIA_TEST_SEGUNDOS = 30;
 
@@ -95,6 +112,19 @@ const INTERMEDIA = { lat: -34.5975, lng: -58.3923, direccion: 'Tribunales, CABA'
 const DESTINO = { lat: -34.5895, lng: -58.3974, direccion: 'Recoleta, CABA' };
 // Fuera de CABA (MIXTO / provincia).
 const AVELLANEDA = { lat: -34.6627, lng: -58.3654, direccion: 'Avellaneda, Buenos Aires' };
+// Peajes (CASO 18). Corrimiento por corrida en el 5to decimal (< 500 m): misma
+// ruta, otra clave de cache. `variante` da otra clave dentro de la corrida. La
+// longitud lleva un corrimiento INDEPENDIENTE: solo con la latitud, la variante 2
+// de una corrida podia caer en la coordenada de otra corrida de los ultimos 15
+// min (TTL del cache) y contar 0 llamadas.
+const JIT = ((stamp % 400) + 1) * 1e-5;
+const JIT_LNG = ((Math.floor(stamp / 400) % 400) + 1) * 1e-5;
+const belgrano = (variante = 0) => ({ lat: -34.5627 + JIT + variante * 0.0004, lng: -58.4566 + JIT_LNG, direccion: 'Cabildo y Juramento, Belgrano' });
+const laPlata = (variante = 0) => ({ lat: -34.9214 - JIT - variante * 0.0004, lng: -57.9545 - JIT_LNG, direccion: 'Plaza Moreno, La Plata' });
+// Sin peajes: Belgrano -> Nunez por Cabildo (no hay autopista posible). OJO:
+// Belgrano -> San Cristobal NO sirve: Google lo lleva por la Illia / 25 de Mayo
+// (AUSA) y cotiza peajes (ARS 3984 de ida en la corrida del 13-11-2026).
+const NUNEZ = { lat: -34.5455 - JIT, lng: -58.4635, direccion: 'Cabildo y Congreso, Nunez' };
 
 const emailsCreados = [];
 const orgsCreadas = new Set();
@@ -423,10 +453,11 @@ async function casos(ctx) {
       `${v.precio_estimado} [${v.precio_estimado_min}, ${v.precio_estimado_max}] vs ${recalculado.total}`
     );
     paso(
-      'CASO 1b: defaults usados y no declarados (null en el viaje, LIVIANO / 0 / false / NINGUNA en el snapshot)',
+      'CASO 1b: defaults usados y no declarados (null en el viaje, LIVIANO / 0 / false en el snapshot; peajes de Google)',
       v.tipo_servicio === null && v.ayudantes === null && v.factura_a === null && v.peajes_estimados === null &&
         snap.entradas.servicio === 'LIVIANO' && snap.entradas.ayudantes === 0 && snap.entradas.factura_a === false &&
-        snap.entradas.fuente_factura_a === 'DEFAULT' && snap.entradas.peajes === 0 && v.fuente_peajes === 'NINGUNA',
+        snap.entradas.fuente_factura_a === 'DEFAULT' && v.fuente_peajes === 'GOOGLE' && Number.isInteger(v.peajes_google_ida) &&
+        snap.entradas.peajes === snap.entradas.peajes_google_total,
       JSON.stringify(snap.entradas)
     );
     paso(
@@ -561,9 +592,10 @@ async function casos(ctx) {
     const r = await api('POST', `/api/organizaciones/${A}/viajes/estimar-precio`, { paradas: [ORIGEN, { id_lugar: ctx.lugar }], ayudantes: 1, peajes_estimados: 1200 }, P1.token);
     const despues = await prisma.viaje.count({ where: { id_organizacion: A } });
     paso(
-      'CASO 5a: 200 con total, rango, desglose v2, peajes (Google null, PYME) y estimados; no crea nada',
+      'CASO 5a: 200 con total, rango, desglose v2, peajes (Google con valor, gana la PYME) y estimados; no crea nada',
       r.status === 200 && r.data.version_precio === 2 && r.data.total % 1000 === 0 && r.data.bajo < r.data.total && r.data.alto > r.data.total &&
-        r.data.desglose?.version === 2 && r.data.peajes.google === null && r.data.peajes.fuente === 'PYME' && r.data.peajes.usados === 1200 &&
+        r.data.desglose?.version === 2 && Number.isInteger(r.data.peajes.google) && Number.isInteger(r.data.peajes.google_ida) &&
+        r.data.peajes.fuente === 'PYME' && r.data.peajes.usados === 1200 && r.data.peajes.error === false &&
         r.data.estimado.horas_precio > 0 && r.data.tramos.length === 2 && r.data.tramos[1].manejo_sin_transito_min !== undefined && antes === despues,
       r2s(r)
     );
@@ -978,7 +1010,8 @@ async function casoFeedback(ctx) {
     paso(
       'CASO 16a: JSON con lo declarado, lo medido, peajes, estimado, medido, pagado y parametros',
       json.status === 200 && fila && fila.servicio === 'LIVIANO' && fila.medido_total > 0 && fila.estimado_total > 0 && fila.fuente_km === 'GPS' &&
-        fila.peajes_google === null && fila.parametros?.PRECIO_KM_IDA === 4500 && fila.gps_puntos > 0 && (correr(15) ? fila.pagado_monto === 260000 : true),
+        Number.isInteger(fila.peajes_google) && Number.isInteger(fila.peajes_google_ida) && fila.peajes_google_error === false &&
+        'peajes_google_incompleto' in fila && fila.parametros?.PRECIO_KM_IDA === 4500 && fila.gps_puntos > 0 && (correr(15) ? fila.pagado_monto === 260000 : true),
       r2s(json).slice(0, 200)
     );
     const csv = await api('GET', `/api/admin/precios/dataset?desde=${encodeURIComponent(desde)}&formato=csv&limit=1000`, null, admin);
@@ -992,6 +1025,202 @@ async function casoFeedback(ctx) {
     const noAdmin = await api('GET', '/api/admin/precios/dataset', null, P1.token);
     paso('CASO 16c: un no-admin → 403', noAdmin.status === 403, r2s(noAdmin));
   }
+}
+
+// -- CASO 18: peajes de Google --------------------------------------------------
+
+// fecha_programada de MANANA a HH:MM en hora argentina (franja horaria fija).
+function mananaA(hhmm, dias = 1) {
+  const d = new Date(Date.now() + dias * 86_400_000).toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
+  return new Date(`${d}T${hhmm}:00-03:00`).toISOString();
+}
+
+// Llamadas de peajes a Google y aciertos de cache en el log del server, desde
+// un offset. Espera un poco: el stdout del hijo llega por un pipe.
+async function contarPeajes(leerLog, desde) {
+  await esperar(400);
+  const t = leerLog().slice(desde);
+  return {
+    llamadas: (t.match(/\[maps\] routes peajes \d+/g) ?? []).length,
+    hits: (t.match(/\[peajes\] cache hit/g) ?? []).length,
+  };
+}
+
+async function casoPeajes(ctx) {
+  titulo('CASO 18: peajes de Google');
+  const { P1, A, K1, K2, leerLog } = ctx;
+  const T1 = mananaA('14:00');
+  const cuerpo = (id_conductor, paradas, fecha, extra = {}) => ({ ...cuerpoViaje(id_conductor, paradas, extra), fecha_programada: fecha });
+
+  // 18a: Belgrano -> La Plata.
+  let desde = leerLog().length;
+  const r = await crearOk(P1, A, cuerpo(K1.id_conductor, [belgrano(), laPlata()], T1));
+  const nA = await contarPeajes(leerLog, desde);
+  const idLP = r.data.id_viaje;
+  const v = await viajeDb(idLP);
+  const ps = await paradasDb(idLP);
+  const e = v.precio_parametros.entradas;
+  const det = r.data.desglose_estimado?.peajes_detalle;
+  paso(
+    'CASO 18a: Belgrano -> La Plata: peajes_google_ida > 0, fuente GOOGLE, usados = ida x 2 (vuelta) x 1 (LIVIANO), 1 llamada',
+    v.peajes_google_ida > 0 && v.fuente_peajes === 'GOOGLE' && v.peajes_google_incompleto === false && e.peajes === v.peajes_google_ida * 2 &&
+      e.peajes_factor_vuelta === 2 && e.peajes_multiplicador === 1 && v.precio_estimado_desglose.peajes === e.peajes && nA.llamadas === 1,
+    `ida=${v.peajes_google_ida} usados=${e.peajes} total=${v.precio_estimado} km=${v.distancia_estimada_km?.toFixed(2)} llamadas=${nA.llamadas}`
+  );
+  paso(
+    'CASO 18a2: tramo de peajes en la parada 2 (= ida, un solo leg; null en la 1) y desglose.peajes_detalle en la respuesta',
+    ps[0].peajes_google_tramo === null && ps[1].peajes_google_tramo === v.peajes_google_ida &&
+      det?.google_ida === v.peajes_google_ida && det.usados === e.peajes && det.fuente === 'GOOGLE' && det.error === false &&
+      r.data.paradas[1].peajes_google_tramo === v.peajes_google_ida && r.data.peajes_google_ida === v.peajes_google_ida,
+    JSON.stringify({ tramos: ps.map((p) => p.peajes_google_tramo), det })
+  );
+  console.log(
+    `  Belgrano -> La Plata (manana 14:00): peaje de ida ${v.peajes_google_ida}, usados ${e.peajes}, ` +
+      `km ${v.distancia_estimada_km?.toFixed(2)}, manejo ${Math.round((v.manejo_estimado_horas ?? 0) * 60)} min, precio ${v.precio_estimado}`
+  );
+
+  // 18b: un viaje sin autopista: sin peajes.
+  const sc = await crearOk(P1, A, cuerpo(K1.id_conductor, [belgrano(1), NUNEZ], T1));
+  const vSc = await viajeDb(sc.data.id_viaje);
+  paso(
+    'CASO 18b: Belgrano -> Nunez (sin autopista): peajes 0 (Google respondio sin peajes: fuente GOOGLE)',
+    vSc.peajes_google_ida === 0 && vSc.precio_parametros.entradas.peajes === 0 && vSc.fuente_peajes === 'GOOGLE',
+    `ida=${vSc.peajes_google_ida} fuente=${vSc.fuente_peajes}`
+  );
+  await cancelarPyme(P1, A, vSc.id_viaje);
+
+  // 18c: la PyME declara el monto: gana, y Google igual queda guardado (mismo cache).
+  desde = leerLog().length;
+  const py = await crearOk(P1, A, cuerpo(K1.id_conductor, [belgrano(), laPlata()], T1, { peajes_estimados: 7000 }));
+  const nC = await contarPeajes(leerLog, desde);
+  const vPy = await viajeDb(py.data.id_viaje);
+  paso(
+    'CASO 18c: la PyME reemplaza el monto (fuente PYME, usados 7000) y peajes_google_ida igual guardado, por el cache (0 llamadas)',
+    vPy.fuente_peajes === 'PYME' && vPy.precio_parametros.entradas.peajes === 7000 && vPy.peajes_google_ida === v.peajes_google_ida &&
+      vPy.precio_estimado_desglose.peajes_detalle.pyme === 7000 && nC.llamadas === 0 && nC.hits === 1,
+    `fuente=${vPy.fuente_peajes} ida=${vPy.peajes_google_ida} llamadas=${nC.llamadas} hits=${nC.hits}`
+  );
+  await cancelarPyme(P1, A, vPy.id_viaje);
+
+  // 18d: estimar-precio y despues crear el MISMO viaje: UNA llamada.
+  desde = leerLog().length;
+  const paradasD = [belgrano(2), laPlata(2)];
+  const est = await api('POST', `/api/organizaciones/${A}/viajes/estimar-precio`, { paradas: paradasD, fecha_programada: T1 }, P1.token);
+  const cr = await crearOk(P1, A, cuerpo(K1.id_conductor, paradasD, T1));
+  const nD = await contarPeajes(leerLog, desde);
+  const vD = await viajeDb(cr.data.id_viaje);
+  paso(
+    'CASO 18d: estimar-precio (peajes.google con valor) y crear el mismo viaje = 1 llamada de peajes + 1 acierto de cache',
+    est.status === 200 && est.data.peajes.google_ida > 0 && est.data.peajes.google === est.data.peajes.google_ida * 2 &&
+      est.data.peajes.fuente === 'GOOGLE' && est.data.peajes.usados === est.data.peajes.google && vD.peajes_google_ida === est.data.peajes.google_ida &&
+      nD.llamadas === 1 && nD.hits === 1,
+    `peajes=${JSON.stringify(est.data.peajes)} llamadas=${nD.llamadas} hits=${nD.hits}`
+  );
+  await cancelarPyme(P1, A, vD.id_viaje);
+
+  // 18e: serie de 3 viajes = UNA llamada de peajes.
+  desde = leerLog().length;
+  const fechaDia = (n) => new Date(Date.now() + n * 86_400_000).toLocaleDateString('en-CA', { timeZone: 'America/Argentina/Buenos_Aires' });
+  const se = await api(
+    'POST',
+    `/api/organizaciones/${A}/series`,
+    {
+      id_conductor: K2.id_conductor,
+      frecuencia: 'DIARIA',
+      hora: '14:00',
+      fecha_desde: fechaDia(1),
+      fecha_hasta: fechaDia(3),
+      paradas: [belgrano(3), laPlata(3)],
+      motivo: 'Serie peajes',
+      descripcion: 'Serie de prueba de peajes',
+    },
+    P1.token
+  );
+  const nE = await contarPeajes(leerLog, desde);
+  const idsSerie = (se.data.viajes ?? []).map((x) => x.id_viaje);
+  idsSerie.forEach((id) => viajesCreados.add(id));
+  const vSerie = await prisma.viaje.findMany({ where: { id_viaje: { in: idsSerie } }, include: { paradas: { orderBy: { orden: 'asc' } } } });
+  paso(
+    'CASO 18e: serie de 3 viajes = 1 llamada de peajes; los 3 con el mismo peajes_google_ida (y su tramo en la parada 2)',
+    se.status === 201 && vSerie.length === 3 && nE.llamadas === 1 && nE.hits === 0 && vSerie[0].peajes_google_ida > 0 &&
+      vSerie.every((x) => x.peajes_google_ida === vSerie[0].peajes_google_ida && x.fuente_peajes === 'GOOGLE' && x.paradas[1].peajes_google_tramo === x.peajes_google_ida),
+    `${se.status} viajes=${vSerie.length} llamadas=${nE.llamadas} ida=${vSerie.map((x) => x.peajes_google_ida).join(',')}`
+  );
+  if (se.data.serie) await api('POST', `/api/organizaciones/${A}/series/${se.data.serie.id_serie}/cancelar`, null, P1.token);
+  for (const id of idsSerie) await cancelarPyme(P1, A, id);
+
+  // 18f: editar el viaje del 18a.
+  desde = leerLog().length;
+  const camion = await api('PUT', `/api/organizaciones/${A}/viajes/${idLP}`, { tipo_servicio: 'CAMION' }, P1.token);
+  const nF1 = await contarPeajes(leerLog, desde);
+  const vCam = await viajeDb(idLP);
+  paso(
+    'CASO 18f: editar solo el servicio a CAMION: 0 llamadas; usados = ida x 2 x 2 con el multiplicador nuevo',
+    camion.status === 200 && nF1.llamadas === 0 && nF1.hits === 0 && vCam.peajes_google_ida === v.peajes_google_ida &&
+      vCam.precio_parametros.entradas.peajes === v.peajes_google_ida * 4 && vCam.precio_parametros.entradas.peajes_multiplicador === 2,
+    `${camion.status} usados=${vCam.precio_parametros.entradas.peajes} llamadas=${nF1.llamadas}`
+  );
+  desde = leerLog().length;
+  const fecha = await api('PUT', `/api/organizaciones/${A}/viajes/${idLP}`, { fecha_programada: mananaA('16:00') }, P1.token);
+  const nF2 = await contarPeajes(leerLog, desde);
+  const vFe = await viajeDb(idLP);
+  const psFe = await paradasDb(idLP);
+  paso(
+    'CASO 18f2: editar la fecha a otra franja horaria: 1 llamada de peajes y el tramo de la parada reescrito',
+    fecha.status === 200 && nF2.llamadas === 1 && vFe.peajes_google_ida > 0 && psFe[1].peajes_google_tramo === vFe.peajes_google_ida &&
+      vFe.precio_parametros.entradas.peajes === vFe.peajes_google_ida * 4,
+    `${fecha.status} ida=${vFe.peajes_google_ida} (antes ${v.peajes_google_ida}) llamadas=${nF2.llamadas}`
+  );
+  desde = leerLog().length;
+  const motivo = await api('PUT', `/api/organizaciones/${A}/viajes/${idLP}`, { motivo: 'Otro motivo peajes' }, P1.token);
+  const nF3 = await contarPeajes(leerLog, desde);
+  paso('CASO 18f3: editar solo el motivo: 0 llamadas', motivo.status === 200 && nF3.llamadas === 0 && nF3.hits === 0, `${motivo.status} llamadas=${nF3.llamadas}`);
+  await cancelarPyme(P1, A, idLP);
+
+  // 18h: un viaje con peajes recorrido por el chofer de punta a punta (todo lo
+  // que recibe entra en el chequeo recursivo del CASO 17).
+  const rh = await crearOk(P1, A, cuerpo(K1.id_conductor, [belgrano(), laPlata()], enMin(2)));
+  const idH = rh.data.id_viaje;
+  await okOFalla(confirmar(K1, idH, ctx.veh.get(K1.id_conductor)), 'confirmar');
+  await okOFalla(apiK('POST', `/api/choferes/viajes/${idH}/iniciar`, { lat: belgrano().lat, lng: belgrano().lng }, K1), 'iniciar');
+  await apiK('GET', `/api/choferes/viajes/${idH}`, null, K1);
+  await apiK('GET', `/api/viajes/${idH}`, null, K1);
+  await llevarAUltima(K1, idH);
+  await okOFalla(salir(K1, idH), 'salir de la ultima');
+  await apiK('GET', `/api/choferes/viajes/${idH}`, null, K1);
+  await apiK('GET', '/api/choferes/viajes?grupo=historial', null, K1);
+  const vH = await viajeDb(idH);
+  const pyH = await api('GET', `/api/organizaciones/${A}/viajes/${idH}`, null, P1.token);
+  paso(
+    'CASO 18h: viaje con peajes FINALIZADO: el medido usa los peajes del snapshot; la PyME ve peajes_google_ida y el tramo',
+    vH.estado === 'FINALIZADO' && vH.peajes_google_ida > 0 && vH.precio_medido_desglose?.peajes === vH.precio_parametros.entradas.peajes &&
+      vH.precio_medido_desglose.peajes_detalle?.google_ida === vH.peajes_google_ida && pyH.data.peajes_google_ida === vH.peajes_google_ida &&
+      pyH.data.paradas[1].peajes_google_tramo === vH.peajes_google_ida,
+    `${vH.estado} medido.peajes=${vH.precio_medido_desglose?.peajes}`
+  );
+
+  // 18g: kill switch (server propio).
+  await conServer({ ...ENV_BASE, PEAJES_GOOGLE_HABILITADO: 'false' }, PUERTO_SIN_PEAJES, async (base, leerLog2) => {
+    const anterior = BASE;
+    BASE = base;
+    try {
+      const d0 = leerLog2().length;
+      const k = await crearOk(P1, A, cuerpo(K1.id_conductor, [belgrano(4), laPlata(4)], T1));
+      const nG = await contarPeajes(leerLog2, d0);
+      const vK = await viajeDb(k.data.id_viaje);
+      paso(
+        'CASO 18g: PEAJES_GOOGLE_HABILITADO=false: 0 llamadas, fuente NINGUNA, ida null, error false (y el aviso al arrancar)',
+        nG.llamadas === 0 && nG.hits === 0 && vK.fuente_peajes === 'NINGUNA' && vK.peajes_google_ida === null &&
+          vK.precio_parametros.entradas.peajes === 0 && vK.precio_parametros.entradas.peajes_google_error === false &&
+          /\[peajes\] PEAJES_GOOGLE_HABILITADO=false/.test(leerLog2()),
+        `fuente=${vK.fuente_peajes} ida=${vK.peajes_google_ida} llamadas=${nG.llamadas}`
+      );
+      await cancelarPyme(P1, A, vK.id_viaje);
+      sumarLlamadasMaps(leerLog2());
+    } finally {
+      BASE = anterior;
+    }
+  });
 }
 
 // CASO 17: el chofer no recibe precios ni datos personales.
@@ -1117,10 +1346,11 @@ async function main() {
       const [sP1, sK1, sK2] = await Promise.all([P1, K1, K2].map((u) => espia(base, u.token)));
       await esperar(1000);
       console.log(`  ${nUsuario} usuarios, PyMEs ${A} y ${B}, sockets conectados`);
-      const ctx = { P1, M1, Q1, A, B, K1, K2, K3, veh, sP1, sK1, sK2, finalizados: [] };
+      const ctx = { P1, M1, Q1, A, B, K1, K2, K3, veh, sP1, sK1, sK2, finalizados: [], leerLog };
       await casos(ctx);
       if (correr(11) || correr(15) || correr(16)) await casoAutomatico(ctx);
       if (correr(15) || correr(16)) await casoFeedback(ctx);
+      if (correr(18)) await casoPeajes(ctx);
       if (correr(17)) await casoChofer(ctx);
       sumarLlamadasMaps(leerLog());
     });

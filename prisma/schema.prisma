@@ -194,10 +194,10 @@ enum TipoCarga {
   FRAGIL
 }
 
-// De donde salieron los peajes del calculo. GOOGLE esta RESERVADO: el calculo
-// de peajes de Routes factura Enterprise y no se implemento, pero el valor se
-// crea ahora porque agregarlo despues a un enum con la DB compartida rompe al
-// Prisma del deploy viejo.
+// De donde salieron los peajes del calculo: lo declarado por la PyME, Google
+// (Routes TOLLS, SKU Enterprise, ver peajes.service.js) o ninguno. GOOGLE se
+// creo con el enum (Precio v2) para no tener que agregarlo despues con la DB
+// compartida (romperia al Prisma del deploy viejo).
 enum FuentePeajes {
   PYME
   GOOGLE
@@ -775,6 +775,12 @@ model Viaje {
   factura_a                Boolean?
   peajes_estimados         Int?
   fuente_peajes            FuentePeajes?
+  // Peajes de Google (Routes TOLLS, SKU Enterprise): el CRUDO de ida en pesos,
+  // sin factor de vuelta ni multiplicador (esos van en el snapshot). null = no
+  // se calculo (kill switch, legacy, falla de Google o viaje anterior).
+  // incompleto = algun peaje de la ruta vino sin tarifa (o en otra moneda).
+  peajes_google_ida        Int?
+  peajes_google_incompleto Boolean?
   // Carga: no entra en la formula, se guarda para recalibrar.
   tipo_carga               TipoCarga?
   bultos                   Int?
@@ -905,6 +911,10 @@ model Parada {
   // Manejo SIN transito del tramo que llega a esta parada (staticDuration de
   // Routes, en la misma llamada del estimado). null en la parada 1.
   manejo_sin_transito_horas Float?
+  // Peaje de IDA (Google, crudo, en pesos) del leg que TERMINA en esta parada.
+  // null en la parada 1, si no se calculo o si la tarifa del leg es desconocida.
+  // El chofer NUNCA lo ve (lista blanca de vista-parada.js).
+  peajes_google_tramo       Int?
 
   viaje Viaje  @relation(fields: [id_viaje], references: [id_viaje])
   lugar Lugar? @relation(fields: [id_lugar], references: [id_lugar], onDelete: SetNull)

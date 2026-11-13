@@ -9,6 +9,8 @@ import {
   kmEstimadosHastaUltimaLlegada,
   kmMedidos,
   declaradosDe,
+  montoPeajesGoogle,
+  entradasPeajes,
 } from './precio-entradas.js';
 import { calcularPrecioV2 } from './precio-v2.js';
 import { configPrecio } from '../config/precio.js';
@@ -204,5 +206,115 @@ describe('medido: horas por reloj y fallback de km', () => {
     const otroEnv = calcularPrecioV2(e, configPrecio({ PRECIO_KM_IDA: '9000' })).total;
     expect(conSnapshot).not.toBe(otroEnv);
     expect(conSnapshot).toBe(calcularPrecioV2(e, P).total);
+  });
+});
+
+describe('peajes de Google: monto usado', () => {
+  const GOOGLE = { ida: 5187, incompleto: false, tramos: [null, 5187], error: false };
+  const viaje = (declarados, peajesGoogle) =>
+    entradasEstimado(
+      { paradas: [OBELISCO, LA_PLATA], manejo_horas: 1.37, distancia_km: 68.24, declarados: { ...SIN, ...declarados }, peajesGoogle },
+      P
+    ).entradas;
+
+  it('ida x factor de vuelta x multiplicador del servicio, redondeado', () => {
+    expect(montoPeajesGoogle(5187, 'LIVIANO', P)).toBe(10374);
+    expect(montoPeajesGoogle(5187, 'EQUIPO', P)).toBe(10374);
+    expect(montoPeajesGoogle(5187, 'CAMION', P)).toBe(20748);
+    expect(montoPeajesGoogle(1001, 'LIVIANO', { ...P, PRECIO_PEAJES_MULTIPLICADOR_LIVIANO: 1.25 })).toBe(2503);
+    expect(montoPeajesGoogle(5187, 'LIVIANO', { ...P, PRECIO_PEAJES_FACTOR_VUELTA: 1 })).toBe(5187);
+    expect(montoPeajesGoogle(null, 'LIVIANO', P)).toBeNull();
+  });
+
+  it('prioridad: PyME > Google > 0', () => {
+    expect(viaje({ peajes_estimados: 7000 }, GOOGLE)).toMatchObject({ peajes: 7000, fuente_peajes: 'PYME', peajes_google_ida: 5187, peajes_google_total: 10374 });
+    expect(viaje({}, GOOGLE)).toMatchObject({ peajes: 10374, fuente_peajes: 'GOOGLE', peajes_pyme: null });
+    expect(viaje({}, null)).toMatchObject({ peajes: 0, fuente_peajes: 'NINGUNA', peajes_google_ida: null, peajes_google_total: null });
+  });
+
+  it('Google sin peajes (0) es fuente GOOGLE con 0; la PyME con 0 sigue ganando', () => {
+    expect(viaje({}, { ...GOOGLE, ida: 0, tramos: [null, 0] })).toMatchObject({ peajes: 0, fuente_peajes: 'GOOGLE', peajes_google_total: 0 });
+    expect(viaje({ peajes_estimados: 0 }, GOOGLE)).toMatchObject({ peajes: 0, fuente_peajes: 'PYME' });
+  });
+
+  it('el multiplicador sale del servicio EFECTIVO (null = LIVIANO)', () => {
+    expect(viaje({ tipo_servicio: 'CAMION' }, GOOGLE)).toMatchObject({ peajes: 20748, peajes_multiplicador: 2, peajes_factor_vuelta: 2 });
+    expect(viaje({}, GOOGLE)).toMatchObject({ peajes_multiplicador: 1 });
+  });
+
+  it('incompleto: se usa lo conocido y queda marcado', () => {
+    expect(viaje({}, { ...GOOGLE, incompleto: true })).toMatchObject({ peajes: 10374, peajes_google_incompleto: true });
+  });
+
+  it('falla de Google: fuente NINGUNA y error true; kill switch: error false', () => {
+    expect(viaje({}, { ida: null, incompleto: null, tramos: null, error: true })).toMatchObject({
+      peajes: 0,
+      fuente_peajes: 'NINGUNA',
+      peajes_google_error: true,
+      peajes_google_incompleto: null,
+    });
+    expect(viaje({}, { ida: null, incompleto: null, tramos: null, error: false })).toMatchObject({ peajes_google_error: false });
+  });
+
+  it('entradasPeajes sin dato de Google y sin PyME', () => {
+    expect(entradasPeajes(null, null, 'LIVIANO', P)).toEqual({
+      peajes: 0,
+      fuente_peajes: 'NINGUNA',
+      peajes_pyme: null,
+      peajes_google_ida: null,
+      peajes_google_total: null,
+      peajes_factor_vuelta: 2,
+      peajes_multiplicador: 1,
+      peajes_google_incompleto: null,
+      peajes_google_error: false,
+    });
+  });
+
+  it('el desglose trae peajes (entero) y peajes_detalle; los peajes NO llevan IVA', () => {
+    const e = viaje({ factura_a: true }, GOOGLE);
+    const r = calcularPrecioV2(e, P);
+    expect(r.desglose.peajes).toBe(10374);
+    expect(r.desglose.peajes_detalle).toEqual({
+      google_ida: 5187,
+      factor_vuelta: 2,
+      multiplicador: 1,
+      google_total: 10374,
+      pyme: null,
+      usados: 10374,
+      fuente: 'GOOGLE',
+      incompleto: false,
+      error: false,
+    });
+    expect(r.desglose.iva).toBe(Math.floor(r.desglose.subtotal_sin_iva * 0.21 + 0.5));
+    expect(r.desglose.subtotal_sin_iva + r.desglose.iva + 10374 + r.desglose.ajuste_redondeo).toBe(r.total);
+  });
+
+  it('ejemplo real Belgrano -> La Plata (valle), LIVIANO: $317.000', () => {
+    const r = calcularPrecioV2(viaje({}, GOOGLE), P);
+    expect(r.desglose.distancia).toBe(307080);
+    expect(r.desglose.regimen).toBe('DISTANCIA');
+    expect(r.total).toBe(317000);
+  });
+
+  it('el medido usa los peajes del SNAPSHOT (no se recalculan)', () => {
+    const { snapshot } = entradasEstimado(
+      { paradas: [OBELISCO, LA_PLATA], manejo_horas: 1.37, distancia_km: 68.24, declarados: SIN, peajesGoogle: GOOGLE },
+      P
+    );
+    const medido = entradasMedido({
+      snapshot,
+      inicio: '2026-11-16T17:00:00Z',
+      corte: '2026-11-16T19:00:00Z',
+      medicion: { distancia_km: 70, pings: 50 },
+      paradas: [],
+      incompleto: false,
+    });
+    expect(medido).toMatchObject({ peajes: 10374, fuente_peajes: 'GOOGLE', peajes_google_ida: 5187 });
+    expect(calcularPrecioV2(medido, snapshot.parametros).desglose.peajes_detalle.usados).toBe(10374);
+  });
+
+  it('un snapshot viejo (sin peajes de Google) da nulls en el detalle', () => {
+    const r = calcularPrecioV2({ km_ida: 5, horas: 1, servicio: 'LIVIANO', peajes: 3000, fuente_peajes: 'PYME' }, P);
+    expect(r.desglose.peajes_detalle).toMatchObject({ google_ida: null, usados: 3000, fuente: 'PYME', error: null });
   });
 });

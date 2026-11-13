@@ -11,6 +11,7 @@
 //   el resto (servicio, ayudantes, provincia, paradas extra, escalera, factura A,
 //   peajes) sale del SNAPSHOT del estimado.
 import { contarParadasPorZona } from './zona.service.js';
+import { aPesos } from './precio-v2.js';
 
 export const SERVICIO_DEFAULT = 'LIVIANO';
 export const ACCESO_DEFAULT = 'PLANTA_BAJA';
@@ -36,11 +37,40 @@ export function elegirFacturaA(declarada, porDefectoOrganizacion) {
 }
 
 // Peajes del calculo: lo declarado por la PyME (total del viaje, ida y vuelta);
-// si no, lo de Google (no implementado: Enterprise); si no, 0.
+// si no, lo de Google (ya con vuelta y multiplicador); si no, 0. Google que
+// respondio "sin peajes" es 0 con fuente GOOGLE; sin dato de Google (falla, kill
+// switch, legacy) es NINGUNA.
 export function elegirPeajes(declaradosPyme, google = null) {
   if (declaradosPyme != null) return { monto: declaradosPyme, fuente: 'PYME' };
   if (google != null) return { monto: google, fuente: 'GOOGLE' };
   return { monto: 0, fuente: 'NINGUNA' };
+}
+
+// Monto de Google que entra en el precio: el peaje de IDA (crudo, de Routes) x
+// la vuelta x el multiplicador del servicio (Google cotiza un auto), en pesos
+// enteros. null si no hay dato de Google.
+export function montoPeajesGoogle(ida, servicio, p) {
+  if (ida == null) return null;
+  return aPesos(ida * p.PRECIO_PEAJES_FACTOR_VUELTA * p[`PRECIO_PEAJES_MULTIPLICADOR_${servicio}`]);
+}
+
+// Las entradas de peajes del snapshot. peajesGoogle: lo que devolvio
+// obtenerPeajesGoogle ({ ida, incompleto, error }) o null (no se calculo).
+export function entradasPeajes(declaradoPyme, peajesGoogle, servicio, p) {
+  const ida = peajesGoogle?.ida ?? null;
+  const google_total = montoPeajesGoogle(ida, servicio, p);
+  const elegido = elegirPeajes(declaradoPyme, google_total);
+  return {
+    peajes: elegido.monto,
+    fuente_peajes: elegido.fuente,
+    peajes_pyme: declaradoPyme ?? null,
+    peajes_google_ida: ida,
+    peajes_google_total: google_total,
+    peajes_factor_vuelta: p.PRECIO_PEAJES_FACTOR_VUELTA,
+    peajes_multiplicador: p[`PRECIO_PEAJES_MULTIPLICADOR_${servicio}`],
+    peajes_google_incompleto: ida == null ? null : Boolean(peajesGoogle.incompleto),
+    peajes_google_error: Boolean(peajesGoogle?.error),
+  };
 }
 
 // Validaciones de negocio de la Parte B sobre el ESTADO RESULTANTE (lo declarado
@@ -93,13 +123,16 @@ export function declaradosDe(fuente) {
 //   manejo_horas / distancia_km: totales del recorrido de Routes
 //   declarados: { tipo_servicio, ayudantes, factura_a, peajes_estimados }
 //   facturaAOrganizacion: Organizacion.factura_a_por_defecto (o null)
+//   peajesGoogle: { ida, incompleto, error } de obtenerPeajesGoogle, o null
 // Devuelve { entradas (las de la formula), snapshot (version, parametros,
 // entradas y declarados: lo que se guarda en Viaje.precio_parametros) }.
-export function entradasEstimado({ paradas, manejo_horas, distancia_km, declarados, facturaAOrganizacion }, p) {
+export function entradasEstimado(
+  { paradas, manejo_horas, distancia_km, declarados, facturaAOrganizacion, peajesGoogle = null },
+  p
+) {
   const servicio = servicioEfectivo(declarados.tipo_servicio);
   const cantidad = paradas.length;
   const factura = elegirFacturaA(declarados.factura_a, facturaAOrganizacion);
-  const peajes = elegirPeajes(declarados.peajes_estimados);
   const entradas = {
     km_ida: distancia_km,
     horas: manejo_horas + (p.PRECIO_MINUTOS_POR_PARADA * cantidad) / 60,
@@ -112,8 +145,7 @@ export function entradasEstimado({ paradas, manejo_horas, distancia_km, declarad
     escalera: hayEscalera(paradas),
     factura_a: factura.valor,
     fuente_factura_a: factura.fuente,
-    peajes: peajes.monto,
-    fuente_peajes: peajes.fuente,
+    ...entradasPeajes(declarados.peajes_estimados, peajesGoogle, servicio, p),
   };
   return {
     entradas,

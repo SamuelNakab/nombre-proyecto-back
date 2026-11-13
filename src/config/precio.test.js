@@ -59,3 +59,46 @@ describe('configPrecio', () => {
     expect(log.mock.calls[0][0]).toMatch(/^\[precio\] PRECIO_KM_IDA="-1" invalido: se usa el default 4500$/);
   });
 });
+
+describe('configPrecio: peajes de Google', () => {
+  it('defaults: habilitado, multiplicadores 1 / 1 / 2, cache 900 s, factor de vuelta 2', () => {
+    const v = configPrecio({});
+    expect(v.PEAJES_GOOGLE_HABILITADO).toBe(true);
+    expect(v.PRECIO_PEAJES_MULTIPLICADOR_LIVIANO).toBe(1);
+    expect(v.PRECIO_PEAJES_MULTIPLICADOR_EQUIPO).toBe(1);
+    expect(v.PRECIO_PEAJES_MULTIPLICADOR_CAMION).toBe(2);
+    expect(v.PRECIO_PEAJES_CACHE_SEGUNDOS).toBe(900);
+    expect(v.PRECIO_PEAJES_FACTOR_VUELTA).toBe(2);
+  });
+
+  it.each([
+    ['false', false],
+    ['FALSE', false],
+    ['0', false],
+    [' true ', true],
+    ['1', true],
+  ])('PEAJES_GOOGLE_HABILITADO=%j -> %s', (valor, esperado) => {
+    const { valores, invalidas } = leerConfigPrecio({ PEAJES_GOOGLE_HABILITADO: valor });
+    expect(valores.PEAJES_GOOGLE_HABILITADO).toBe(esperado);
+    expect(invalidas).toEqual([]);
+  });
+
+  it.each([[''], ['si'], ['2']])('PEAJES_GOOGLE_HABILITADO=%j invalido -> default true + warning', (valor) => {
+    const { valores, invalidas } = leerConfigPrecio({ PEAJES_GOOGLE_HABILITADO: valor });
+    expect(valores.PEAJES_GOOGLE_HABILITADO).toBe(true);
+    expect(invalidas).toEqual([{ nombre: 'PEAJES_GOOGLE_HABILITADO', valor, defecto: true }]);
+  });
+
+  it('el cache es entero (0 vale) y el multiplicador acepta decimales', () => {
+    const v = configPrecio({ PRECIO_PEAJES_CACHE_SEGUNDOS: '0', PRECIO_PEAJES_MULTIPLICADOR_LIVIANO: '1.5' });
+    expect(v.PRECIO_PEAJES_CACHE_SEGUNDOS).toBe(0);
+    expect(v.PRECIO_PEAJES_MULTIPLICADOR_LIVIANO).toBe(1.5);
+    expect(configPrecio({ PRECIO_PEAJES_CACHE_SEGUNDOS: '1.5' }).PRECIO_PEAJES_CACHE_SEGUNDOS).toBe(900);
+  });
+
+  it('advertirConfigPrecio avisa si el kill switch esta apagado', () => {
+    const log = vi.fn();
+    advertirConfigPrecio({ PEAJES_GOOGLE_HABILITADO: 'false' }, log);
+    expect(log).toHaveBeenCalledWith('[peajes] PEAJES_GOOGLE_HABILITADO=false: no se calculan peajes con Google');
+  });
+});

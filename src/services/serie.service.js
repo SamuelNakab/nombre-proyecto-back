@@ -25,6 +25,7 @@ import { ErrorNegocio } from './error-negocio.js';
 import { ErrorMaps } from './maps/comun.js';
 import {
   estimarPrecioInterno,
+  peajesDeEstimacion,
   columnasPrecioV2,
   exigirDatosPrecio,
   facturaAPorDefecto,
@@ -194,6 +195,11 @@ export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
     });
   }
 
+  // PEAJES: UNA sola llamada Enterprise por serie (con la salida de la PRIMERA
+  // ocurrencia), en paralelo con los tramos. La MISMA promesa va a todas las
+  // estimaciones: el resultado se copia a todos los viajes. Nunca tira.
+  const peajesSerie = peajesDeEstimacion({ paradas, fecha_programada: ocurrencias[0].fecha_programada.toISOString() });
+
   // Estimaciones: TODAS antes de escribir nada. Cada una con SU fecha (trafico y
   // hora pico propios). Si cualquiera falla, sale su error y no se crea nada.
   const tEstimacion = Date.now();
@@ -207,6 +213,7 @@ export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
         fecha_programada: o.fecha_programada.toISOString(),
         declarados,
         facturaAOrganizacion,
+        peajesGoogle: peajesSerie,
       }),
     {
       deadlineMs: timeoutMs,
@@ -291,7 +298,10 @@ export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
 
     await tx.parada.createMany({
       data: creados.flatMap((c) =>
-        conEstimacionPorParada(filasParada, c.estimacion.recorrido).map((p) => ({ ...p, id_viaje: c.id_viaje }))
+        conEstimacionPorParada(filasParada, c.estimacion.recorrido, c.estimacion.peajes.tramos).map((p) => ({
+          ...p,
+          id_viaje: c.id_viaje,
+        }))
       ),
     });
     return { id_serie: serie.id_serie, creados };
@@ -351,7 +361,7 @@ export async function crearSerie({ io, id_organizacion, id_usuario, datos }) {
   const llamadas = ocurrencias.length * (paradas.length - 1);
   console.log(
     `[series] serie ${id_serie}: ${viajes.length} viajes, ${llamadas} llamadas Pro, ` +
-      `estimacion ${msEstimacion}ms, tx ${msTx}ms, total ${Date.now() - t0}ms`
+      `estimacion ${msEstimacion}ms, tx ${msTx}ms, total ${Date.now() - t0}ms, peajes ${estimaciones[0].peajes.origen}`
   );
 
   return {
